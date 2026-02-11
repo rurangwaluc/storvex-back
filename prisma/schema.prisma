@@ -1,0 +1,524 @@
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL") // runtime (pooler OK)
+  directUrl         = env("DIRECT_URL")   // migrations (direct/session)
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+////////////////////////////
+// ENUMS
+////////////////////////////
+
+enum UserRole {
+  PLATFORM_ADMIN
+  OWNER
+  CASHIER
+  TECHNICIAN
+}
+
+enum PlatformRole {
+  PLATFORM_ADMIN
+}
+
+enum OwnerIntentStatus {
+  PENDING
+  PAID
+  CONSUMED
+  EXPIRED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum TenantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  SUSPENDED
+}
+
+enum RepairStatus {
+  RECEIVED
+  IN_PROGRESS
+  COMPLETED
+  DELIVERED
+}
+
+enum ExpenseCategory {
+  RENT
+  SALARY
+  UTILITIES
+  TRANSPORT
+  MAINTENANCE
+  OTHER
+}
+
+enum InterStoreDealStatus {
+  BORROWED
+  SOLD
+  RETURNED
+  PAID
+  RECEIVED
+}
+
+enum AuditAction {
+  CREATE_DEAL
+  MARK_RECEIVED
+  MARK_SOLD
+  MARK_RETURNED
+  MARK_PAID
+  ADD_PAYMENT
+}
+
+
+
+enum SaleType {
+  CASH
+  CREDIT
+}
+
+enum SalePaymentMethod {
+  CASH
+  MOMO
+  BANK
+  OTHER
+}
+
+enum InterStorePaymentMethod {
+  CASH
+  MOMO
+  BANK
+  OTHER
+}
+
+enum SalePaymentStatus {
+  UNPAID
+  PARTIAL
+  PAID
+  OVERDUE
+}
+
+////////////////////////////
+// SAAS OWNER (YOU)
+////////////////////////////
+
+model PlatformUser {
+  id        String       @id @default(uuid())
+  email     String       @unique
+  password  String
+  role      PlatformRole @default(PLATFORM_ADMIN)
+  createdAt DateTime     @default(now())
+}
+
+////////////////////////////
+// OWNER INTENT
+////////////////////////////
+
+model OwnerIntent {
+  id        String @id @default(uuid())
+  storeName String
+  ownerName String
+  email     String
+  phone     String
+
+  shopType    String?
+  district    String?
+  sector      String?
+  address     String?
+  convertedAt DateTime?
+
+  status    OwnerIntentStatus @default(PENDING)
+  expiresAt DateTime
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @default(now()) @updatedAt
+
+  payments Payment[]
+}
+
+////////////////////////////
+// PAYMENT
+////////////////////////////
+
+model Payment {
+  id        String        @id @default(uuid())
+  intentId  String
+  intent    OwnerIntent   @relation(fields: [intentId], references: [id])
+  amount    Float
+  currency  String        @default("RWF")
+  reference String        @unique
+  status    PaymentStatus @default(PENDING)
+  provider  String // MTN_MOMO
+  createdAt DateTime      @default(now())
+}
+
+////////////////////////////
+// TENANT (STORE)
+////////////////////////////
+
+model Tenant {
+  id        String       @id @default(uuid())
+  name      String
+  email     String
+  phone     String
+  status    TenantStatus @default(PENDING)
+  createdAt DateTime     @default(now())
+
+  users        User[]
+  products     Product[]
+  customers    Customer[]
+  sales        Sale[]
+  repairs      Repair[]
+  subscription Subscription?
+
+  salePayments SalePayment[]
+
+ interStorePayments InterStorePayment[]
+
+
+  suppliedDeals InterStoreDeal[] @relation("SupplierDeals")
+  borrowedDeals InterStoreDeal[] @relation("BorrowerDeals")
+  expenses      Expense[]
+}
+
+////////////////////////////
+// USERS (TENANT LEVEL)
+////////////////////////////
+model User {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  name     String
+  email    String   @unique
+  phone    String
+  password String
+  role     UserRole
+
+  receivedSalePayments SalePayment[] @relation("ReceivedSalePayments")
+
+  receivedInterStorePayments InterStorePayment[] @relation("ReceivedInterStorePayments")
+
+
+  // Relations
+  sales     Sale[]     @relation("CashierSales")
+  repairs   Repair[]   @relation("TechnicianRepairs")
+  auditLogs AuditLog[]
+
+  // ✅ EXPENSE RELATIONS (FIX)
+  createdExpenses  Expense[] @relation("CreatedExpenses")
+  approvedExpenses Expense[] @relation("ApprovedExpenses")
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+}
+
+////////////////////////////
+// SUBSCRIPTIONS
+////////////////////////////
+
+model Subscription {
+  id        String             @id @default(uuid())
+  tenantId  String             @unique
+  tenant    Tenant             @relation(fields: [tenantId], references: [id])
+  status    SubscriptionStatus
+  startDate DateTime
+  endDate   DateTime
+  createdAt DateTime           @default(now())
+}
+
+////////////////////////////
+// INVENTORY
+////////////////////////////
+
+model Product {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  name      String
+  sku       String?
+  serial    String?
+  costPrice Float
+  sellPrice Float
+  stockQty  Int
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  saleItems SaleItem[]
+
+  // New relation field - we are using the "ProductDeals" name for consistency
+  deals                     InterStoreDeal[] @relation("ProductDeals")
+  receivedInInterStoreDeals InterStoreDeal[] @relation(name: "ReceivedProduct")
+}
+
+////////////////////////////
+// CUSTOMERS
+////////////////////////////
+
+model Customer {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  name  String
+  phone String
+
+  createdAt DateTime @default(now())
+
+  sales   Sale[]
+  repairs Repair[]
+
+  @@index([tenantId])
+
+  @@unique([tenantId, phone])
+
+}
+
+////////////////////////////
+// POS (SALES)
+////////////////////////////
+
+model Sale {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  cashierId String
+  cashier   User   @relation("CashierSales", fields: [cashierId], references: [id])
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+
+  total     Float
+  createdAt DateTime @default(now())
+
+  // ✅ CREDIT SALES
+  saleType   SaleType          @default(CASH)
+  amountPaid Float             @default(0)
+  balanceDue Float             @default(0)
+  status     SalePaymentStatus @default(PAID)
+  dueDate    DateTime?
+
+  items    SaleItem[]
+  payments SalePayment[] @relation("SalePayments")
+
+  @@index([tenantId])
+  @@index([saleType])
+  @@index([status])
+  @@index([dueDate])
+}
+
+model SaleItem {
+  id     String @id @default(uuid())
+  saleId String
+  sale   Sale   @relation(fields: [saleId], references: [id])
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+
+  quantity Int
+  price    Float
+}
+
+model SalePayment {
+  id String @id @default(uuid())
+
+  saleId String
+  sale   Sale   @relation("SalePayments", fields: [saleId], references: [id])
+
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  receivedById String?
+  receivedBy   User?   @relation("ReceivedSalePayments", fields: [receivedById], references: [id])
+
+  amount    Float
+  method    SalePaymentMethod @default(CASH)
+  note      String?
+  createdAt DateTime          @default(now())
+
+  @@index([saleId])
+  @@index([tenantId])
+  @@index([receivedById])
+}
+
+////////////////////////////
+// REPAIRS
+////////////////////////////
+
+model Repair {
+  id       String @id @default(uuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  technicianId String? // <-- It must be nullable (this is where we set `String?` to allow null)
+  technician   User?   @relation("TechnicianRepairs", fields: [technicianId], references: [id])
+
+  device      String
+  serial      String?
+  issue       String
+  status      RepairStatus
+  warrantyEnd DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+}
+
+////////////////////////////
+// EXPENSES
+////////////////////////////
+
+model Expense {
+  id           String          @id @default(cuid())
+  title        String
+  category     ExpenseCategory // Enum type for category
+  notes        String?
+  status       String          @default("PENDING")
+  createdAt    DateTime        @default(now())
+  approvedAt   DateTime?
+  tenantId     String
+  createdById  String
+  approvedById String?
+
+  tenant     Tenant @relation(fields: [tenantId], references: [id])
+  createdBy  User   @relation("CreatedExpenses", fields: [createdById], references: [id])
+  approvedBy User?  @relation("ApprovedExpenses", fields: [approvedById], references: [id])
+
+  @@index([tenantId])
+}
+
+////////////////////////////
+// INTER-STORE DEALS
+////////////////////////////
+
+model InterStoreDeal {
+  id String @id @default(uuid())
+
+  // Borrowing store (the tenant using Storvex)
+  borrowerTenantId String
+  borrowerTenant   Tenant @relation(name: "BorrowerDeals", fields: [borrowerTenantId], references: [id])
+
+  // INTERNAL supplier (optional)
+  supplierTenantId String?
+  supplierTenant   Tenant? @relation(name: "SupplierDeals", fields: [supplierTenantId], references: [id])
+
+  // EXTERNAL supplier (optional)
+  externalSupplierName  String?
+  externalSupplierPhone String?
+
+  // Person who takes the item (RESELLER / BORROWER PERSON)
+  resellerName       String
+  resellerPhone      String
+  resellerStore      String?
+  resellerWorkplace  String?
+  resellerDistrict   String?
+  resellerSector     String?
+  resellerAddress    String?
+  resellerNationalId String?
+
+  // Product info (inventory link optional)
+  productId String?
+  product   Product? @relation(name: "ProductDeals", fields: [productId], references: [id])
+
+  productName     String
+  productCategory String?
+  productColor    String?
+
+  // ✅ Serial should never be optional
+  serial String
+
+  // ✅ Quantity for this deal (Phase 1: keep at 1 for serialized items; later support serials list)
+  quantity         Int @default(1)
+  soldQuantity     Int @default(0)
+  returnedQuantity Int @default(0)
+
+  // Money tracking (audit)
+  agreedPrice    Float
+  soldPrice      Float?
+  paidAmount     Float?
+  paymentMethod  String?
+  dueDate        DateTime?
+  takenAt        DateTime? // optional custom timestamp if needed (borrowedAt already exists)
+
+  // Optional link to POS sale
+  saleId String?
+
+  payments InterStorePayment[]
+
+
+  status InterStoreDealStatus @default(BORROWED)
+
+  borrowedAt DateTime  @default(now())
+  soldAt     DateTime?
+  returnedAt DateTime?
+  paidAt     DateTime?
+
+  notes String?
+
+  createdAt DateTime @default(now())
+
+  receivedAt        DateTime?
+  receivedProductId String?
+  receivedProduct   Product?  @relation(name: "ReceivedProduct", fields: [receivedProductId], references: [id])
+
+  @@index([borrowerTenantId])
+  @@index([supplierTenantId])
+  @@index([status])
+  @@index([receivedProductId])
+  @@index([resellerPhone])
+  @@index([serial])
+}
+
+
+model InterStorePayment {
+  id String @id @default(uuid())
+
+  dealId String
+  deal   InterStoreDeal @relation(fields: [dealId], references: [id])
+
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  receivedById String?
+  receivedBy   User? @relation("ReceivedInterStorePayments", fields: [receivedById], references: [id])
+
+  amount    Float
+  method    InterStorePaymentMethod @default(CASH)
+  note      String?
+  createdAt DateTime @default(now())
+
+  @@index([dealId])
+  @@index([tenantId])
+  @@index([receivedById])
+}
+
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  tenantId  String
+  userId    String?
+  action    String
+  entity    String
+  entityId  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+}
