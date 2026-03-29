@@ -1,44 +1,118 @@
 const prisma = require("../../config/database");
 
+function normalizeText(value) {
+  const s = String(value || "").trim();
+  return s || null;
+}
+
+function normalizePhone(value) {
+  const s = String(value || "").trim();
+  return s || null;
+}
+
+function normalizeBoolean(value, fallback = false) {
+  if (value == null) return fallback;
+  return Boolean(value);
+}
+
+function safeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 // CREATE
 async function createCustomer(req, res) {
-  const { name, phone } = req.body;
+  const {
+    name,
+    phone,
+    email,
+    address,
+    tinNumber,
+    idNumber,
+    notes,
+    whatsappOptIn,
+  } = req.body || {};
 
-  if (!name || !phone) {
+  const cleanName = normalizeText(name);
+  const cleanPhone = normalizePhone(phone);
+
+  if (!cleanName || !cleanPhone) {
     return res.status(400).json({ message: "Name and phone are required" });
   }
 
   const tenantId = req.user?.tenantId;
-  if (!tenantId) return res.status(400).json({ message: "Tenant ID is missing" });
+  if (!tenantId) {
+    return res.status(400).json({ message: "Tenant ID is missing" });
+  }
 
   try {
-    // With UNIQUE(tenantId, phone) in DB, this prevents duplicates.
-    // If phone already exists, return a clear error.
     const customer = await prisma.customer.create({
-      data: { tenantId, name: String(name).trim(), phone: String(phone).trim() },
+      data: {
+        tenantId,
+        name: cleanName,
+        phone: cleanPhone,
+        ...(email !== undefined ? { email: normalizeText(email) } : {}),
+        ...(address !== undefined ? { address: normalizeText(address) } : {}),
+        ...(tinNumber !== undefined ? { tinNumber: normalizeText(tinNumber) } : {}),
+        ...(idNumber !== undefined ? { idNumber: normalizeText(idNumber) } : {}),
+        ...(notes !== undefined ? { notes: normalizeText(notes) } : {}),
+        ...(whatsappOptIn !== undefined
+          ? { whatsappOptIn: normalizeBoolean(whatsappOptIn, false) }
+          : {}),
+        ...(typeof prisma.customer.fields?.isActive !== "undefined" ? { isActive: true } : {}),
+      },
     });
 
     return res.status(201).json(customer);
   } catch (err) {
-    // Prisma unique violation is P2002
     if (err?.code === "P2002") {
       return res.status(409).json({ message: "Customer with this phone already exists" });
     }
+
     console.error("Failed to create customer", err);
     return res.status(500).json({ message: "Failed to create customer" });
   }
 }
 
-// READ ALL (with outstanding credit per customer)
+// SEARCH / READ ALL
 async function getCustomers(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = req.user?.tenantId;
+    if (!tenantId) {
+      return res.status(400).json({ message: "Tenant ID is missing" });
+    }
 
-    // Return customers + outstanding credit (sum of balanceDue of credit sales)
-    // We do it with groupBy to keep it fast.
+    const q = String(req.query.q || "").trim();
+    const includeInactive =
+      String(req.query.includeInactive || "").toLowerCase() === "true";
+
+    const where = {
+      tenantId,
+      ...(typeof prisma.customer.fields?.isActive !== "undefined" && !includeInactive
+        ? { isActive: true }
+        : {}),
+      ...(q
+        ? {
+            OR: [
+              { name: { contains: q, mode: "insensitive" } },
+              { phone: { contains: q, mode: "insensitive" } },
+              ...(typeof prisma.customer.fields?.email !== "undefined"
+                ? [{ email: { contains: q, mode: "insensitive" } }]
+                : []),
+              ...(typeof prisma.customer.fields?.tinNumber !== "undefined"
+                ? [{ tinNumber: { contains: q, mode: "insensitive" } }]
+                : []),
+              ...(typeof prisma.customer.fields?.idNumber !== "undefined"
+                ? [{ idNumber: { contains: q, mode: "insensitive" } }]
+                : []),
+            ],
+          }
+        : {}),
+    };
+
     const [customers, creditAgg] = await Promise.all([
       prisma.customer.findMany({
-        where: { tenantId },
+        where,
         orderBy: { createdAt: "desc" },
       }),
       prisma.sale.groupBy({
@@ -55,7 +129,9 @@ async function getCustomers(req, res) {
 
     const map = new Map();
     for (const row of creditAgg) {
-      if (row.customerId) map.set(row.customerId, row._sum.balanceDue || 0);
+      if (row.customerId) {
+        map.set(row.customerId, safeNumber(row._sum.balanceDue, 0));
+      }
     }
 
     const enriched = customers.map((c) => ({
@@ -65,7 +141,7 @@ async function getCustomers(req, res) {
 
     return res.json(enriched);
   } catch (err) {
-    console.error(err);
+    console.error("Failed to fetch customers", err);
     return res.status(500).json({ message: "Failed to fetch customers" });
   }
 }
@@ -79,7 +155,9 @@ async function getCustomerById(req, res) {
       where: { id, tenantId: req.user.tenantId },
     });
 
-    if (!customer) return res.status(404).json({ message: "Customer not found" });
+    if (!customer) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
 
     return res.json(customer);
   } catch (err) {
@@ -91,39 +169,78 @@ async function getCustomerById(req, res) {
 // UPDATE
 async function updateCustomer(req, res) {
   const { id } = req.params;
-  const { name, phone } = req.body;
+  const {
+    name,
+    phone,
+    email,
+    address,
+    tinNumber,
+    idNumber,
+    notes,
+    whatsappOptIn,
+    isActive,
+  } = req.body || {};
 
   try {
+    const data = {
+      ...(name !== undefined ? { name: normalizeText(name) } : {}),
+      ...(phone !== undefined ? { phone: normalizePhone(phone) } : {}),
+      ...(email !== undefined ? { email: normalizeText(email) } : {}),
+      ...(address !== undefined ? { address: normalizeText(address) } : {}),
+      ...(tinNumber !== undefined ? { tinNumber: normalizeText(tinNumber) } : {}),
+      ...(idNumber !== undefined ? { idNumber: normalizeText(idNumber) } : {}),
+      ...(notes !== undefined ? { notes: normalizeText(notes) } : {}),
+      ...(whatsappOptIn !== undefined
+        ? { whatsappOptIn: normalizeBoolean(whatsappOptIn, false) }
+        : {}),
+      ...(isActive !== undefined &&
+      typeof prisma.customer.fields?.isActive !== "undefined"
+        ? { isActive: Boolean(isActive) }
+        : {}),
+    };
+
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ message: "No valid customer fields provided" });
+    }
+
     const updated = await prisma.customer.updateMany({
       where: { id, tenantId: req.user.tenantId },
-      data: {
-        ...(name ? { name: String(name).trim() } : {}),
-        ...(phone ? { phone: String(phone).trim() } : {}),
-      },
+      data,
     });
 
     if (updated.count === 0) {
       return res.status(404).json({ message: "Customer not found" });
     }
 
-    return res.json({ message: "Customer updated successfully" });
+    const customer = await prisma.customer.findFirst({
+      where: { id, tenantId: req.user.tenantId },
+    });
+
+    return res.json(customer);
   } catch (err) {
     if (err?.code === "P2002") {
       return res.status(409).json({ message: "Customer with this phone already exists" });
     }
+
     console.error("Failed to update customer", err);
     return res.status(500).json({ message: "Failed to update customer" });
   }
 }
 
-// REACTIVATE CUSTOMER (soft restore)
+// REACTIVATE CUSTOMER
 async function reactivateCustomer(req, res) {
   const { id } = req.params;
 
   try {
+    if (typeof prisma.customer.fields?.isActive === "undefined") {
+      return res.status(400).json({
+        message: "Customer reactivation requires isActive field in schema",
+      });
+    }
+
     const result = await prisma.customer.updateMany({
-      where: { id, tenantId: req.user.tenantId, name: "[DEACTIVATED]" },
-      data: { name: "Restored Customer" },
+      where: { id, tenantId: req.user.tenantId, isActive: false },
+      data: { isActive: true },
     });
 
     if (result.count === 0) {
@@ -146,12 +263,20 @@ async function deactivateCustomer(req, res) {
   const { id } = req.params;
 
   try {
+    if (typeof prisma.customer.fields?.isActive === "undefined") {
+      return res.status(400).json({
+        message: "Customer deactivation requires isActive field in schema",
+      });
+    }
+
     const result = await prisma.customer.updateMany({
-      where: { id, tenantId: req.user.tenantId },
-      data: { name: "[DEACTIVATED]" },
+      where: { id, tenantId: req.user.tenantId, isActive: true },
+      data: { isActive: false },
     });
 
-    if (result.count === 0) return res.status(404).json({ message: "Customer not found" });
+    if (result.count === 0) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
 
     return res.json({ message: "Customer deactivated successfully" });
   } catch (err) {
@@ -174,10 +299,21 @@ async function getCustomerLedger(req, res) {
 
     const customer = await prisma.customer.findFirst({
       where: { id: customerId, tenantId },
-      select: { id: true, name: true, phone: true },
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        ...(typeof prisma.customer.fields?.email !== "undefined" ? { email: true } : {}),
+        ...(typeof prisma.customer.fields?.address !== "undefined" ? { address: true } : {}),
+        ...(typeof prisma.customer.fields?.tinNumber !== "undefined" ? { tinNumber: true } : {}),
+        ...(typeof prisma.customer.fields?.idNumber !== "undefined" ? { idNumber: true } : {}),
+        ...(typeof prisma.customer.fields?.isActive !== "undefined" ? { isActive: true } : {}),
+      },
     });
 
-    if (!customer) return res.status(404).json({ message: "Customer not found" });
+    if (!customer) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
 
     const sales = await prisma.sale.findMany({
       where: { tenantId, customerId },
@@ -191,6 +327,8 @@ async function getCustomerLedger(req, res) {
         amountPaid: true,
         balanceDue: true,
         dueDate: true,
+        receiptNumber: true,
+        invoiceNumber: true,
         items: {
           select: {
             quantity: true,
@@ -205,17 +343,18 @@ async function getCustomerLedger(req, res) {
       },
     });
 
-    // Summaries
     let totalAll = 0;
     let totalCredit = 0;
     let totalPaid = 0;
     let totalOutstanding = 0;
 
     for (const s of sales) {
-      totalAll += s.total;
-      totalPaid += s.amountPaid || 0;
-      if (s.saleType === "CREDIT") totalCredit += s.total;
-      totalOutstanding += s.balanceDue || 0;
+      totalAll += safeNumber(s.total, 0);
+      totalPaid += safeNumber(s.amountPaid, 0);
+      if (s.saleType === "CREDIT") {
+        totalCredit += safeNumber(s.total, 0);
+      }
+      totalOutstanding += safeNumber(s.balanceDue, 0);
     }
 
     return res.json({
@@ -230,7 +369,7 @@ async function getCustomerLedger(req, res) {
       sales,
     });
   } catch (err) {
-    console.error(err);
+    console.error("Failed to fetch ledger", err);
     return res.status(500).json({ message: "Failed to fetch ledger" });
   }
 }
@@ -243,14 +382,12 @@ async function getCreditSummary(req, res) {
   try {
     const tenantId = req.user.tenantId;
 
-    // Total outstanding
     const totals = await prisma.sale.aggregate({
       where: { tenantId, saleType: "CREDIT" },
       _sum: { balanceDue: true, total: true, amountPaid: true },
       _count: { _all: true },
     });
 
-    // Top debtors (by sum(balanceDue))
     const grouped = await prisma.sale.groupBy({
       by: ["customerId"],
       where: {
@@ -265,29 +402,43 @@ async function getCreditSummary(req, res) {
     });
 
     const customerIds = grouped.map((g) => g.customerId).filter(Boolean);
+
     const customers = await prisma.customer.findMany({
       where: { tenantId, id: { in: customerIds } },
-      select: { id: true, name: true, phone: true },
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        ...(typeof prisma.customer.fields?.isActive !== "undefined" ? { isActive: true } : {}),
+      },
     });
 
     const cMap = new Map(customers.map((c) => [c.id, c]));
 
     const topDebtors = grouped.map((g) => ({
-      customer: cMap.get(g.customerId) || { id: g.customerId, name: "Unknown", phone: "" },
-      outstanding: g._sum.balanceDue || 0,
+      customer:
+        cMap.get(g.customerId) || {
+          id: g.customerId,
+          name: "Unknown",
+          phone: "",
+          ...(typeof prisma.customer.fields?.isActive !== "undefined"
+            ? { isActive: false }
+            : {}),
+        },
+      outstanding: safeNumber(g._sum.balanceDue, 0),
     }));
 
     return res.json({
       totals: {
         creditSalesCount: totals._count._all,
-        totalCredit: totals._sum.total || 0,
-        totalPaid: totals._sum.amountPaid || 0,
-        totalOutstanding: totals._sum.balanceDue || 0,
+        totalCredit: safeNumber(totals._sum.total, 0),
+        totalPaid: safeNumber(totals._sum.amountPaid, 0),
+        totalOutstanding: safeNumber(totals._sum.balanceDue, 0),
       },
       topDebtors,
     });
   } catch (err) {
-    console.error(err);
+    console.error("Failed to fetch credit summary", err);
     return res.status(500).json({ message: "Failed to fetch credit summary" });
   }
 }

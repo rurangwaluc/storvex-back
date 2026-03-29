@@ -1,92 +1,133 @@
-// Load environment variables from .env file
-require("dotenv").config(); 
+require("dotenv").config();
 
-// Import dependencies
 const express = require("express");
 const cors = require("cors");
+
 const authenticate = require("./middlewares/authenticate");
+const requireTenant = require("./middlewares/requireTenant");
+const requireRole = require("./middlewares/requireRole");
+const {
+  requireActiveSubscription,
+} = require("./middlewares/requireActiveSubscription");
+
 const authRoutes = require("./modules/auth/auth.routes");
 const userRoutes = require("./modules/users/users.routes");
 const tenantRoutes = require("./modules/tenants/tenants.routes");
 const posRoutes = require("./modules/pos/pos.routes");
+const cashDrawerRouter = require("./modules/cashDrawer/cashDrawer.routes");
+const storeRoutes = require("./modules/store/store.routes");
+
 const repairRoutes = require("./modules/repairs/repairs.routes");
 const inventoryRoutes = require("./modules/inventory/inventory.routes");
 const customerRoutes = require("./modules/customers/customers.routes");
 const reportRoutes = require("./modules/reports/reports.routes");
 const interstoreRoutes = require("./modules/interStore/interStore.routes");
-// const paymentsRoutes = require("./modules/payments/payments.routes");
-const requireActiveSubscription = require("./middlewares/requireActiveSubscription");
+
+const whatsappRoutes = require("./modules/whatsapp/whatsapp.routes");
+const whatsappAccountsRoutes = require("./modules/whatsapp/whatsapp.accounts.routes");
+const whatsappInboxRoutes = require("./modules/whatsapp/whatsapp.inbox.routes");
+
+const deliveryNotesRoutes = require("./modules/deliveryNotes/deliveryNotes.routes");
+const receiptsRoutes = require("./modules/receipts/receipts.routes");
+const invoicesRoutes = require("./modules/invoices/invoices.routes");
+const proformasRoutes = require("./modules/proformas/proformas.routes");
+const warrantiesRoutes = require("./modules/warranties/warranties.routes");
+
+const permissionsRoutes = require("./modules/auth/permissions.routes");
 
 const app = express();
 
-// Use CORS with default options, allowing all origins
 app.use(cors());
 
-// Global middleware to parse JSON requests
+/**
+ * IMPORTANT
+ * Webhook MUST be raw bytes so signature verification uses exact payload.
+ * This must run BEFORE global express.json().
+ */
+app.use("/api/whatsapp/webhook", express.raw({ type: "*/*" }));
+
 app.use(express.json());
 
-// Health check route to verify the service is running
 app.get("/health", (req, res) => {
   res.json({ status: "OK", service: "Storvex API" });
 });
 
-// Authentication routes (Public routes)
+// Auth routes
 app.use("/api/auth", authRoutes);
 
-// API root route (requires authentication and active subscription)
+// Permissions routes
+app.use("/api/auth/permissions", permissionsRoutes);
+
 app.get("/api", authenticate, requireActiveSubscription, (req, res) => {
   res.json({ message: "Storvex API root" });
 });
 
-// Hard test route for authentication (will only be accessible if the user is authenticated)
 app.get("/api/auth-test", authenticate, (req, res) => {
-  res.json({
-    message: "Authentication successful",
-    user: req.user, // Assuming `authenticate` middleware sets `req.user`
-  });
+  res.json({ message: "Authentication successful", user: req.user });
 });
 
-// Payments routes (currently commented out, can be added in the future)
-// app.use("/api/payments", paymentsRoutes);
-
-// Platform routes (for platform-level functionality)
+// Platform routes
 app.use("/api/platform", require("./modules/platform/platform.routes"));
 app.use("/api/platform/auth", require("./modules/platform/platform.auth.routes"));
 
-// Tenants routes (for tenant-level functionality)
+// Tenant routes
 app.use("/api/tenants", tenantRoutes);
 
-// Dashboard routes (for dashboard-related functionality)
+// Other modules
 app.use("/api/dashboard", require("./modules/dashboard/dashboard.routes"));
-
-// Employees routes (for employee-related functionality)
 app.use("/api/employees", require("./modules/employees/employee.routes"));
-
-// Audit routes (for audit logging and tracking)
 app.use("/api/audit", require("./modules/audit/audit.routes"));
-
-// Expenses routes (for expense management)
 app.use("/api/expenses", require("./modules/expenses/expenses.routes"));
+app.use("/api/billing", require("./modules/billing/billing.routes"));
+app.use("/api/suppliers", require("./modules/suppliers/suppliers.routes"));
 
-// Users routes (for user management)
+app.use(
+  "/api/store",
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+  requireRole("OWNER", "MANAGER", "STOREKEEPER", "SELLER", "CASHIER", "TECHNICIAN"),
+  storeRoutes
+);
+
+app.use(
+  "/api/cash-drawer",
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  cashDrawerRouter
+);
+
+// Document routes
+app.use("/api/delivery-notes", deliveryNotesRoutes);
+app.use("/api/receipts", receiptsRoutes);
+app.use("/api/invoices", invoicesRoutes);
+app.use("/api/proformas", proformasRoutes);
+app.use("/api/warranties", warrantiesRoutes);
+
+// Core business routes
 app.use("/api/users", userRoutes);
-
-// POS routes (for point-of-sale functionality)
 app.use("/api/pos", posRoutes);
-
-// Inventory routes (for inventory management)
 app.use("/api/inventory", inventoryRoutes);
-
-// Customers routes (for customer management, protected by authentication)
 app.use("/api/customers", authenticate, customerRoutes);
-
-// Repairs routes (for repair management)
 app.use("/api/repairs", repairRoutes);
-
-// Reports routes (for report generation)
 app.use("/api/reports", reportRoutes);
-
-// Interstore routes (for interstore operations)
 app.use("/api/interstore", interstoreRoutes);
+
+// WhatsApp webhook (public)
+app.use("/api/whatsapp", whatsappRoutes);
+
+// WhatsApp accounts (OWNER only)
+app.use(
+  "/api/whatsapp",
+  authenticate,
+  requireTenant,
+  requireRole("OWNER"),
+  whatsappAccountsRoutes
+);
+
+// WhatsApp inbox / protected actions inside its own route layer
+app.use("/api/whatsapp", whatsappInboxRoutes);
 
 module.exports = app;

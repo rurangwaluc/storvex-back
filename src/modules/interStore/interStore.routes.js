@@ -1,51 +1,148 @@
-// src/modules/interStore/interStore.routes.js
+// src/modules/interstore/interStore.routes.js
 const express = require("express");
-const router = express.Router();
 
-const controller = require("./interStore.controller");
+const router = express.Router();
 
 const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
 const requireRole = require("../../middlewares/requireRole");
-const requireActiveSubscription = require("../../middlewares/requireActiveSubscription");
+const {
+  requireActiveSubscription,
+  requireWritableSubscription,
+} = require("../../middlewares/requireActiveSubscription");
 
-// All interstore actions require auth + tenant + active subscription
+const controller = require("./interStore.controller");
+
+// All routes are tenant-auth protected.
 router.use(authenticate, requireTenant, requireActiveSubscription);
 
-// Borrow / create deal
-router.post("/", requireRole("OWNER", "CASHIER"), controller.createDeal);
+/**
+ * Access model
+ *
+ * READ:
+ * - OWNER
+ * - MANAGER
+ * - CASHIER
+ *
+ * WRITE / OPERATIONAL:
+ * - OWNER
+ * - MANAGER
+ * - CASHIER
+ *
+ * HIGH-CONTROL:
+ * - OWNER
+ * - MANAGER
+ */
 
-// Mark as RECEIVED
-router.patch("/:id/received", requireRole("OWNER", "CASHIER"), controller.markReceived);
+//
+// Collections / Search / Listing
+//
+router.get(
+  "/outstanding",
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.listOutstanding
+);
 
-// Mark as SOLD
-router.patch("/:id/sold", requireRole("OWNER", "CASHIER"), controller.markSold);
+router.get(
+  "/overdue",
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.listOverdue
+);
 
-// Mark as RETURNED
-router.patch("/:id/returned", requireRole("OWNER", "CASHIER"), controller.markReturned);
+router.get(
+  "/search",
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.searchDeals
+);
 
-// ⚠️ If you’re doing installments, you should STOP using /:id/paid.
-// If you want to keep it temporarily, leave it. Otherwise remove it.
-// router.patch("/:id/paid", requireRole("OWNER"), controller.markPaid);
+router.get(
+  "/collections/search",
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.searchCollections
+);
 
-// Installments: record a payment
-router.post("/:id/payments", requireRole("OWNER"), controller.addPayment);
+router.get(
+  "/payments",
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.listPayments
+);
 
-// Installments: list payments for a deal
-router.get("/:id/payments", requireRole("OWNER", "CASHIER"), controller.getDealPayments);
+router.get(
+  "/audit",
+  requireRole("OWNER", "MANAGER"),
+  controller.listDealAudit
+);
 
-// List deals
-router.get("/", controller.listDeals);
+router.get(
+  "/",
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.listDeals
+);
 
-// Outstanding / overdue
-router.get("/outstanding", requireRole("OWNER", "CASHIER"), controller.listOutstanding);
-router.get("/overdue", requireRole("OWNER", "CASHIER"), controller.listOverdue);
+//
+// Deal creation / workflow mutations
+//
+router.post(
+  "/",
+  express.json(),
+  requireWritableSubscription,
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.createDeal
+);
 
-// Search
-router.get("/search", requireRole("OWNER", "CASHIER"), controller.searchDeals);
-router.get("/collections/search", requireRole("OWNER", "CASHIER"), controller.searchCollections);
+router.post(
+  "/:id/receive",
+  express.json(),
+  requireWritableSubscription,
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.markReceived
+);
 
-// Audit log
-router.get("/audit", requireRole("OWNER"), controller.listDealAudit);
+router.post(
+  "/:id/sell",
+  express.json(),
+  requireWritableSubscription,
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.markSold
+);
+
+router.post(
+  "/:id/return",
+  express.json(),
+  requireWritableSubscription,
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.markReturned
+);
+
+router.post(
+  "/:id/paid",
+  express.json(),
+  requireWritableSubscription,
+  requireRole("OWNER", "MANAGER"),
+  controller.markPaid
+);
+
+router.get(
+  "/:id/payments",
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.getDealPayments
+);
+
+router.post(
+  "/:id/payments",
+  express.json(),
+  requireWritableSubscription,
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.addPayment
+);
+
+//
+// Keep this LAST so it does not catch /outstanding, /overdue, /search, etc.
+//
+router.get(
+  "/:id",
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.getDeal
+);
 
 module.exports = router;

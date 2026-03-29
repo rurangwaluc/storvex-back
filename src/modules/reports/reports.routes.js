@@ -1,37 +1,34 @@
 const express = require("express");
 const router = express.Router();
 
-const reportsController = require("./reports.controller");
-
 const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
 const requireRole = require("../../middlewares/requireRole");
+const { requireActiveSubscription } = require("../../middlewares/requireActiveSubscription");
 
-// Sales summary
-router.get(
-  "/sales",
-  authenticate,
-  requireTenant,
-  requireRole("OWNER"),
-  reportsController.salesSummary
-);
+const {
+  salesSummary,
+  expenseSummary,
+  repairSummary,
+  dashboard,
+  dailyClose,
+  topSellers,
+  dailyClosePdf,
+  periodPdf,
+  insights,
+} = require("./reports.controller");
 
-// Inventory report
-router.get(
-  "/inventory",
-  authenticate,
-  requireTenant,
-  requireRole("OWNER"),
-  reportsController.inventoryReport
-);
+// Owner only for now
+router.use(authenticate, requireTenant, requireActiveSubscription, requireRole("OWNER"));
 
-// Repairs report
-router.get(
-  "/repairs",
-  authenticate,
-  requireTenant,
-  requireRole("OWNER"),
-  reportsController.repairsReport
-);
+router.get("/sales-summary", salesSummary);
+router.get("/expense-summary", expenseSummary);
+router.get("/repair-summary", repairSummary);
+router.get("/dashboard", dashboard);
+router.get("/daily-close", dailyClose);
+router.get("/top-sellers", topSellers);
+router.get("/insights", insights);
+router.get("/daily-close.pdf", dailyClosePdf);
+router.get("/period.pdf", periodPdf);
 
 module.exports = router;

@@ -5,36 +5,49 @@ const controller = require("./expenses.controller");
 const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
 const requireRole = require("../../middlewares/requireRole");
+const {
+  requireActiveSubscription,
+  requireWritableSubscription,
+} = require("../../middlewares/requireActiveSubscription");
 
-// OWNER only
-router.post(
-  "/",
+const readBase = [authenticate, requireTenant, requireActiveSubscription];
+const writeBase = [
   authenticate,
   requireTenant,
+  requireActiveSubscription,
+  requireWritableSubscription,
+];
+
+// Recommended policy:
+// - CASHIER/TECHNICIAN can create (request)
+// - OWNER can list/approve/delete
+
+router.post(
+  "/",
+  ...writeBase,
   requireRole("OWNER", "CASHIER", "TECHNICIAN"),
-  controller.createExpense,
+  controller.createExpense
 );
 
 router.get(
   "/",
-  authenticate,
-  requireTenant,
+  ...readBase,
   requireRole("OWNER"),
-  controller.listExpenses,
+  controller.listExpenses
 );
+
 router.patch(
   "/:id/approve",
-  authenticate,
-  requireTenant,
+  ...writeBase,
   requireRole("OWNER"),
-  controller.approveExpense,
+  controller.approveExpense
 );
+
 router.delete(
   "/:id",
-  authenticate,
-  requireTenant,
+  ...writeBase,
   requireRole("OWNER"),
-  controller.deleteExpense,
+  controller.deleteExpense
 );
 
 module.exports = router;

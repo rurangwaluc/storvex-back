@@ -5,17 +5,70 @@ const controller = require("./employee.controller");
 
 const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
-const requireRole = require("../../middlewares/requireRole");
-const requireActiveSubscription = require("../../middlewares/requireActiveSubscription");
+const {
+  requireActiveSubscription,
+  requireWritableSubscription,
+} = require("../../middlewares/requireActiveSubscription");
+const requireDbPermission = require("../../middlewares/requireDbPermission");
+const {
+  enforceSeatLimitOnCreate,
+  enforceSeatLimitOnUpdate,
+} = require("../../middlewares/enforceStaffSeatLimit");
 
-// OWNER ONLY
-router.use(authenticate, requireTenant, requireRole("OWNER"));
-router.use(authenticate, requireTenant, requireActiveSubscription, requireRole("OWNER"));
+const base = [authenticate, requireTenant, requireActiveSubscription];
 
-// Employee routes
-router.post("/", controller.createEmployee);
-router.get("/", controller.listEmployees);  // This route will return both employees and subscription info
-router.put("/:id", controller.updateEmployee);
-router.delete("/:id", controller.deleteEmployee);
+router.get(
+  "/",
+  ...base,
+  requireDbPermission("user.view"),
+  controller.listEmployees
+);
+
+router.post(
+  "/",
+  express.json(),
+  ...base,
+  requireWritableSubscription,
+  requireDbPermission("user.create"),
+  enforceSeatLimitOnCreate,
+  controller.createEmployee
+);
+
+router.put(
+  "/:id",
+  express.json(),
+  ...base,
+  requireWritableSubscription,
+  requireDbPermission("user.update"),
+  enforceSeatLimitOnUpdate,
+  controller.updateEmployee
+);
+
+router.patch(
+  "/:id/status",
+  express.json(),
+  ...base,
+  requireWritableSubscription,
+  requireDbPermission("user.deactivate"),
+  enforceSeatLimitOnUpdate,
+  controller.setEmployeeActiveStatus
+);
+
+router.post(
+  "/:id/reset-password",
+  express.json(),
+  ...base,
+  requireWritableSubscription,
+  requireDbPermission("user.update"),
+  controller.resetEmployeePassword
+);
+
+router.delete(
+  "/:id",
+  ...base,
+  requireWritableSubscription,
+  requireDbPermission("user.deactivate"),
+  controller.deleteEmployee
+);
 
 module.exports = router;

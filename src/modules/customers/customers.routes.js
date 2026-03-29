@@ -6,80 +6,80 @@ const customersController = require("./customers.controller");
 const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
 const requireRole = require("../../middlewares/requireRole");
-const requireActiveSubscription = require("../../middlewares/requireActiveSubscription");
+const {
+  requireActiveSubscription,
+  requireWritableSubscription,
+} = require("../../middlewares/requireActiveSubscription");
 
-// Customers CRUD
-router.post(
-  "/",
+const readBase = [authenticate, requireTenant, requireActiveSubscription];
+const writeBase = [
   authenticate,
   requireTenant,
   requireActiveSubscription,
-  requireRole("OWNER", "CASHIER"),
+  requireWritableSubscription,
+];
+
+// CREATE
+router.post(
+  "/",
+  ...writeBase,
+  requireRole("OWNER", "MANAGER", "CASHIER", "SELLER"),
   customersController.createCustomer
 );
 
+// LIST / SEARCH
 router.get(
   "/",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER", "CASHIER", "TECHNICIAN"),
+  ...readBase,
+  requireRole("OWNER", "MANAGER", "CASHIER", "SELLER", "TECHNICIAN"),
   customersController.getCustomers
 );
 
+// IMPORTANT: static routes BEFORE dynamic :id routes
 router.get(
-  "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER", "CASHIER", "TECHNICIAN"),
-  customersController.getCustomerById
+  "/ledger/summary/outstanding",
+  ...readBase,
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  customersController.getCreditSummary
 );
 
-router.put(
-  "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER", "CASHIER"),
-  customersController.updateCustomer
-);
-
-router.delete(
-  "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER"),
-  customersController.deactivateCustomer
-);
-
-router.put(
-  "/:id/reactivate",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER"),
-  customersController.reactivateCustomer
-);
-
-// ✅ Ledger + summaries (money features)
 router.get(
   "/:id/ledger",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER", "CASHIER"),
+  ...readBase,
+  requireRole("OWNER", "MANAGER", "CASHIER"),
   customersController.getCustomerLedger
 );
 
+// READ ONE
 router.get(
-  "/ledger/summary/outstanding",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER", "CASHIER"),
-  customersController.getCreditSummary
+  "/:id",
+  ...readBase,
+  requireRole("OWNER", "MANAGER", "CASHIER", "SELLER", "TECHNICIAN"),
+  customersController.getCustomerById
+);
+
+// UPDATE
+router.put(
+  "/:id",
+  ...writeBase,
+  requireRole("OWNER", "MANAGER", "CASHIER", "SELLER"),
+  customersController.updateCustomer
+);
+
+// DEACTIVATE
+router.delete(
+  "/:id",
+  ...writeBase,
+  requireRole("OWNER", "MANAGER"),
+  customersController.deactivateCustomer
+);
+
+// REACTIVATE
+router.put(
+  "/:id/reactivate",
+  ...writeBase,
+  requireRole("OWNER", "MANAGER"),
+  customersController.reactivateCustomer
 );
 
 module.exports = router;

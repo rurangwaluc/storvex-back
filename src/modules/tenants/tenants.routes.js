@@ -1,34 +1,64 @@
+// src/modules/tenants/tenants.routes.js
+
 const express = require("express");
+const multer = require("multer");
+
 const router = express.Router();
 
 const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
 const requireRole = require("../../middlewares/requireRole");
+const {
+  requireActiveSubscription,
+  requireWritableSubscription,
+} = require("../../middlewares/requireActiveSubscription");
 
+const controller = require("./tenants.controller");
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Settings
 router.get(
-  "/test-owner",
+  "/settings",
   authenticate,
   requireTenant,
+  requireActiveSubscription,
   requireRole("OWNER"),
-  (req, res) => {
-    res.json({
-      message: "OWNER access granted",
-      user: req.user,
-    });
-  }
+  controller.getTenantSettings
 );
 
-router.get(
-  "/test-cashier",
+router.patch(
+  "/settings",
+  express.json(),
   authenticate,
   requireTenant,
-  requireRole("CASHIER"),
-  (req, res) => {
-    res.json({
-      message: "CASHIER access granted",
-      user: req.user,
-    });
-  }
+  requireActiveSubscription,
+  requireWritableSubscription,
+  requireRole("OWNER"),
+  controller.updateTenantSettings
+);
+
+// Logo upload (OWNER only)
+router.post(
+  "/logo/upload",
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+  requireWritableSubscription,
+  requireRole("OWNER"),
+  upload.single("file"),
+  controller.uploadTenantLogo
+);
+
+// Remove logo (OWNER only)
+router.post(
+  "/logo/remove",
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+  requireWritableSubscription,
+  requireRole("OWNER"),
+  controller.removeTenantLogo
 );
 
 module.exports = router;

@@ -1,27 +1,37 @@
-// ✅ Fully fixed: src/utils/auditLogger.js
-const { PrismaClient, AuditAction } = require("@prisma/client");
+// src/utils/auditLogger.js
+const prisma = require("../config/database");
 
-const prisma = new PrismaClient();
+// ✅ Prisma v5/v6 safest way: read enums from Prisma namespace
+const { Prisma } = require("@prisma/client");
 
-// Strict allowlist: ONLY allow schema enum values
-const ALLOWED_ACTIONS = new Set(Object.values(AuditAction));
+// These may be undefined depending on Prisma build/export style.
+// So we must NOT call Object.values on undefined.
+const AUDIT_ACTION_ENUM = Prisma?.AuditAction;
+const AUDIT_ENTITY_ENUM = Prisma?.AuditEntity;
 
-async function logAudit({
-  tenantId,
-  userId,
-  action,
-  entity,
-  entityId = null,
-  metadata = null,
-}) {
-  // Required fields
-  if (!tenantId || !entity) {
-    console.error("Audit log rejected: missing tenantId/entity", { tenantId, entity });
+// Strict allowlists (only if enums exist)
+const ALLOWED_ACTIONS = AUDIT_ACTION_ENUM ? new Set(Object.values(AUDIT_ACTION_ENUM)) : null;
+const ALLOWED_ENTITIES = AUDIT_ENTITY_ENUM ? new Set(Object.values(AUDIT_ENTITY_ENUM)) : null;
+
+async function logAudit({ tenantId, userId, action, entity, entityId = null, metadata = null }) {
+  if (!tenantId || !entity || !action) {
+    console.error("Audit log rejected: missing tenantId/entity/action", {
+      tenantId,
+      entity,
+      action,
+    });
     return;
   }
 
-  // Enforce enum value
-  if (!ALLOWED_ACTIONS.has(action)) {
+  // ✅ Validate ONLY if enums are available (prevents server crash)
+  if (ALLOWED_ENTITIES && !ALLOWED_ENTITIES.has(entity)) {
+    console.error("Audit log rejected invalid entity:", entity, {
+      allowed: Array.from(ALLOWED_ENTITIES),
+    });
+    return;
+  }
+
+  if (ALLOWED_ACTIONS && !ALLOWED_ACTIONS.has(action)) {
     console.error("Audit log rejected invalid action:", action, {
       allowed: Array.from(ALLOWED_ACTIONS),
     });
@@ -33,7 +43,7 @@ async function logAudit({
       data: {
         tenantId,
         userId: userId || null,
-        action, // stored as string in DB, enforced here
+        action,
         entity,
         entityId,
         metadata,

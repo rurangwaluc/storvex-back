@@ -1,24 +1,1235 @@
-datasource db {
-  provider          = "postgresql"
-  url               = env("DATABASE_URL") // runtime (pooler OK)
-  directUrl         = env("DIRECT_URL")   // migrations (direct/session)
-  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
-}
-
-
 generator client {
   provider = "prisma-client-js"
 }
 
-////////////////////////////
-// ENUMS
-////////////////////////////
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  directUrl         = env("DIRECT_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+model PlatformUser {
+  id        String       @id @default(uuid())
+  email     String       @unique
+  password  String
+  role      PlatformRole @default(PLATFORM_ADMIN)
+  createdAt DateTime     @default(now())
+}
+model Permission {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  key         String   @unique @db.Text
+  module      String   @db.Text
+  label       String   @db.Text
+  description String?  @db.Text
+  createdAt   DateTime @default(now()) @map("createdAt") @db.Timestamp(6)
+
+  rolePermissions RolePermission[]
+  userPermissions UserPermission[]
+
+  @@map("Permission")
+}
+
+model RolePermission {
+  id           String   @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  role         UserRole
+  permissionId String   @map("permission_id") @db.Text
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(6)
+
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([role, permissionId])
+  @@map("RolePermission")
+}
+
+model UserPermission {
+  id           String   @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  userId       String   @map("user_id") @db.Text
+  permissionId String   @map("permission_id") @db.Text
+  isGranted    Boolean  @map("is_granted")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(6)
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, permissionId])
+  @@map("UserPermission")
+}
+
+/// /////////////////////////
+/// /////////////////////////
+model OwnerIntent {
+  id                          String            @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  email                       String            @db.Text
+  phone                       String            @db.Text
+  storeName                   String            @db.Text
+  status                      OwnerIntentStatus @default(PENDING)
+  expiresAt                   DateTime
+  createdAt                   DateTime          @default(now())
+
+  address                     String?           @db.Text
+  convertedAt                 DateTime?
+  district                    String?           @db.Text
+  ownerName                   String            @db.Text
+  sector                      String?           @db.Text
+  shopType                    String?           @db.Text
+  updatedAt                   DateTime          @default(now()) @updatedAt
+
+  emailVerified               Boolean           @default(false)
+  phoneVerified               Boolean           @default(false)
+  emailVerifiedAt             DateTime?
+  phoneVerifiedAt             DateTime?
+
+  deviceId                    String?           @db.Text
+  browserFingerprint          String?           @db.Text
+  signupIp                    String?           @db.Text
+  signupUserAgent             String?           @db.Text
+
+  trialGrantedAt              DateTime?
+  trialEligibilityCheckedAt   DateTime?
+  trialBlockedReason          String?           @db.Text
+
+  requestedPlanKey            String?           @db.Text
+  requestedTierKey            String?           @db.Text
+  requestedCycleKey           String?           @db.Text
+  requestedStaffLimit         Int?
+  requestedPriceAmount        Float?
+  requestedCurrency           String?           @db.Text
+
+  otps                        OtpCode[]
+  otpDeliveryLogs             OtpDeliveryLog[]
+  payments                    Payment[]
+}
+
+model Payment {
+  id           String        @id @default(uuid())
+  intentId     String?
+  amount       Float
+  currency     String        @default("RWF")
+  reference    String        @unique
+  status       PaymentStatus @default(PENDING)
+  provider     String
+  createdAt    DateTime      @default(now())
+  tenantId     String?
+  planKey      String?
+  tierKey      String?       @db.Text
+  cycleKey     String?       @db.Text
+  staffLimit   Int?
+  priceAmount  Float?
+  purpose      String
+  updatedAt    DateTime      @default(now()) @updatedAt
+
+  intent       OwnerIntent?  @relation(fields: [intentId], references: [id])
+  tenant       Tenant?       @relation(fields: [tenantId], references: [id])
+
+  @@index([intentId])
+  @@index([tenantId])
+  @@index([status])
+  @@index([purpose])
+  @@index([planKey])
+  @@index([tierKey])
+  @@index([cycleKey])
+}
+
+model Tenant {
+  id                           String                    @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  name                         String                    @db.Text
+  email                        String                    @db.Text
+  phone                        String                    @db.Text
+  status                       TenantStatus              @default(PENDING)
+  createdAt                    DateTime                  @default(now())
+
+  logoUrl                      String?                   @db.Text
+  receiptHeader                String?                   @db.Text
+  receiptFooter                String?                   @db.Text
+  logoKey                      String?                   @db.Text
+
+  proformas Proforma[]
+
+  shopType                     String?                   @db.Text
+  district                     String?                   @db.Text
+  sector                       String?                   @db.Text
+  address                      String?                   @db.Text
+  countryCode                  String                    @default("RW") @db.Text
+  currencyCode                 String                    @default("RWF") @db.Text
+  timezone                     String                    @default("Africa/Kigali") @db.Text
+  onboardingCompleted          Boolean                   @default(false)
+  onboardingCompletedAt        DateTime?
+
+  cash_drawer_block_cash_sales Boolean                   @default(true)
+
+  documentSettings              TenantDocumentSettings?
+  documentCounter               TenantDocumentCounter?
+
+  customers                    Customer[]
+  deliveryNotes                DeliveryNote[]
+  deliveryNoteCounters         DeliveryNoteCounter?
+  expenses                     Expense[]
+  borrowedDeals                InterStoreDeal[]          @relation("BorrowerDeals")
+  suppliedDeals                InterStoreDeal[]          @relation("SupplierDeals")
+  interStorePayments           InterStorePayment[]
+  notifications                Notification[]
+  payments                     Payment[]
+  products                     Product[]
+  promotions                   Promotion[]
+  purchaseOrders               PurchaseOrder[]
+  purchaseOrderItemSerials     PurchaseOrderItemSerial[]
+  repairs                      Repair[]
+  sales                        Sale[]
+  salePayments                 SalePayment[]
+  saleRefunds                  SaleRefund[]              @relation("TenantToSaleRefunds")
+  stockAdjustments             StockAdjustment[]
+  subscription                 Subscription?
+  suppliers                    Supplier[]
+  SupplierSupply               SupplierSupply[]
+  SupplierSupplyItem           SupplierSupplyItem[]
+  users                        User[]
+  whatsAppAccounts             WhatsAppAccount[]
+  whatsAppBroadcasts           WhatsAppBroadcast[]
+  whatsAppConversations        WhatsAppConversation[]
+  whatsAppMessages             WhatsAppMessage[]
+  saleWarranties               SaleWarranty[]
+
+  @@map("Tenant")
+}
+
+
+model TenantDocumentSettings {
+  tenantId              String   @id @db.Text
+  receiptPrefix         String   @default("RCT") @db.Text
+  invoicePrefix         String   @default("INV") @db.Text
+  warrantyPrefix        String   @default("WAR") @db.Text
+  receiptPadding        Int      @default(6)
+  invoicePadding        Int      @default(6)
+  warrantyPadding       Int      @default(6)
+  invoiceTerms          String?  @db.Text
+  warrantyTerms         String?  @db.Text
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @default(now()) @updatedAt
+
+  proformaPrefix        String   @default("PRF")
+  proformaPadding       Int      @default(6)
+  proformaTerms         String?  @db.Text
+  deliveryNoteTerms     String?  @db.Text
+
+  documentPrimaryColor  String?  @db.Text
+  documentAccentColor   String?  @db.Text
+
+  tenant                Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("TenantDocumentSettings")
+}
+
+model TenantDocumentCounter {
+  tenantId         String   @id @db.Text
+  nextReceiptSeq   BigInt   @default(1)
+  nextInvoiceSeq   BigInt   @default(1)
+  nextWarrantySeq  BigInt   @default(1)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @default(now()) @updatedAt
+
+  tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  nextProformaSeq BigInt @default(1)
+  
+  @@map("TenantDocumentCounter")
+}
+
+/// /////////////////////////
+/// /////////////////////////
+model User {
+  id                         String                 @id @default(uuid())
+  tenantId                   String
+  name                       String
+  email                      String                 @unique
+  phone                      String
+  password                   String
+  role                       UserRole
+  createdAt                  DateTime               @default(now())
+  isActive                   Boolean                @default(true) @map("is_active")
+  
+  userPermissions UserPermission[]
+
+  createdProformas Proforma[] @relation("ProformaCreatedBy")
+
+
+  auditLogs                  AuditLog[]
+  createdDeliveryNotes       DeliveryNote[]
+  approvedExpenses           Expense[]              @relation("ApprovedExpenses")
+  createdExpenses            Expense[]              @relation("CreatedExpenses")
+  receivedInterStorePayments InterStorePayment[]    @relation("ReceivedInterStorePayments")
+  createdNotifications       Notification[]         @relation("NotificationsCreated")
+  receivedNotifications      Notification[]         @relation("NotificationsReceived")
+  promotions                 Promotion[]
+  purchaseOrders             PurchaseOrder[]
+  repairs                    Repair[]               @relation("TechnicianRepairs")
+  sales                      Sale[]                 @relation("CashierSales")
+  saleRefundsCreated         SaleRefund[]           @relation("UserToSaleRefunds")
+  receivedSalePayments       SalePayment[]          @relation("ReceivedSalePayments")
+  stockAdjustments           StockAdjustment[]
+  tenant                     Tenant                 @relation(fields: [tenantId], references: [id])
+  whatsAppBroadcasts         WhatsAppBroadcast[]
+  assignedConversations      WhatsAppConversation[]
+  whatsAppMessages           WhatsAppMessage[]
+  saleWarranties             SaleWarranty[]
+
+  @@index([tenantId])
+  @@index([tenantId, id])
+  @@map("User")
+}
+
+
+model Subscription {
+  id                  String                  @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  tenantId            String                  @unique @db.Text
+  status              SubscriptionStatus
+  accessMode          SubscriptionAccessMode  @default(ACTIVE)
+
+  planKey             String?                 @db.Text
+  tierKey             String?                 @db.Text
+  cycleKey            String?                 @db.Text
+  staffLimit          Int?
+  priceAmount         Float?
+  currency            String?                 @db.Text
+
+  startDate           DateTime
+  endDate             DateTime
+  trialStartDate      DateTime?
+  trialEndDate        DateTime?
+  graceEndDate        DateTime?
+  readOnlySince       DateTime?
+  lastPaymentAt       DateTime?
+  renewedAt           DateTime?
+  createdAt           DateTime                @default(now())
+
+  trialConsumed       Boolean                 @default(false)
+  trialSourceIntentId String?                 @db.Text
+  nextPlanKey         String?                 @db.Text
+
+  tenant              Tenant                  @relation(fields: [tenantId], references: [id])
+
+  @@index([status])
+  @@index([accessMode])
+  @@index([planKey])
+  @@index([tierKey])
+  @@index([cycleKey])
+}
+
+model Product {
+  id                        String                    @id @default(uuid())
+  tenantId                  String
+  name                      String
+  sku                       String?
+  serial                    String?
+  costPrice                 Float
+  sellPrice                 Float
+  stockQty                  Int
+  createdAt                 DateTime                  @default(now())
+  isActive                  Boolean                   @default(true)
+  brand                     String?
+  category                  String?
+  subcategory               String?
+  subcategoryOther          String?
+  minStockLevel             Int?
+  barcode                   String?
+  location                  String?
+  notes                     String?
+  refundItems               SaleRefundItem[]          @relation("ProductToRefundItems")
+  supplierName              String?
+  supplierId                String?
+  deliveryNoteItems         DeliveryNoteItem[]
+  deals                     InterStoreDeal[]          @relation("ProductDeals")
+  receivedInInterStoreDeals InterStoreDeal[]          @relation("ReceivedProduct")
+  supplier                  Supplier?                 @relation(fields: [supplierId], references: [id])
+  tenant                    Tenant                    @relation(fields: [tenantId], references: [id])
+  promotions                Promotion[]
+  purchaseOrderItems        PurchaseOrderItem[]
+  purchaseOrderItemSerials  PurchaseOrderItemSerial[]
+  saleItems                 SaleItem[]
+  stockAdjustments          StockAdjustment[]
+  SupplierSupplyItem        SupplierSupplyItem[]
+
+  proformaItems ProformaItem[]
+
+  @@index([tenantId, supplierId])
+  @@index([tenantId])
+  @@index([tenantId, category])
+  @@index([tenantId, subcategory])
+  @@index([tenantId, name])
+  @@index([tenantId, barcode])
+  @@index([tenantId, brand])
+  @@index([tenantId, supplierName])
+}
+
+model Customer {
+  id                    String                 @id @default(uuid())
+  tenantId              String
+  name                  String
+  phone                 String
+  email                 String?
+  address               String?
+  tinNumber             String?
+  idNumber              String?
+  notes                 String?
+  isActive              Boolean                @default(true)
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @default(now()) @updatedAt
+  whatsappOptIn         Boolean                @default(false)
+
+  tenant                Tenant                 @relation(fields: [tenantId], references: [id])
+  repairs               Repair[]
+  sales                 Sale[]
+  whatsAppConversations WhatsAppConversation[]
+
+  proformas Proforma[]
+
+  @@unique([tenantId, phone])
+  @@index([tenantId])
+  @@index([tenantId, name])
+  @@index([tenantId, phone])
+  @@index([tenantId, isActive])
+  @@index([tenantId, tinNumber])
+  @@index([tenantId, idNumber])
+}
+
+model Sale {
+  id         String            @id @default(uuid())
+  tenantId   String
+  cashierId  String
+  customerId String?
+  total      Float
+  createdAt  DateTime          @default(now())
+  amountPaid Float             @default(0)
+  balanceDue Float             @default(0)
+  dueDate    DateTime?
+  saleType   SaleType          @default(CASH)
+  status     SalePaymentStatus @default(PAID)
+
+  // draft lifecycle
+  isDraft     Boolean   @default(false)
+  draftSource String?
+  finalizedAt DateTime?
+
+  // cancel/void support
+  isCancelled   Boolean   @default(false)
+  cancelledAt   DateTime?
+  cancelledById String?
+  cancelNote    String?
+
+  // refund summary
+  refundedTotal Float @default(0)
+
+  deliveryNotes DeliveryNote[]
+  cashier       User           @relation("CashierSales", fields: [cashierId], references: [id])
+  customer      Customer?      @relation(fields: [customerId], references: [id])
+  tenant        Tenant         @relation(fields: [tenantId], references: [id])
+  items         SaleItem[]
+  payments      SalePayment[]  @relation("SalePayments")
+  refunds       SaleRefund[]   @relation("SaleToRefunds")
+  warranties    SaleWarranty[]
+
+  receiptNumber String?
+  invoiceNumber String?
+
+  conversationId String?
+  conversation   WhatsAppConversation? @relation(fields: [conversationId], references: [id])
+  @@index([conversationId])
+
+  @@index([tenantId])
+  @@index([tenantId, isDraft])
+  @@index([tenantId, draftSource])
+  @@index([saleType])
+  @@index([status])
+  @@index([dueDate])
+  @@index([isCancelled])
+}
+
+model SaleItem {
+  id                String             @id @default(uuid())
+  saleId            String
+  productId         String
+  quantity          Int
+  price             Float
+  product           Product            @relation(fields: [productId], references: [id])
+  sale              Sale               @relation(fields: [saleId], references: [id])
+  saleWarrantyUnits SaleWarrantyUnit[]
+}
+
+model SalePayment {
+  id           String            @id @default(uuid())
+  saleId       String
+  tenantId     String
+  receivedById String?
+  amount       Float
+  method       SalePaymentMethod @default(CASH)
+  note         String?
+  createdAt    DateTime          @default(now())
+  receivedBy   User?             @relation("ReceivedSalePayments", fields: [receivedById], references: [id])
+  sale         Sale              @relation("SalePayments", fields: [saleId], references: [id])
+  tenant       Tenant            @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, note])
+  @@index([saleId])
+  @@index([tenantId])
+  @@index([receivedById])
+}
+
+model Proforma {
+  id               String          @id @default(cuid())
+  tenantId         String
+  customerId       String?
+  createdById      String?
+
+  number           String
+  status           ProformaStatus  @default(DRAFT)
+
+  customerName     String
+  customerPhone    String?
+  customerEmail    String?
+  customerAddress  String?
+
+  subtotal         Float           @default(0)
+  total            Float           @default(0)
+  currency         String          @default("RWF")
+
+  validUntil       DateTime?
+  preparedBy       String?
+  reference        String?
+  notes            String?
+
+  convertedToSaleId String?
+  convertedAt      DateTime?
+
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  tenant           Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer         Customer?       @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  createdBy        User?           @relation("ProformaCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  items            ProformaItem[]
+
+  @@unique([tenantId, number])
+  @@index([tenantId, status, createdAt])
+  @@index([tenantId, customerName])
+  @@index([tenantId, customerPhone])
+  @@index([tenantId, validUntil])
+  @@index([tenantId, convertedToSaleId])
+}
+
+model ProformaItem {
+  id           String    @id @default(cuid())
+  proformaId   String
+  productId    String?
+
+  productName  String
+  serial       String?
+  quantity     Int
+  unitPrice    Float
+  total        Float
+
+  createdAt    DateTime  @default(now())
+
+  proforma     Proforma  @relation(fields: [proformaId], references: [id], onDelete: Cascade)
+  product      Product?  @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([proformaId, createdAt])
+  @@index([productId])
+}
+
+model SaleRefund {
+  id          String @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  saleId      String @map("sale_id") @db.Text
+  tenantId    String @map("tenant_id") @db.Text
+  createdById String @map("created_by_id") @db.Text
+
+  // ✅ these exist in DB (you showed them)
+  total  Float   @map("total")
+  method String  @map("method") @db.Text // keep String because DB column is TEXT (not a Postgres enum)
+  note   String? @map("note") @db.Text
+
+  reason    String?  @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  sale      Sale   @relation(fields: [saleId], references: [id], name: "SaleToRefunds")
+  tenant    Tenant @relation(fields: [tenantId], references: [id], name: "TenantToSaleRefunds")
+  createdBy User   @relation(fields: [createdById], references: [id], name: "UserToSaleRefunds")
+
+  items SaleRefundItem[] @relation("RefundToItems")
+
+  @@index([saleId])
+  @@index([tenantId])
+  @@index([createdById])
+  @@map("SaleRefund")
+}
+
+model SaleRefundItem {
+  id        String @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  refundId  String @map("refund_id") @db.Text
+  productId String @map("product_id") @db.Text
+  quantity  Int    @map("quantity")
+  price     Float  @map("price")
+
+  refund  SaleRefund @relation(fields: [refundId], references: [id], name: "RefundToItems")
+  product Product    @relation(fields: [productId], references: [id], name: "ProductToRefundItems")
+
+  @@index([refundId])
+  @@index([productId])
+  @@map("SaleRefundItem")
+}
+
+model Repair {
+  id           String       @id @default(uuid())
+  tenantId     String
+  customerId   String
+  technicianId String?
+  device       String
+  serial       String?
+  issue        String
+  status       RepairStatus
+  warrantyEnd  DateTime?
+  createdAt    DateTime     @default(now())
+  customer     Customer     @relation(fields: [customerId], references: [id])
+  technician   User?        @relation("TechnicianRepairs", fields: [technicianId], references: [id])
+  tenant       Tenant       @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+}
+
+model Expense {
+  id           String          @id @default(cuid())
+  title        String
+  notes        String?
+  status       String          @default("PENDING")
+  createdAt    DateTime        @default(now())
+  approvedAt   DateTime?
+  tenantId     String
+  createdById  String
+  approvedById String?
+  category     ExpenseCategory
+  amount       Float
+  approvedBy   User?           @relation("ApprovedExpenses", fields: [approvedById], references: [id])
+  createdBy    User            @relation("CreatedExpenses", fields: [createdById], references: [id])
+  tenant       Tenant          @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+}
+
+model InterStoreDeal {
+  id                    String               @id @default(uuid())
+  supplierTenantId      String?
+  borrowerTenantId      String
+  productId             String?
+  serial                String
+  agreedPrice           Float
+  status                InterStoreDealStatus @default(BORROWED)
+  borrowedAt            DateTime             @default(now())
+  soldAt                DateTime?
+  returnedAt            DateTime?
+  paidAt                DateTime?
+  notes                 String?
+  createdAt             DateTime             @default(now())
+  externalSupplierName  String?
+  externalSupplierPhone String?
+  productName           String
+  receivedAt            DateTime?
+  receivedProductId     String?
+  soldPrice             Float?
+  paidAmount            Float?
+  paymentMethod         String?
+  saleId                String?
+  resellerName          String
+  resellerPhone         String
+  resellerStore         String?
+  resellerWorkplace     String?
+  resellerDistrict      String?
+  resellerSector        String?
+  resellerAddress       String?
+  resellerNationalId    String?
+  productCategory       String?
+  productColor          String?
+  quantity              Int                  @default(1)
+  soldQuantity          Int                  @default(0)
+  returnedQuantity      Int                  @default(0)
+  dueDate               DateTime?
+  takenAt               DateTime?
+  borrowerTenant        Tenant               @relation("BorrowerDeals", fields: [borrowerTenantId], references: [id])
+  product               Product?             @relation("ProductDeals", fields: [productId], references: [id])
+  receivedProduct       Product?             @relation("ReceivedProduct", fields: [receivedProductId], references: [id])
+  supplierTenant        Tenant?              @relation("SupplierDeals", fields: [supplierTenantId], references: [id])
+  payments              InterStorePayment[]
+
+  @@index([borrowerTenantId])
+  @@index([supplierTenantId])
+  @@index([status])
+  @@index([receivedProductId])
+  @@index([resellerPhone])
+  @@index([serial])
+}
+
+model InterStorePayment {
+  id           String                  @id @default(uuid())
+  dealId       String
+  tenantId     String
+  receivedById String?
+  amount       Float
+  method       InterStorePaymentMethod @default(CASH)
+  note         String?
+  createdAt    DateTime                @default(now())
+  deal         InterStoreDeal          @relation(fields: [dealId], references: [id])
+  receivedBy   User?                   @relation("ReceivedInterStorePayments", fields: [receivedById], references: [id])
+  tenant       Tenant                  @relation(fields: [tenantId], references: [id])
+
+  @@index([dealId])
+  @@index([tenantId])
+  @@index([receivedById])
+}
+
+model AuditLog {
+  id        String      @id @default(uuid())
+  tenantId  String
+  entityId  String?
+  createdAt DateTime    @default(now())
+  userId    String?
+  metadata  Json?
+  action    AuditAction
+  entity    AuditEntity
+  user      User?       @relation(fields: [userId], references: [id])
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, entity, createdAt])
+  @@index([tenantId, action, createdAt])
+}
+
+model WhatsAppAccount {
+  id                 String                 @id @default(uuid())
+  tenantId           String
+  phoneNumber        String
+  businessName       String?
+  phoneNumberId      String?                @unique
+  wabaId             String?
+  accessToken        String?
+  webhookVerifyToken String?
+  appSecret          String?
+  isActive           Boolean                @default(true)
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+  tenant             Tenant                 @relation(fields: [tenantId], references: [id])
+  broadcasts         WhatsAppBroadcast[]
+  conversations      WhatsAppConversation[] @relation("AccountConversations")
+  whatsAppMessages   WhatsAppMessage[]
+
+  @@unique([tenantId, phoneNumber])
+  @@index([tenantId])
+}
+
+model WhatsAppConversation {
+  id           String             @id @default(uuid())
+  tenantId     String
+  accountId    String
+  customerId   String?
+  phone        String
+  status       ConversationStatus @default(OPEN)
+  assignedToId String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  account      WhatsAppAccount    @relation("AccountConversations", fields: [accountId], references: [id])
+  assignedTo   User?              @relation(fields: [assignedToId], references: [id])
+  customer     Customer?          @relation(fields: [customerId], references: [id])
+  tenant       Tenant             @relation(fields: [tenantId], references: [id])
+  messages     WhatsAppMessage[]
+  sales Sale[]
+
+  @@index([tenantId])
+  @@index([phone])
+  @@index([accountId])
+  @@index([tenantId, status])
+}
+
+model WhatsAppMessage {
+  id             String               @id @default(uuid())
+  conversationId String
+  tenantId       String
+  accountId      String?
+  broadcastId    String?
+  direction      WhatsAppDirection
+  type           WhatsAppMessageType
+  textContent    String?
+  mediaUrl       String?
+  messageId      String?              @unique
+  sentById       String?
+  createdAt      DateTime             @default(now())
+  account        WhatsAppAccount?     @relation(fields: [accountId], references: [id])
+  broadcast      WhatsAppBroadcast?   @relation(fields: [broadcastId], references: [id])
+  conversation   WhatsAppConversation @relation(fields: [conversationId], references: [id])
+  sentBy         User?                @relation(fields: [sentById], references: [id])
+  tenant         Tenant               @relation(fields: [tenantId], references: [id])
+
+  @@index([conversationId])
+  @@index([tenantId])
+  @@index([accountId])
+  @@index([broadcastId])
+}
+
+model Promotion {
+  id          String              @id @default(uuid())
+  tenantId    String
+  title       String
+  message     String
+  productId   String?
+  createdById String
+  createdAt   DateTime            @default(now())
+  sentAt      DateTime?
+  createdBy   User                @relation(fields: [createdById], references: [id])
+  product     Product?            @relation(fields: [productId], references: [id])
+  tenant      Tenant              @relation(fields: [tenantId], references: [id])
+  broadcasts  WhatsAppBroadcast[]
+
+  @@index([tenantId])
+  @@index([productId])
+  @@index([createdAt])
+}
+
+model WhatsAppBroadcast {
+  id           String            @id @default(uuid())
+  tenantId     String
+  accountId    String
+  promotionId  String?
+  templateName String
+  languageCode String            @default("en_US")
+  status       BroadcastStatus   @default(DRAFT)
+  createdById  String
+  queuedAt     DateTime?
+  sentAt       DateTime?
+  createdAt    DateTime          @default(now())
+  account      WhatsAppAccount   @relation(fields: [accountId], references: [id])
+  createdBy    User              @relation(fields: [createdById], references: [id])
+  promotion    Promotion?        @relation(fields: [promotionId], references: [id])
+  tenant       Tenant            @relation(fields: [tenantId], references: [id])
+  messages     WhatsAppMessage[]
+
+  @@index([tenantId])
+  @@index([accountId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Notification {
+  id              String           @id @default(uuid())
+  tenantId        String
+  type            NotificationType @default(INFO)
+  title           String
+  message         String
+  createdById     String?
+  recipientUserId String?
+  recipientRole   UserRole?
+  readAt          DateTime?
+  createdAt       DateTime         @default(now())
+  createdBy       User?            @relation("NotificationsCreated", fields: [createdById], references: [id])
+  recipientUser   User?            @relation("NotificationsReceived", fields: [recipientUserId], references: [id])
+  tenant          Tenant           @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@index([tenantId, createdAt])
+  @@index([recipientUserId])
+  @@index([recipientRole])
+}
+model OtpCode {
+  id           String           @id @default(uuid())
+  intentId     String           @db.Text
+  channel      OtpChannel
+  target       String           @db.Text
+  codeHash     String           @db.Text
+  expiresAt    DateTime
+  attempts     Int              @default(0)
+  verifiedAt   DateTime?
+  createdAt    DateTime         @default(now())
+  intent       OwnerIntent      @relation(fields: [intentId], references: [id])
+  deliveryLogs OtpDeliveryLog[]
+
+  @@index([intentId, channel])
+  @@index([target])
+  @@index([expiresAt])
+}
+
+model TrialGuard {
+  id                 String   @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+
+  email              String?  @unique @db.Text
+  phone              String?  @unique @db.Text
+  deviceId           String?  @unique @db.Text
+  browserFingerprint String?  @unique @db.Text
+
+  normalizedEmail    String?  @db.Text
+  normalizedPhone    String?  @db.Text
+  deviceHash         String?  @db.Text
+  fingerprintHash    String?  @db.Text
+  ipHash             String?  @db.Text
+
+  intentId           String?  @db.Text
+  tenantId           String?  @db.Text
+  ip                 String?  @db.Text
+  userAgent          String?  @db.Text
+  consumedAt         DateTime
+  createdAt          DateTime @default(now())
+
+  @@index([normalizedEmail])
+  @@index([normalizedPhone])
+  @@index([deviceHash])
+  @@index([fingerprintHash])
+  @@index([ipHash])
+  @@index([tenantId])
+  @@index([intentId])
+}
+
+model OtpDeliveryLog {
+  id          String      @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  otpId       String?     @db.Text
+  intentId    String      @db.Text
+  channel     OtpChannel
+  target      String      @db.Text
+  provider    String?     @db.Text
+  status      String      @db.Text
+  reason      String?     @db.Text
+  messageId   String?     @db.Text
+  metadata    Json?
+  requestedAt DateTime    @default(now())
+  deliveredAt DateTime?
+
+  otp         OtpCode?    @relation(fields: [otpId], references: [id])
+  intent      OwnerIntent @relation(fields: [intentId], references: [id])
+
+  @@index([intentId, requestedAt(sort: Desc)])
+  @@index([target, requestedAt(sort: Desc)])
+  @@index([status, requestedAt(sort: Desc)])
+  @@index([provider, requestedAt(sort: Desc)])
+  @@map("OtpDeliveryLog")
+}
+
+model StockAdjustment {
+  id          String              @id @default(uuid())
+  tenantId    String
+  productId   String
+  type        StockAdjustmentType
+  delta       Int
+  beforeQty   Int
+  afterQty    Int
+  note        String?
+  createdById String?
+  createdAt   DateTime            @default(now())
+  createdBy   User?               @relation(fields: [createdById], references: [id])
+  product     Product             @relation(fields: [productId], references: [id], onDelete: Cascade)
+  tenant      Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, productId, createdAt])
+}
+
+/// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
+model Supplier {
+  id             String             @id @default(uuid())
+  tenantId       String
+  name           String
+  phone          String?
+  email          String?
+  address        String?
+  notes          String?
+  isActive       Boolean            @default(true)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @default(now()) @updatedAt
+  idType         SupplierIdType
+  idNumber       String
+  companyName    String?
+  taxId          String?
+  sourceType     SupplierSourceType @default(OTHER)
+  sourceDetails  String?
+  verifiedAt     DateTime?          @db.Timestamp(6)
+  products       Product[]
+  orders         PurchaseOrder[]
+  tenant         Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  SupplierSupply SupplierSupply[]
+
+  @@unique([tenantId, idType, idNumber])
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+  @@index([tenantId, name])
+}
+
+model PurchaseOrder {
+  id          String                    @id @default(uuid())
+  tenantId    String
+  supplierId  String
+  status      PurchaseOrderStatus       @default(DRAFT)
+  orderDate   DateTime?                 @db.Date
+  receivedAt  DateTime?
+  note        String?
+  createdById String?
+  createdAt   DateTime                  @default(now())
+  updatedAt   DateTime                  @default(now()) @updatedAt
+  createdBy   User?                     @relation(fields: [createdById], references: [id], onUpdate: NoAction)
+  supplier    Supplier                  @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
+  tenant      Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  items       PurchaseOrderItem[]
+  serials     PurchaseOrderItemSerial[]
+
+  @@index([tenantId])
+  @@index([supplierId])
+  @@index([tenantId, status, createdAt])
+}
+
+model PurchaseOrderItem {
+  id              String                    @id @default(uuid())
+  purchaseOrderId String
+  productId       String
+  quantity        Int
+  unitCost        Float
+  createdAt       DateTime                  @default(now())
+  product         Product                   @relation(fields: [productId], references: [id], onUpdate: NoAction)
+  purchaseOrder   PurchaseOrder             @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  serials         PurchaseOrderItemSerial[]
+
+  @@index([purchaseOrderId])
+  @@index([productId])
+  @@index([purchaseOrderId], map: "PurchaseOrderItem_orderId_idx")
+}
+
+model PurchaseOrderItemSerial {
+  id                  String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  tenantId            String
+  purchaseOrderId     String
+  purchaseOrderItemId String
+  productId           String
+  serial              String
+  notes               String?
+  createdAt           DateTime          @default(now()) @db.Timestamp(6)
+  product             Product           @relation(fields: [productId], references: [id], onUpdate: NoAction, map: "POItemSerial_productId_fkey")
+  purchaseOrder       PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "POItemSerial_purchaseOrderId_fkey")
+  purchaseOrderItem   PurchaseOrderItem @relation(fields: [purchaseOrderItemId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "POItemSerial_purchaseOrderItemId_fkey")
+  tenant              Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "POItemSerial_tenantId_fkey")
+
+  @@unique([tenantId, serial], map: "POItemSerial_tenantId_serial_key")
+  @@index([productId], map: "POItemSerial_productId_idx")
+  @@index([purchaseOrderId], map: "POItemSerial_purchaseOrderId_idx")
+  @@index([purchaseOrderItemId], map: "POItemSerial_purchaseOrderItemId_idx")
+  @@index([tenantId], map: "POItemSerial_tenantId_idx")
+  @@index([tenantId, serial], map: "POItemSerial_tenantId_serial_idx")
+}
+
+model SupplierSupply {
+  id                 String               @id @default(dbgenerated("(gen_random_uuid())::text"))
+  tenantId           String
+  supplierId         String
+  sourceType         SupplySourceType     @default(OTHER)
+  sourceDetails      String?
+  documentRef        String?
+  notes              String?
+  createdAt          DateTime             @default(now()) @db.Timestamp(6)
+  Supplier           Supplier             @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
+  Tenant             Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  SupplierSupplyItem SupplierSupplyItem[]
+
+  @@index([supplierId, createdAt])
+  @@index([tenantId, createdAt])
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model SupplierSupplyItem {
+  id               String         @id @default(dbgenerated("(gen_random_uuid())::text"))
+  tenantId         String
+  supplyId         String
+  productId        String?
+  productName      String
+  category         String?
+  subcategory      String?
+  subcategoryOther String?
+  brand            String?
+  serial           String?
+  quantity         Int            @default(1)
+  buyPrice         Float
+  sellPrice        Float
+  notes            String?
+  createdAt        DateTime       @default(now()) @db.Timestamp(6)
+  Product          Product?       @relation(fields: [productId], references: [id], onUpdate: NoAction)
+  SupplierSupply   SupplierSupply @relation(fields: [supplyId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Tenant           Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([supplyId])
+  @@index([tenantId, createdAt])
+}
+
+model DeliveryNoteCounter {
+  tenantId   String @id
+  nextNumber Int    @default(1)
+  tenant     Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+model DeliveryNote {
+  id              String             @id @default(dbgenerated("(gen_random_uuid())::text"))
+  tenantId        String
+  number          Int
+  date            DateTime           @default(dbgenerated("CURRENT_DATE")) @db.Date
+  saleId          String?
+  customerName    String
+  customerPhone   String?
+  customerAddress String?
+  deliveredBy     String?
+  receivedBy      String?
+  receivedByPhone String?
+  notes           String?
+  createdById     String?
+  createdAt       DateTime           @default(now()) @db.Timestamp(6)
+  updatedAt       DateTime           @default(now()) @updatedAt @db.Timestamp(6)
+  createdBy       User?              @relation(fields: [createdById], references: [id], onUpdate: NoAction)
+  sale            Sale?              @relation(fields: [saleId], references: [id], onUpdate: NoAction)
+  tenant          Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  items           DeliveryNoteItem[]
+
+  @@unique([tenantId, number], map: "DeliveryNote_tenant_number_key")
+  @@index([tenantId, createdAt(sort: Desc)], map: "DeliveryNote_tenant_createdAt_idx")
+  @@index([tenantId, saleId], map: "DeliveryNote_tenant_sale_idx")
+}
+
+model DeliveryNoteItem {
+  id             String       @id @default(dbgenerated("(gen_random_uuid())::text"))
+  deliveryNoteId String
+  productId      String?
+  productName    String
+  serial         String?
+  quantity       Int          @default(1)
+  createdAt      DateTime     @default(now()) @db.Timestamp(6)
+  deliveryNote   DeliveryNote @relation(fields: [deliveryNoteId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  product        Product?     @relation(fields: [productId], references: [id], onUpdate: NoAction)
+
+  @@index([deliveryNoteId], map: "DeliveryNoteItem_note_idx")
+  @@index([productId], map: "DeliveryNoteItem_product_idx")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model cash_drawer_events {
+  id                   String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenant_id            String                 @db.Uuid
+  session_id           String?                @db.Uuid
+  type                 cash_drawer_event_type
+  amount               BigInt?
+  note                 String?
+  created_by_user_id   String                 @db.Uuid
+  created_at           DateTime               @default(now()) @db.Timestamptz(6)
+  cash_drawer_sessions cash_drawer_sessions?  @relation(fields: [session_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([session_id, created_at(sort: Desc)], map: "idx_cash_drawer_events_session_created")
+  @@index([tenant_id, created_at(sort: Desc)], map: "idx_cash_drawer_events_tenant_created")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model cash_drawer_sessions {
+  id                 String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenant_id          String               @db.Uuid
+  opened_at          DateTime             @default(now()) @db.Timestamptz(6)
+  opened_by_user_id  String               @db.Uuid
+  opening_cash       BigInt               @default(0)
+  closed_at          DateTime?            @db.Timestamptz(6)
+  closed_by_user_id  String?              @db.Uuid
+  closing_cash       BigInt?
+  note               String?
+  created_at         DateTime             @default(now()) @db.Timestamptz(6)
+  cash_drawer_events cash_drawer_events[]
+
+  @@index([tenant_id, created_at(sort: Desc)], map: "idx_cash_drawer_sessions_tenant_created")
+  @@index([tenant_id, closed_at], map: "idx_cash_drawer_sessions_tenant_open")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model cash_movements {
+  id            String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenant_id     String               @db.Uuid
+  session_id    String               @db.Uuid
+  type          cash_movement_type
+  reason        cash_movement_reason
+  amount        BigInt
+  note          String?
+  created_by    String?              @db.Uuid
+  created_at    DateTime             @default(now()) @db.Timestamptz(6)
+  cash_sessions cash_sessions        @relation(fields: [session_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([session_id])
+  @@index([tenant_id])
+}
+
+model cash_sessions {
+  id             String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenant_id      String           @db.Uuid
+  opened_by      String?          @db.Uuid
+  opened_at      DateTime         @default(now()) @db.Timestamptz(6)
+  opening_cash   BigInt           @default(0)
+  closed_by      String?          @db.Uuid
+  closed_at      DateTime?        @db.Timestamptz(6)
+  counted_cash   BigInt?
+  close_note     String?
+  created_at     DateTime         @default(now()) @db.Timestamptz(6)
+  cash_movements cash_movements[]
+}
+
+model SaleWarranty {
+  id          String @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  saleId      String @map("sale_id") @db.Text
+  tenantId    String @map("tenant_id") @db.Text
+  createdById String @map("created_by_id") @db.Text
+
+  policy         String?   @db.Text
+  durationMonths Int?      @map("duration_months")
+  durationDays   Int?      @map("duration_days")
+  startsAt       DateTime  @map("starts_at") @db.Timestamptz(6)
+  endsAt         DateTime? @map("ends_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  sale      Sale   @relation(fields: [saleId], references: [id])
+  tenant    Tenant @relation(fields: [tenantId], references: [id])
+  createdBy User   @relation(fields: [createdById], references: [id])
+
+  units SaleWarrantyUnit[]
+
+  warrantyNumber String? @map("warrantyNumber") @db.Text
+
+  @@index([saleId])
+  @@index([tenantId])
+  @@index([createdById])
+  @@map("SaleWarranty")
+}
+
+model SaleWarrantyUnit {
+  id         String @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  warrantyId String @map("warranty_id") @db.Text
+  saleItemId String @map("sale_item_id") @db.Text
+  productId  String @map("product_id") @db.Text
+
+  serial    String? @db.Text
+  imei1     String? @db.Text
+  imei2     String? @db.Text
+  unitLabel String? @map("unit_label") @db.Text
+
+  startsAt DateTime @map("starts_at") @db.Timestamptz(6)
+  endsAt   DateTime @map("ends_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  warranty SaleWarranty @relation(fields: [warrantyId], references: [id], onDelete: Cascade)
+  saleItem SaleItem     @relation(fields: [saleItemId], references: [id], onDelete: Cascade)
+
+  @@unique([warrantyId, serial], map: "SaleWarrantyUnit_unique_serial_per_warranty")
+  @@index([warrantyId])
+  @@index([saleItemId])
+  @@index([productId])
+  @@map("SaleWarrantyUnit")
+}
 
 enum UserRole {
-  PLATFORM_ADMIN
   OWNER
+  MANAGER
   CASHIER
+  SELLER
+  STOREKEEPER
   TECHNICIAN
+  PLATFORM_ADMIN
 }
 
 enum PlatformRole {
@@ -50,6 +1261,14 @@ enum SubscriptionStatus {
   SUSPENDED
 }
 
+enum SubscriptionAccessMode {
+  TRIAL
+  ACTIVE
+  GRACE
+  READ_ONLY
+  SUSPENDED
+}
+
 enum RepairStatus {
   RECEIVED
   IN_PROGRESS
@@ -76,14 +1295,43 @@ enum InterStoreDealStatus {
 
 enum AuditAction {
   CREATE_DEAL
-  MARK_RECEIVED
   MARK_SOLD
   MARK_RETURNED
   MARK_PAID
+  MARK_RECEIVED
   ADD_PAYMENT
+  EXPENSE_CREATED
+  EXPENSE_APPROVED
+  EXPENSE_DELETED
+
+  PRODUCT_CREATED
+  PRODUCT_UPDATED
+  PRODUCT_DEACTIVATED
+  PRODUCT_ACTIVATED
+
+  SALE_CREATED
+SALE_PAYMENT_ADDED
+SALE_CANCELLED
+SALE_REFUNDED
+WARRANTY_CREATED
+CUSTOMER_CREATED
+CUSTOMER_UPDATED
+CUSTOMER_DEACTIVATED
+CUSTOMER_REACTIVATED
 }
 
-
+enum AuditEntity {
+  INTERSTORE_DEAL
+  EXPENSE
+  SALE
+  REPAIR
+  PRODUCT
+  CUSTOMER
+  USER
+  TENANT
+  SUBSCRIPTION
+  PAYMENT
+}
 
 enum SaleType {
   CASH
@@ -111,414 +1359,101 @@ enum SalePaymentStatus {
   OVERDUE
 }
 
-////////////////////////////
-// SAAS OWNER (YOU)
-////////////////////////////
-
-model PlatformUser {
-  id        String       @id @default(uuid())
-  email     String       @unique
-  password  String
-  role      PlatformRole @default(PLATFORM_ADMIN)
-  createdAt DateTime     @default(now())
+enum WhatsAppMessageType {
+  TEXT
+  IMAGE
+  AUDIO
+  VIDEO
+  DOCUMENT
+  LOCATION
+  UNKNOWN
 }
 
-////////////////////////////
-// OWNER INTENT
-////////////////////////////
-
-model OwnerIntent {
-  id        String @id @default(uuid())
-  storeName String
-  ownerName String
-  email     String
-  phone     String
-
-  shopType    String?
-  district    String?
-  sector      String?
-  address     String?
-  convertedAt DateTime?
-
-  status    OwnerIntentStatus @default(PENDING)
-  expiresAt DateTime
-  createdAt DateTime          @default(now())
-  updatedAt DateTime          @default(now()) @updatedAt
-
-  payments Payment[]
+enum WhatsAppDirection {
+  INBOUND
+  OUTBOUND
 }
 
-////////////////////////////
-// PAYMENT
-////////////////////////////
-
-model Payment {
-  id        String        @id @default(uuid())
-  intentId  String
-  intent    OwnerIntent   @relation(fields: [intentId], references: [id])
-  amount    Float
-  currency  String        @default("RWF")
-  reference String        @unique
-  status    PaymentStatus @default(PENDING)
-  provider  String // MTN_MOMO
-  createdAt DateTime      @default(now())
+enum ConversationStatus {
+  OPEN
+  CLOSED
 }
 
-////////////////////////////
-// TENANT (STORE)
-////////////////////////////
-
-model Tenant {
-  id        String       @id @default(uuid())
-  name      String
-  email     String
-  phone     String
-  status    TenantStatus @default(PENDING)
-  createdAt DateTime     @default(now())
-
-  users        User[]
-  products     Product[]
-  customers    Customer[]
-  sales        Sale[]
-  repairs      Repair[]
-  subscription Subscription?
-
-  salePayments SalePayment[]
-
- interStorePayments InterStorePayment[]
-
-
-  suppliedDeals InterStoreDeal[] @relation("SupplierDeals")
-  borrowedDeals InterStoreDeal[] @relation("BorrowerDeals")
-  expenses      Expense[]
+enum BroadcastStatus {
+  DRAFT
+  QUEUED
+  SENT
+  FAILED
 }
 
-////////////////////////////
-// USERS (TENANT LEVEL)
-////////////////////////////
-model User {
-  id       String @id @default(uuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id])
-
-  name     String
-  email    String   @unique
-  phone    String
-  password String
-  role     UserRole
-
-  receivedSalePayments SalePayment[] @relation("ReceivedSalePayments")
-
-  receivedInterStorePayments InterStorePayment[] @relation("ReceivedInterStorePayments")
-
-
-  // Relations
-  sales     Sale[]     @relation("CashierSales")
-  repairs   Repair[]   @relation("TechnicianRepairs")
-  auditLogs AuditLog[]
-
-  // ✅ EXPENSE RELATIONS (FIX)
-  createdExpenses  Expense[] @relation("CreatedExpenses")
-  approvedExpenses Expense[] @relation("ApprovedExpenses")
-
-  createdAt DateTime @default(now())
-
-  @@index([tenantId])
+enum NotificationType {
+  INFO
+  WARNING
+  ACTION_REQUIRED
 }
 
-////////////////////////////
-// SUBSCRIPTIONS
-////////////////////////////
-
-model Subscription {
-  id        String             @id @default(uuid())
-  tenantId  String             @unique
-  tenant    Tenant             @relation(fields: [tenantId], references: [id])
-  status    SubscriptionStatus
-  startDate DateTime
-  endDate   DateTime
-  createdAt DateTime           @default(now())
+enum OtpChannel {
+  EMAIL
+  PHONE
 }
 
-////////////////////////////
-// INVENTORY
-////////////////////////////
-
-model Product {
-  id        String   @id @default(uuid())
-  tenantId  String
-  tenant    Tenant   @relation(fields: [tenantId], references: [id])
-  name      String
-  sku       String?
-  serial    String?
-  costPrice Float
-  sellPrice Float
-  stockQty  Int
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-
-  saleItems SaleItem[]
-
-  // New relation field - we are using the "ProductDeals" name for consistency
-  deals                     InterStoreDeal[] @relation("ProductDeals")
-  receivedInInterStoreDeals InterStoreDeal[] @relation(name: "ReceivedProduct")
+enum StockAdjustmentType {
+  RESTOCK
+  LOSS
+  CORRECTION
 }
 
-////////////////////////////
-// CUSTOMERS
-////////////////////////////
-
-model Customer {
-  id       String @id @default(uuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id])
-
-  name  String
-  phone String
-
-  createdAt DateTime @default(now())
-
-  sales   Sale[]
-  repairs Repair[]
-
-  @@index([tenantId])
-
-  @@unique([tenantId, phone])
-
+enum PurchaseOrderStatus {
+  DRAFT
+  ORDERED
+  RECEIVED
+  CANCELLED
 }
 
-////////////////////////////
-// POS (SALES)
-////////////////////////////
-
-model Sale {
-  id       String @id @default(uuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id])
-
-  cashierId String
-  cashier   User   @relation("CashierSales", fields: [cashierId], references: [id])
-
-  customerId String?
-  customer   Customer? @relation(fields: [customerId], references: [id])
-
-  total     Float
-  createdAt DateTime @default(now())
-
-  // ✅ CREDIT SALES
-  saleType   SaleType          @default(CASH)
-  amountPaid Float             @default(0)
-  balanceDue Float             @default(0)
-  status     SalePaymentStatus @default(PAID)
-  dueDate    DateTime?
-
-  items    SaleItem[]
-  payments SalePayment[] @relation("SalePayments")
-
-  @@index([tenantId])
-  @@index([saleType])
-  @@index([status])
-  @@index([dueDate])
+enum SupplierIdType {
+  NATIONAL_ID
+  PASSPORT
 }
 
-model SaleItem {
-  id     String @id @default(uuid())
-  saleId String
-  sale   Sale   @relation(fields: [saleId], references: [id])
-
-  productId String
-  product   Product @relation(fields: [productId], references: [id])
-
-  quantity Int
-  price    Float
+enum SupplierSourceType {
+  BOUGHT
+  GIFT
+  TRADE_IN
+  CONSIGNMENT
+  OTHER
 }
 
-model SalePayment {
-  id String @id @default(uuid())
-
-  saleId String
-  sale   Sale   @relation("SalePayments", fields: [saleId], references: [id])
-
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id])
-
-  receivedById String?
-  receivedBy   User?   @relation("ReceivedSalePayments", fields: [receivedById], references: [id])
-
-  amount    Float
-  method    SalePaymentMethod @default(CASH)
-  note      String?
-  createdAt DateTime          @default(now())
-
-  @@index([saleId])
-  @@index([tenantId])
-  @@index([receivedById])
+enum SupplySourceType {
+  BOUGHT
+  GIFT
+  TRADE_IN
+  CONSIGNMENT
+  OTHER
 }
 
-////////////////////////////
-// REPAIRS
-////////////////////////////
-
-model Repair {
-  id       String @id @default(uuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id])
-
-  customerId String
-  customer   Customer @relation(fields: [customerId], references: [id])
-
-  technicianId String? // <-- It must be nullable (this is where we set `String?` to allow null)
-  technician   User?   @relation("TechnicianRepairs", fields: [technicianId], references: [id])
-
-  device      String
-  serial      String?
-  issue       String
-  status      RepairStatus
-  warrantyEnd DateTime?
-
-  createdAt DateTime @default(now())
-
-  @@index([tenantId])
+enum cash_drawer_event_type {
+  OPEN
+  CLOSE
+  ADJUST
 }
 
-////////////////////////////
-// EXPENSES
-////////////////////////////
-
-model Expense {
-  id           String          @id @default(cuid())
-  title        String
-  category     ExpenseCategory // Enum type for category
-  notes        String?
-  status       String          @default("PENDING")
-  createdAt    DateTime        @default(now())
-  approvedAt   DateTime?
-  tenantId     String
-  createdById  String
-  approvedById String?
-
-  tenant     Tenant @relation(fields: [tenantId], references: [id])
-  createdBy  User   @relation("CreatedExpenses", fields: [createdById], references: [id])
-  approvedBy User?  @relation("ApprovedExpenses", fields: [approvedById], references: [id])
-
-  @@index([tenantId])
+enum cash_movement_reason {
+  FLOAT
+  WITHDRAWAL
+  DEPOSIT
+  EXPENSE
+  OTHER
 }
 
-////////////////////////////
-// INTER-STORE DEALS
-////////////////////////////
-
-model InterStoreDeal {
-  id String @id @default(uuid())
-
-  // Borrowing store (the tenant using Storvex)
-  borrowerTenantId String
-  borrowerTenant   Tenant @relation(name: "BorrowerDeals", fields: [borrowerTenantId], references: [id])
-
-  // INTERNAL supplier (optional)
-  supplierTenantId String?
-  supplierTenant   Tenant? @relation(name: "SupplierDeals", fields: [supplierTenantId], references: [id])
-
-  // EXTERNAL supplier (optional)
-  externalSupplierName  String?
-  externalSupplierPhone String?
-
-  // Person who takes the item (RESELLER / BORROWER PERSON)
-  resellerName       String
-  resellerPhone      String
-  resellerStore      String?
-  resellerWorkplace  String?
-  resellerDistrict   String?
-  resellerSector     String?
-  resellerAddress    String?
-  resellerNationalId String?
-
-  // Product info (inventory link optional)
-  productId String?
-  product   Product? @relation(name: "ProductDeals", fields: [productId], references: [id])
-
-  productName     String
-  productCategory String?
-  productColor    String?
-
-  // ✅ Serial should never be optional
-  serial String
-
-  // ✅ Quantity for this deal (Phase 1: keep at 1 for serialized items; later support serials list)
-  quantity         Int @default(1)
-  soldQuantity     Int @default(0)
-  returnedQuantity Int @default(0)
-
-  // Money tracking (audit)
-  agreedPrice    Float
-  soldPrice      Float?
-  paidAmount     Float?
-  paymentMethod  String?
-  dueDate        DateTime?
-  takenAt        DateTime? // optional custom timestamp if needed (borrowedAt already exists)
-
-  // Optional link to POS sale
-  saleId String?
-
-  payments InterStorePayment[]
-
-
-  status InterStoreDealStatus @default(BORROWED)
-
-  borrowedAt DateTime  @default(now())
-  soldAt     DateTime?
-  returnedAt DateTime?
-  paidAt     DateTime?
-
-  notes String?
-
-  createdAt DateTime @default(now())
-
-  receivedAt        DateTime?
-  receivedProductId String?
-  receivedProduct   Product?  @relation(name: "ReceivedProduct", fields: [receivedProductId], references: [id])
-
-  @@index([borrowerTenantId])
-  @@index([supplierTenantId])
-  @@index([status])
-  @@index([receivedProductId])
-  @@index([resellerPhone])
-  @@index([serial])
+enum cash_movement_type {
+  IN
+  OUT
 }
 
-
-model InterStorePayment {
-  id String @id @default(uuid())
-
-  dealId String
-  deal   InterStoreDeal @relation(fields: [dealId], references: [id])
-
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id])
-
-  receivedById String?
-  receivedBy   User? @relation("ReceivedInterStorePayments", fields: [receivedById], references: [id])
-
-  amount    Float
-  method    InterStorePaymentMethod @default(CASH)
-  note      String?
-  createdAt DateTime @default(now())
-
-  @@index([dealId])
-  @@index([tenantId])
-  @@index([receivedById])
-}
-
-
-model AuditLog {
-  id        String   @id @default(uuid())
-  tenantId  String
-  userId    String?
-  action    String
-  entity    String
-  entityId  String?
-  metadata  Json?
-  createdAt DateTime @default(now())
-
-  user User? @relation(fields: [userId], references: [id])
+enum ProformaStatus {
+  DRAFT
+  SENT
+  EXPIRED
+  CONVERTED
+  CANCELLED
 }

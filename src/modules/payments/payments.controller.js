@@ -1,6 +1,5 @@
-const { PrismaClient } = require("@prisma/client");
 const axios = require("axios");
-const prisma = new PrismaClient();
+const prisma = require("../../config/database");
 
 async function initiatePayment(req, res) {
   const { intentId, phone } = req.body;

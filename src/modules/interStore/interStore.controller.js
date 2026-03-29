@@ -1,27 +1,51 @@
+// src/modules/interstore/interStore.controller.js
 const {
-  PrismaClient,
   InterStoreDealStatus,
   AuditAction,
   InterStorePaymentMethod,
 } = require("@prisma/client");
-
-const prisma = new PrismaClient();
-
+const prisma = require("../../config/database");
 const logAudit = require("../../utils/auditLogger");
 
-// Strict enum allowlists (prevents random strings)
-const ALLOWED_INTERSTORE_METHODS = new Set(
-  Object.values(InterStorePaymentMethod) // CASH, MOMO, BANK, OTHER
-);
+const ALLOWED_INTERSTORE_METHODS = new Set(Object.values(InterStorePaymentMethod));
+const ALLOWED_COLLECTION_STATUSES = new Set(Object.values(InterStoreDealStatus));
+const BILLABLE_INTERSTORE_ROLES = new Set([
+  "OWNER",
+  "MANAGER",
+  "CASHIER",
+  "SELLER",
+  "STOREKEEPER",
+  "TECHNICIAN",
+]);
 
-function normalizeInterStoreMethod(method) {
-  if (method == null) return "CASH";
-  if (typeof method !== "string" && typeof method !== "number") return null;
-
-  const m = String(method).trim().toUpperCase();
-  return ALLOWED_INTERSTORE_METHODS.has(m) ? m : null;
+function cleanString(value) {
+  const s = String(value || "").trim();
+  return s || null;
 }
 
+function cleanNullableString(value, maxLen = null) {
+  const s = cleanString(value);
+  if (!s) return null;
+  if (maxLen && s.length > maxLen) return s.slice(0, maxLen);
+  return s;
+}
+
+function normalizePhone(value) {
+  const s = cleanString(value);
+  if (!s) return null;
+  return s.replace(/[^\d+]/g, "") || null;
+}
+
+function normalizeSerial(value) {
+  const s = cleanString(value);
+  if (!s) return null;
+  return s.toUpperCase();
+}
+
+function normalizeInterStoreMethod(method) {
+  const m = method ? String(method).trim().toUpperCase() : "CASH";
+  return ALLOWED_INTERSTORE_METHODS.has(m) ? m : null;
+}
 
 function toNum(x) {
   const n = Number(x);
@@ -34,111 +58,250 @@ function toInt(x) {
   return Math.floor(n);
 }
 
-function assertBorrower(deal, tenantId) {
-  return deal.borrowerTenantId === tenantId;
+function toIsoOrNull(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
 }
 
-function assertCanView(deal, tenantId) {
-  return deal.borrowerTenantId === tenantId || deal.supplierTenantId === tenantId;
+function parseIsoDateOrNull(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
+function serializeDeal(deal) {
+  if (!deal) return null;
+
+  return {
+    ...deal,
+    borrowedAt: toIsoOrNull(deal.borrowedAt),
+    dueDate: toIsoOrNull(deal.dueDate),
+    takenAt: toIsoOrNull(deal.takenAt),
+    receivedAt: toIsoOrNull(deal.receivedAt),
+    soldAt: toIsoOrNull(deal.soldAt),
+    returnedAt: toIsoOrNull(deal.returnedAt),
+    paidAt: toIsoOrNull(deal.paidAt),
+    createdAt: toIsoOrNull(deal.createdAt),
+    updatedAt: toIsoOrNull(deal.updatedAt),
+    agreedPrice: Number.isFinite(Number(deal.agreedPrice)) ? Number(deal.agreedPrice) : deal.agreedPrice,
+    soldPrice: Number.isFinite(Number(deal.soldPrice)) ? Number(deal.soldPrice) : deal.soldPrice,
+    paidAmount: Number.isFinite(Number(deal.paidAmount)) ? Number(deal.paidAmount) : deal.paidAmount,
+  };
+}
+
+function serializePayment(payment) {
+  if (!payment) return null;
+
+  return {
+    ...payment,
+    amount: Number.isFinite(Number(payment.amount)) ? Number(payment.amount) : payment.amount,
+    createdAt: toIsoOrNull(payment.createdAt),
+  };
+}
+
+function dealSuccess(res, deal, extra = {}) {
+  return res.json({
+    ok: true,
+    deal: serializeDeal(deal),
+    ...extra,
+  });
+}
+
+function dealsListSuccess(res, deals, extra = {}) {
+  return res.json({
+    ok: true,
+    deals: Array.isArray(deals) ? deals.map(serializeDeal) : [],
+    count: Array.isArray(deals) ? deals.length : 0,
+    ...extra,
+  });
+}
+
+function paymentsListSuccess(res, payments, extra = {}) {
+  return res.json({
+    ok: true,
+    payments: Array.isArray(payments) ? payments.map(serializePayment) : [],
+    count: Array.isArray(payments) ? payments.length : 0,
+    ...extra,
+  });
+}
+
+function buildBorrowerDealWhere(id, tenantId) {
+  return { id, borrowerTenantId: tenantId };
+}
+
+function buildVisibleDealWhere(id, tenantId) {
+  return {
+    id,
+    OR: [{ borrowerTenantId: tenantId }, { supplierTenantId: tenantId }],
+  };
+}
+
+async function getBorrowerDealOrNull({ id, tenantId, tx = prisma }) {
+  return tx.interStoreDeal.findFirst({
+    where: buildBorrowerDealWhere(id, tenantId),
+  });
+}
+
+async function getVisibleDealOrNull({ id, tenantId, tx = prisma }) {
+  return tx.interStoreDeal.findFirst({
+    where: buildVisibleDealWhere(id, tenantId),
+  });
+}
+
+async function assertBorrowerSerialNotDuplicated({
+  tx,
+  tenantId,
+  serial,
+  ignoreDealId = null,
+  ignoreProductId = null,
+}) {
+  if (!serial) return;
+
+  const activeDeal = await tx.interStoreDeal.findFirst({
+    where: {
+      borrowerTenantId: tenantId,
+      serial,
+      ...(ignoreDealId ? { id: { not: ignoreDealId } } : {}),
+      status: {
+        in: [
+          InterStoreDealStatus.BORROWED,
+          InterStoreDealStatus.RECEIVED,
+          InterStoreDealStatus.SOLD,
+        ],
+      },
+    },
+    select: { id: true, status: true },
+  });
+
+  if (activeDeal) {
+    throw new Error("DUPLICATE_ACTIVE_DEAL_SERIAL");
+  }
+
+  const product = await tx.product.findFirst({
+    where: {
+      tenantId,
+      serial,
+      ...(ignoreProductId ? { id: { not: ignoreProductId } } : {}),
+      isActive: true,
+    },
+    select: { id: true },
+  });
+
+  if (product) {
+    throw new Error("DUPLICATE_INVENTORY_SERIAL");
+  }
+}
+
+function buildCollectionProjection() {
+  return {
+    id: true,
+    status: true,
+    productName: true,
+    serial: true,
+    quantity: true,
+    soldQuantity: true,
+    returnedQuantity: true,
+    agreedPrice: true,
+    soldPrice: true,
+    paidAmount: true,
+    paymentMethod: true,
+    dueDate: true,
+    borrowedAt: true,
+    soldAt: true,
+    resellerName: true,
+    resellerPhone: true,
+    resellerStore: true,
+    createdAt: true,
+    updatedAt: true,
+  };
+}
+
+function computeDaysLeft(dueDate) {
+  if (!dueDate) return null;
+  const due = new Date(dueDate).getTime();
+  if (!Number.isFinite(due)) return null;
+  return Math.ceil((due - Date.now()) / (1000 * 60 * 60 * 24));
+}
+
+function computeDaysOverdue(dueDate) {
+  if (!dueDate) return null;
+  const due = new Date(dueDate).getTime();
+  if (!Number.isFinite(due)) return null;
+  return Math.ceil((Date.now() - due) / (1000 * 60 * 60 * 24));
 }
 
 /**
  * CREATE DEAL (BORROW)
- * - Requires reseller identity + product identity.
- * - If internal supplier + productId: decrement supplier stock immediately (physical item left).
- * - Enforces serial required (DB-level + API-level).
- * - Enforces quantity rules for serialized items (Phase 1).
  */
 async function createDeal(req, res) {
   try {
     const borrowerTenantId = req.user.tenantId;
 
-    const {
-      supplierTenantId,
-      externalSupplierName,
-      externalSupplierPhone,
+    const payload = {
+      supplierTenantId: cleanNullableString(req.body.supplierTenantId),
+      externalSupplierName: cleanNullableString(req.body.externalSupplierName, 180),
+      externalSupplierPhone: normalizePhone(req.body.externalSupplierPhone),
+      resellerName: cleanNullableString(req.body.resellerName, 180),
+      resellerPhone: normalizePhone(req.body.resellerPhone),
+      resellerStore: cleanNullableString(req.body.resellerStore, 180),
+      resellerWorkplace: cleanNullableString(req.body.resellerWorkplace, 180),
+      resellerDistrict: cleanNullableString(req.body.resellerDistrict, 120),
+      resellerSector: cleanNullableString(req.body.resellerSector, 120),
+      resellerAddress: cleanNullableString(req.body.resellerAddress, 255),
+      resellerNationalId: cleanNullableString(req.body.resellerNationalId, 64),
+      productId: cleanNullableString(req.body.productId),
+      productName: cleanNullableString(req.body.productName, 180),
+      productCategory: cleanNullableString(req.body.productCategory, 120),
+      productColor: cleanNullableString(req.body.productColor, 80),
+      serial: normalizeSerial(req.body.serial),
+      quantity: req.body.quantity,
+      agreedPrice: req.body.agreedPrice,
+      dueDate: req.body.dueDate,
+      takenAt: req.body.takenAt,
+      notes: cleanNullableString(req.body.notes, 2000),
+    };
 
-      // Person who took the item
-      resellerName,
-      resellerPhone,
-      resellerStore,
-      resellerWorkplace,
-      resellerDistrict,
-      resellerSector,
-      resellerAddress,
-      resellerNationalId,
-
-      // Product
-      productId,
-      productName,
-      productCategory,
-      productColor,
-      serial,
-      quantity,
-
-      // Money + timing
-      agreedPrice,
-      dueDate,
-      takenAt,
-      notes,
-    } = req.body;
-
-    // ---- Required validations ----
-    if (!resellerName || !resellerPhone) {
-      return res
-        .status(400)
-        .json({ message: "resellerName and resellerPhone are required" });
+    if (!payload.resellerName || !payload.resellerPhone) {
+      return res.status(400).json({ message: "resellerName and resellerPhone are required" });
     }
 
-    if (!productName) {
+    if (!payload.productName) {
       return res.status(400).json({ message: "productName is required" });
     }
 
-    // serial REQUIRED
-    if (!serial || String(serial).trim().length === 0) {
+    if (!payload.serial) {
       return res.status(400).json({ message: "serial is required" });
     }
 
-    if (agreedPrice == null) {
+    if (payload.agreedPrice == null) {
       return res.status(400).json({ message: "agreedPrice is required" });
     }
 
-    // Supplier validation
-    if (!supplierTenantId && !externalSupplierName) {
-      return res
-        .status(400)
-        .json({ message: "Supplier required (internal or external)" });
+    if (!payload.supplierTenantId && !payload.externalSupplierName) {
+      return res.status(400).json({ message: "Supplier required (internal or external)" });
     }
 
-    if (supplierTenantId && externalSupplierName) {
-      return res
-        .status(400)
-        .json({ message: "Choose one supplier type only" });
+    if (payload.supplierTenantId && payload.externalSupplierName) {
+      return res.status(400).json({ message: "Choose one supplier type only" });
     }
 
-    if (supplierTenantId && supplierTenantId === borrowerTenantId) {
-      return res
-        .status(400)
-        .json({ message: "Supplier cannot be the same tenant as borrower" });
+    if (payload.supplierTenantId && payload.supplierTenantId === borrowerTenantId) {
+      return res.status(400).json({ message: "Supplier cannot be the same tenant as borrower" });
     }
 
-    // Price validation
-    const price = toNum(agreedPrice);
+    const price = toNum(payload.agreedPrice);
     if (!Number.isFinite(price) || price <= 0) {
-      return res
-        .status(400)
-        .json({ message: "agreedPrice must be a positive number" });
+      return res.status(400).json({ message: "agreedPrice must be a positive number" });
     }
 
-    // Quantity validation
-    const qty = quantity == null ? 1 : toInt(quantity);
+    const qty = payload.quantity == null ? 1 : toInt(payload.quantity);
     if (!Number.isFinite(qty) || qty <= 0) {
-      return res
-        .status(400)
-        .json({ message: "quantity must be a positive integer" });
+      return res.status(400).json({ message: "quantity must be a positive integer" });
     }
 
-    // Phase 1 serialized rule
     if (qty !== 1) {
       return res.status(400).json({
         message:
@@ -146,91 +309,93 @@ async function createDeal(req, res) {
       });
     }
 
-    // Parse dueDate / takenAt safely
-    const parsedDueDate = dueDate ? new Date(dueDate) : null;
-    if (dueDate && Number.isNaN(parsedDueDate.getTime())) {
+    const parsedDueDate = payload.dueDate ? parseIsoDateOrNull(payload.dueDate) : null;
+    if (payload.dueDate && !parsedDueDate) {
       return res.status(400).json({ message: "dueDate is invalid ISO date" });
     }
 
-    // ✅ NEW: dueDate cannot be in the past (prevents broken real-world collections)
     if (parsedDueDate) {
       const today = new Date();
       today.setHours(0, 0, 0, 0);
+
       if (parsedDueDate < today) {
-        return res
-          .status(400)
-          .json({ message: "dueDate cannot be in the past" });
+        return res.status(400).json({ message: "dueDate cannot be in the past" });
       }
 
-      // optional cap: 365 days
       const max = new Date(today);
       max.setDate(max.getDate() + 365);
+
       if (parsedDueDate > max) {
-        return res
-          .status(400)
-          .json({ message: "dueDate too far in the future" });
+        return res.status(400).json({ message: "dueDate too far in the future" });
       }
     }
 
-    const parsedTakenAt = takenAt ? new Date(takenAt) : null;
-    if (takenAt && Number.isNaN(parsedTakenAt.getTime())) {
+    const parsedTakenAt = payload.takenAt ? parseIsoDateOrNull(payload.takenAt) : null;
+    if (payload.takenAt && !parsedTakenAt) {
       return res.status(400).json({ message: "takenAt is invalid ISO date" });
     }
 
     const deal = await prisma.$transaction(async (tx) => {
-      // If internal supplier + productId, validate and decrement supplier stock by qty
-      if (supplierTenantId && productId) {
-        const supplierProduct = await tx.product.findFirst({
-          where: { id: productId, tenantId: supplierTenantId, isActive: true },
-          select: { id: true, stockQty: true, name: true },
+      await assertBorrowerSerialNotDuplicated({
+        tx,
+        tenantId: borrowerTenantId,
+        serial: payload.serial,
+      });
+
+      if (payload.supplierTenantId && payload.productId) {
+        const stockUpdate = await tx.product.updateMany({
+          where: {
+            id: payload.productId,
+            tenantId: payload.supplierTenantId,
+            isActive: true,
+            stockQty: { gte: qty },
+          },
+          data: {
+            stockQty: { decrement: qty },
+          },
         });
 
-        if (!supplierProduct) throw new Error("SUPPLIER_PRODUCT_NOT_FOUND");
-        if (supplierProduct.stockQty < qty) throw new Error("SUPPLIER_OUT_OF_STOCK");
+        if (stockUpdate.count === 0) {
+          const supplierProduct = await tx.product.findFirst({
+            where: {
+              id: payload.productId,
+              tenantId: payload.supplierTenantId,
+              isActive: true,
+            },
+            select: { id: true, stockQty: true },
+          });
 
-        await tx.product.update({
-          where: { id: supplierProduct.id },
-          data: { stockQty: { decrement: qty } },
-        });
+          if (!supplierProduct) throw new Error("SUPPLIER_PRODUCT_NOT_FOUND");
+          throw new Error("SUPPLIER_OUT_OF_STOCK");
+        }
       }
 
       return tx.interStoreDeal.create({
         data: {
           borrowerTenantId,
-
-          supplierTenantId: supplierTenantId || null,
-          externalSupplierName: externalSupplierName || null,
-          externalSupplierPhone: externalSupplierPhone || null,
-
-          // reseller identity
-          resellerName: String(resellerName).trim(),
-          resellerPhone: String(resellerPhone).trim(),
-          resellerStore: resellerStore ? String(resellerStore).trim() : null,
-          resellerWorkplace: resellerWorkplace ? String(resellerWorkplace).trim() : null,
-          resellerDistrict: resellerDistrict ? String(resellerDistrict).trim() : null,
-          resellerSector: resellerSector ? String(resellerSector).trim() : null,
-          resellerAddress: resellerAddress ? String(resellerAddress).trim() : null,
-          resellerNationalId: resellerNationalId ? String(resellerNationalId).trim() : null,
-
-          // product info
-          productId: productId || null,
-          productName: String(productName).trim(),
-          productCategory: productCategory ? String(productCategory).trim() : null,
-          productColor: productColor ? String(productColor).trim() : null,
-          serial: String(serial).trim(),
-
-          // quantities
+          supplierTenantId: payload.supplierTenantId || null,
+          externalSupplierName: payload.externalSupplierName || null,
+          externalSupplierPhone: payload.externalSupplierPhone || null,
+          resellerName: payload.resellerName,
+          resellerPhone: payload.resellerPhone,
+          resellerStore: payload.resellerStore,
+          resellerWorkplace: payload.resellerWorkplace,
+          resellerDistrict: payload.resellerDistrict,
+          resellerSector: payload.resellerSector,
+          resellerAddress: payload.resellerAddress,
+          resellerNationalId: payload.resellerNationalId,
+          productId: payload.productId || null,
+          productName: payload.productName,
+          productCategory: payload.productCategory,
+          productColor: payload.productColor,
+          serial: payload.serial,
           quantity: qty,
           soldQuantity: 0,
           returnedQuantity: 0,
-
-          // money + timing
           agreedPrice: price,
           dueDate: parsedDueDate,
           takenAt: parsedTakenAt,
-
-          notes: notes ? String(notes) : null,
-
+          notes: payload.notes,
           status: InterStoreDealStatus.BORROWED,
           borrowedAt: new Date(),
         },
@@ -240,13 +405,13 @@ async function createDeal(req, res) {
     await logAudit({
       tenantId: borrowerTenantId,
       userId: req.user.userId,
-      action: AuditAction.CREATE_DEAL, // ✅ enum-safe
-      entity: "InterStoreDeal",
+      action: AuditAction.CREATE_DEAL,
+      entity: "INTERSTORE_DEAL",
       entityId: deal.id,
       metadata: {
-        supplierTenantId: supplierTenantId || null,
-        externalSupplierName: externalSupplierName || null,
-        productId: productId || null,
+        supplierTenantId: payload.supplierTenantId || null,
+        externalSupplierName: payload.externalSupplierName || null,
+        productId: payload.productId || null,
         productName: deal.productName,
         serial: deal.serial,
         quantity: deal.quantity,
@@ -256,15 +421,32 @@ async function createDeal(req, res) {
       },
     });
 
-
-    return res.status(201).json(deal);
+    return res.status(201).json({
+      ok: true,
+      message: "Deal created",
+      deal: serializeDeal(deal),
+    });
   } catch (err) {
     if (err.message === "SUPPLIER_PRODUCT_NOT_FOUND") {
       return res.status(404).json({ message: "Supplier product not found" });
     }
+
     if (err.message === "SUPPLIER_OUT_OF_STOCK") {
       return res.status(400).json({ message: "Supplier product out of stock" });
     }
+
+    if (err.message === "DUPLICATE_ACTIVE_DEAL_SERIAL") {
+      return res.status(409).json({
+        message: "This serial already exists in another active interstore deal for this tenant",
+      });
+    }
+
+    if (err.message === "DUPLICATE_INVENTORY_SERIAL") {
+      return res.status(409).json({
+        message: "This serial already exists in borrower inventory",
+      });
+    }
+
     console.error(err);
     return res.status(500).json({ message: "Failed to create deal" });
   }
@@ -272,26 +454,17 @@ async function createDeal(req, res) {
 
 /**
  * MARK RECEIVED
- * - borrower only
- * - only allowed when status = BORROWED
- * - idempotent
- * - creates borrower inventory product exactly once
- * - stockQty = quantity
  */
 async function markReceived(req, res) {
   try {
     const id = req.params.id;
     const tenantId = req.user.tenantId;
 
-    const deal = await prisma.interStoreDeal.findUnique({ where: { id } });
+    const deal = await getBorrowerDealOrNull({ id, tenantId });
     if (!deal) return res.status(404).json({ message: "Deal not found" });
 
-    if (!assertBorrower(deal, tenantId)) {
-      return res.status(403).json({ message: "Not authorized" });
-    }
-
     if (deal.status === InterStoreDealStatus.RECEIVED && deal.receivedProductId) {
-      return res.json(deal);
+      return dealSuccess(res, deal, { message: "Deal already marked as received" });
     }
 
     if (deal.status !== InterStoreDealStatus.BORROWED) {
@@ -299,6 +472,13 @@ async function markReceived(req, res) {
     }
 
     const result = await prisma.$transaction(async (tx) => {
+      await assertBorrowerSerialNotDuplicated({
+        tx,
+        tenantId,
+        serial: deal.serial,
+        ignoreDealId: deal.id,
+      });
+
       let receivedProductId = deal.receivedProductId || null;
 
       if (!receivedProductId) {
@@ -306,9 +486,9 @@ async function markReceived(req, res) {
           data: {
             tenantId: deal.borrowerTenantId,
             name: deal.productName,
-            serial: deal.serial, // ✅ required now
+            serial: deal.serial,
             costPrice: deal.agreedPrice,
-            sellPrice: deal.agreedPrice, // borrower can edit later
+            sellPrice: deal.agreedPrice,
             stockQty: deal.quantity,
             isActive: true,
           },
@@ -318,27 +498,56 @@ async function markReceived(req, res) {
         receivedProductId = createdProduct.id;
       }
 
-      return tx.interStoreDeal.update({
-        where: { id },
+      const upd = await tx.interStoreDeal.updateMany({
+        where: {
+          id: deal.id,
+          borrowerTenantId: tenantId,
+          status: InterStoreDealStatus.BORROWED,
+        },
         data: {
           status: InterStoreDealStatus.RECEIVED,
           receivedAt: new Date(),
           receivedProductId,
         },
       });
+
+      if (upd.count === 0) return null;
+
+      return tx.interStoreDeal.findFirst({
+        where: buildBorrowerDealWhere(deal.id, tenantId),
+      });
     });
+
+    if (!result) {
+      return res.status(409).json({ message: "Deal changed; refresh and try again" });
+    }
 
     await logAudit({
       tenantId,
       userId: req.user.userId,
       action: AuditAction.MARK_RECEIVED,
-      entity: "InterStoreDeal",
+      entity: "INTERSTORE_DEAL",
       entityId: result.id,
-      metadata: { receivedProductId: result.receivedProductId, quantity: result.quantity },
+      metadata: {
+        receivedProductId: result.receivedProductId,
+        quantity: result.quantity,
+      },
     });
 
-    return res.json(result);
+    return dealSuccess(res, result, { message: "Deal marked as received" });
   } catch (err) {
+    if (err.message === "DUPLICATE_ACTIVE_DEAL_SERIAL") {
+      return res.status(409).json({
+        message: "This serial already exists in another active interstore deal for this tenant",
+      });
+    }
+
+    if (err.message === "DUPLICATE_INVENTORY_SERIAL") {
+      return res.status(409).json({
+        message: "This serial already exists in borrower inventory",
+      });
+    }
+
     console.error(err);
     return res.status(500).json({ message: "Failed to mark received" });
   }
@@ -346,16 +555,11 @@ async function markReceived(req, res) {
 
 /**
  * MARK SOLD
- * - borrower only
- * - requires RECEIVED + receivedProductId
- * - decrements borrower stock by soldQuantity
- * - updates soldQuantity and sets SOLD only if fully resolved (sold+returned == quantity)
  */
 async function markSold(req, res) {
   try {
     const id = req.params.id;
     const tenantId = req.user.tenantId;
-
     const { soldPrice, soldQuantity } = req.body;
 
     const sp = soldPrice == null ? null : toNum(soldPrice);
@@ -368,12 +572,8 @@ async function markSold(req, res) {
       return res.status(400).json({ message: "soldQuantity must be a positive integer" });
     }
 
-    const deal = await prisma.interStoreDeal.findUnique({ where: { id } });
+    const deal = await getBorrowerDealOrNull({ id, tenantId });
     if (!deal) return res.status(404).json({ message: "Deal not found" });
-
-    if (!assertBorrower(deal, tenantId)) {
-      return res.status(403).json({ message: "Not authorized" });
-    }
 
     if (deal.status !== InterStoreDealStatus.RECEIVED) {
       return res.status(400).json({ message: `Cannot mark sold in status ${deal.status}` });
@@ -389,18 +589,28 @@ async function markSold(req, res) {
     }
 
     const updated = await prisma.$transaction(async (tx) => {
-      // decrement borrower product stock
-      await tx.product.update({
-        where: { id: deal.receivedProductId },
+      const prodUpd = await tx.product.updateMany({
+        where: {
+          id: deal.receivedProductId,
+          tenantId,
+          stockQty: { gte: sq },
+        },
         data: { stockQty: { decrement: sq } },
       });
+
+      if (prodUpd.count === 0) {
+        throw new Error("BORROWER_PRODUCT_OUT_OF_STOCK_OR_NOT_FOUND");
+      }
 
       const newSoldQty = deal.soldQuantity + sq;
       const fullyResolved = newSoldQty + deal.returnedQuantity === deal.quantity;
 
-      // If fully resolved by sales -> SOLD
-      const next = await tx.interStoreDeal.update({
-        where: { id },
+      const upd = await tx.interStoreDeal.updateMany({
+        where: {
+          id: deal.id,
+          borrowerTenantId: tenantId,
+          status: InterStoreDealStatus.RECEIVED,
+        },
         data: {
           soldQuantity: newSoldQty,
           soldAt: fullyResolved ? new Date() : deal.soldAt,
@@ -409,33 +619,50 @@ async function markSold(req, res) {
         },
       });
 
-      // deactivate if stock is now <= 0
-      const p = await tx.product.findUnique({
-        where: { id: deal.receivedProductId },
+      if (upd.count === 0) return null;
+
+      const p = await tx.product.findFirst({
+        where: { id: deal.receivedProductId, tenantId },
         select: { stockQty: true },
       });
 
       if (p && p.stockQty <= 0) {
-        await tx.product.update({
-          where: { id: deal.receivedProductId },
+        await tx.product.updateMany({
+          where: { id: deal.receivedProductId, tenantId },
           data: { isActive: false },
         });
       }
 
-      return next;
+      return tx.interStoreDeal.findFirst({
+        where: buildBorrowerDealWhere(deal.id, tenantId),
+      });
     });
+
+    if (!updated) {
+      return res.status(409).json({ message: "Deal changed; refresh and try again" });
+    }
 
     await logAudit({
       tenantId,
       userId: req.user.userId,
       action: AuditAction.MARK_SOLD,
-      entity: "InterStoreDeal",
+      entity: "INTERSTORE_DEAL",
       entityId: updated.id,
-      metadata: { soldQuantity: sq, totalSoldQuantity: updated.soldQuantity, soldPrice: sp },
+      metadata: {
+        soldQuantity: sq,
+        totalSoldQuantity: updated.soldQuantity,
+        soldPrice: sp,
+      },
     });
 
-    return res.json(updated);
+    return dealSuccess(res, updated, { message: "Deal sale recorded" });
   } catch (err) {
+    if (err.message === "BORROWER_PRODUCT_OUT_OF_STOCK_OR_NOT_FOUND") {
+      return res.status(400).json({
+        message: "Borrower inventory product not found or insufficient stock",
+      });
+    }
+
     console.error(err);
     return res.status(500).json({ message: "Failed to mark sold" });
   }
@@ -443,30 +670,20 @@ async function markSold(req, res) {
 
 /**
  * MARK RETURNED
- * - borrower only
- * - allowed if BORROWED or RECEIVED
- * - decrements borrower inventory (if receivedProductId exists) by returnedQuantity
- * - increments supplier stock by returnedQuantity if internal supplier + productId
- * - status RETURNED only when fully resolved (sold+returned == quantity) and nothing sold? (we keep RETURNED anyway as resolution)
  */
 async function markReturned(req, res) {
   try {
     const id = req.params.id;
     const tenantId = req.user.tenantId;
-
     const { returnedQuantity } = req.body;
-    const rq = returnedQuantity == null ? 1 : toInt(returnedQuantity);
 
+    const rq = returnedQuantity == null ? 1 : toInt(returnedQuantity);
     if (!Number.isFinite(rq) || rq <= 0) {
       return res.status(400).json({ message: "returnedQuantity must be a positive integer" });
     }
 
-    const deal = await prisma.interStoreDeal.findUnique({ where: { id } });
+    const deal = await getBorrowerDealOrNull({ id, tenantId });
     if (!deal) return res.status(404).json({ message: "Deal not found" });
-
-    if (!assertBorrower(deal, tenantId)) {
-      return res.status(403).json({ message: "Not authorized" });
-    }
 
     if (![InterStoreDealStatus.BORROWED, InterStoreDealStatus.RECEIVED].includes(deal.status)) {
       return res.status(400).json({ message: `Cannot return in status ${deal.status}` });
@@ -478,60 +695,101 @@ async function markReturned(req, res) {
     }
 
     const updated = await prisma.$transaction(async (tx) => {
-      // If borrower already received inventory, decrement stock by returned quantity
       if (deal.receivedProductId) {
-        await tx.product.update({
-          where: { id: deal.receivedProductId },
+        const prodUpd = await tx.product.updateMany({
+          where: {
+            id: deal.receivedProductId,
+            tenantId,
+            stockQty: { gte: rq },
+          },
           data: { stockQty: { decrement: rq } },
         });
 
-        const p = await tx.product.findUnique({
-          where: { id: deal.receivedProductId },
+        if (prodUpd.count === 0) {
+          throw new Error("BORROWER_PRODUCT_OUT_OF_STOCK_OR_NOT_FOUND");
+        }
+
+        const p = await tx.product.findFirst({
+          where: { id: deal.receivedProductId, tenantId },
           select: { stockQty: true },
         });
 
         if (p && p.stockQty <= 0) {
-          await tx.product.update({
-            where: { id: deal.receivedProductId },
+          await tx.product.updateMany({
+            where: { id: deal.receivedProductId, tenantId },
             data: { isActive: false },
           });
         }
       }
 
-      // Return to internal supplier stock
       if (deal.supplierTenantId && deal.productId) {
-        await tx.product.update({
-          where: { id: deal.productId },
+        const supplierRestore = await tx.product.updateMany({
+          where: {
+            id: deal.productId,
+            tenantId: deal.supplierTenantId,
+          },
           data: { stockQty: { increment: rq } },
         });
+
+        if (supplierRestore.count === 0) {
+          throw new Error("SUPPLIER_PRODUCT_NOT_FOUND");
+        }
       }
 
       const newReturnedQty = deal.returnedQuantity + rq;
       const fullyResolved = deal.soldQuantity + newReturnedQty === deal.quantity;
-
       const nextStatus = fullyResolved ? InterStoreDealStatus.RETURNED : deal.status;
 
-      return tx.interStoreDeal.update({
-        where: { id },
+      const upd = await tx.interStoreDeal.updateMany({
+        where: {
+          id: deal.id,
+          borrowerTenantId: tenantId,
+          status: {
+            in: [InterStoreDealStatus.BORROWED, InterStoreDealStatus.RECEIVED],
+          },
+        },
         data: {
           returnedQuantity: newReturnedQty,
           returnedAt: fullyResolved ? new Date() : deal.returnedAt,
           status: nextStatus,
         },
       });
+
+      if (upd.count === 0) return null;
+
+      return tx.interStoreDeal.findFirst({
+        where: buildBorrowerDealWhere(deal.id, tenantId),
+      });
     });
+
+    if (!updated) {
+      return res.status(409).json({ message: "Deal changed; refresh and try again" });
+    }
 
     await logAudit({
       tenantId,
       userId: req.user.userId,
       action: AuditAction.MARK_RETURNED,
-      entity: "InterStoreDeal",
+      entity: "INTERSTORE_DEAL",
       entityId: updated.id,
-      metadata: { returnedQuantity: rq, totalReturnedQuantity: updated.returnedQuantity },
+      metadata: {
+        returnedQuantity: rq,
+        totalReturnedQuantity: updated.returnedQuantity,
+      },
     });
 
-    return res.json(updated);
+    return dealSuccess(res, updated, { message: "Deal return recorded" });
   } catch (err) {
+    if (err.message === "BORROWER_PRODUCT_OUT_OF_STOCK_OR_NOT_FOUND") {
+      return res.status(400).json({
+        message: "Borrower inventory product not found or insufficient stock",
+      });
+    }
+
+    if (err.message === "SUPPLIER_PRODUCT_NOT_FOUND") {
+      return res.status(404).json({ message: "Supplier product not found" });
+    }
+
     console.error(err);
     return res.status(500).json({ message: "Failed to mark returned" });
   }
@@ -539,49 +797,38 @@ async function markReturned(req, res) {
 
 /**
  * MARK PAID
- * - borrower only (route restricts OWNER)
- * - requires SOLD
- * - stores paidAmount + paymentMethod (optional)
  */
 async function markPaid(req, res) {
   try {
     const id = req.params.id;
     const tenantId = req.user.tenantId;
-
     const { paidAmount, paymentMethod } = req.body;
 
     const amt = paidAmount == null ? null : toNum(paidAmount);
     if (amt == null || !Number.isFinite(amt) || amt <= 0) {
-      return res
-        .status(400)
-        .json({ message: "paidAmount must be a positive number" });
+      return res.status(400).json({ message: "paidAmount must be a positive number" });
     }
 
-    const deal = await prisma.interStoreDeal.findUnique({ where: { id } });
+    const normalizedMethod = paymentMethod
+      ? normalizeInterStoreMethod(paymentMethod)
+      : null;
+
+    if (paymentMethod && !normalizedMethod) {
+      return res.status(400).json({
+        message: "paymentMethod must be one of CASH, MOMO, BANK, OTHER",
+      });
+    }
+
+    const deal = await getBorrowerDealOrNull({ id, tenantId });
     if (!deal) return res.status(404).json({ message: "Deal not found" });
 
-    if (!assertBorrower(deal, tenantId)) {
-      return res.status(403).json({ message: "Not authorized" });
-    }
-
     if (deal.status !== InterStoreDealStatus.SOLD) {
-      return res
-        .status(400)
-        .json({ message: `Cannot mark paid in status ${deal.status}` });
+      return res.status(400).json({ message: `Cannot mark paid in status ${deal.status}` });
     }
 
-    // ✅ PAID means fully paid supplier
-    // owed = agreedPrice * soldQuantity (soldQuantity must be > 0 once SOLD)
-    const soldQty = Number(deal.soldQuantity || 0);
-    const owed = Number(deal.agreedPrice) * soldQty;
-
+    const owed = Number(deal.agreedPrice) * Number(deal.soldQuantity || 0);
     if (!Number.isFinite(owed) || owed <= 0) {
-      return res.status(400).json({
-        message: "Invalid owed amount (check agreedPrice and soldQuantity)",
-        owed,
-        soldQuantity: deal.soldQuantity,
-        agreedPrice: deal.agreedPrice,
-      });
+      return res.status(400).json({ message: "Invalid owed amount" });
     }
 
     if (amt < owed) {
@@ -592,26 +839,40 @@ async function markPaid(req, res) {
       });
     }
 
-    const updated = await prisma.interStoreDeal.update({
-      where: { id },
+    const upd = await prisma.interStoreDeal.updateMany({
+      where: {
+        id: deal.id,
+        borrowerTenantId: tenantId,
+        status: InterStoreDealStatus.SOLD,
+      },
       data: {
         status: InterStoreDealStatus.PAID,
         paidAt: new Date(),
         paidAmount: amt,
-        paymentMethod: paymentMethod ? String(paymentMethod).toUpperCase() : null,
+        paymentMethod: normalizedMethod || null,
       },
     });
+
+    if (upd.count === 0) {
+      return res.status(409).json({ message: "Deal changed; refresh and try again" });
+    }
+
+    const updated = await getBorrowerDealOrNull({ id: deal.id, tenantId });
 
     await logAudit({
       tenantId,
       userId: req.user.userId,
       action: AuditAction.MARK_PAID,
-      entity: "InterStoreDeal",
-      entityId: updated.id,
-      metadata: { paidAmount: amt, paymentMethod: updated.paymentMethod, owed },
+      entity: "INTERSTORE_DEAL",
+      entityId: deal.id,
+      metadata: {
+        paidAmount: amt,
+        paymentMethod: updated?.paymentMethod || null,
+        owed,
+      },
     });
 
-    return res.json(updated);
+    return dealSuccess(res, updated, { message: "Deal marked as paid" });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Failed to mark paid" });
@@ -620,7 +881,6 @@ async function markPaid(req, res) {
 
 /**
  * LIST DEALS
- * borrower OR internal supplier can view
  */
 async function listDeals(req, res) {
   try {
@@ -633,12 +893,13 @@ async function listDeals(req, res) {
       orderBy: { createdAt: "desc" },
     });
 
-    return res.json(deals);
+    return dealsListSuccess(res, deals);
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch deals" });
   }
 }
+
 async function listOutstanding(req, res) {
   try {
     const tenantId = req.user.tenantId;
@@ -646,38 +907,19 @@ async function listOutstanding(req, res) {
     const deals = await prisma.interStoreDeal.findMany({
       where: {
         borrowerTenantId: tenantId,
-        status: "SOLD",
+        status: InterStoreDealStatus.SOLD,
       },
       orderBy: [{ dueDate: "asc" }, { createdAt: "desc" }],
       take: 200,
-      select: {
-        id: true,
-        status: true,
-        productName: true,
-        serial: true,
-        quantity: true,
-        agreedPrice: true,
-        soldPrice: true,
-        paidAmount: true,
-        paymentMethod: true,
-        dueDate: true,
-        borrowedAt: true,
-        soldAt: true,
-        resellerName: true,
-        resellerPhone: true,
-        resellerStore: true,
-      },
+      select: buildCollectionProjection(),
     });
 
-    // derived fields for UI
-    const now = Date.now();
-    const items = deals.map((d) => {
-      const due = d.dueDate ? new Date(d.dueDate).getTime() : null;
-      const daysLeft = due == null ? null : Math.ceil((due - now) / (1000 * 60 * 60 * 24));
-      return { ...d, daysLeft };
-    });
+    const items = deals.map((d) => ({
+      ...serializeDeal(d),
+      daysLeft: computeDaysLeft(d.dueDate),
+    }));
 
-    return res.json({ deals: items, count: items.length });
+    return res.json({ ok: true, deals: items, count: items.length });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch outstanding deals" });
@@ -692,38 +934,20 @@ async function listOverdue(req, res) {
     const deals = await prisma.interStoreDeal.findMany({
       where: {
         borrowerTenantId: tenantId,
-        status: "SOLD",
+        status: InterStoreDealStatus.SOLD,
         dueDate: { not: null, lt: now },
       },
       orderBy: [{ dueDate: "asc" }, { createdAt: "desc" }],
       take: 200,
-      select: {
-        id: true,
-        status: true,
-        productName: true,
-        serial: true,
-        quantity: true,
-        agreedPrice: true,
-        soldPrice: true,
-        paidAmount: true,
-        paymentMethod: true,
-        dueDate: true,
-        borrowedAt: true,
-        soldAt: true,
-        resellerName: true,
-        resellerPhone: true,
-        resellerStore: true,
-      },
+      select: buildCollectionProjection(),
     });
 
-    const nowMs = Date.now();
-    const items = deals.map((d) => {
-      const dueMs = d.dueDate ? new Date(d.dueDate).getTime() : null;
-      const daysOverdue = dueMs == null ? null : Math.ceil((nowMs - dueMs) / (1000 * 60 * 60 * 24));
-      return { ...d, daysOverdue };
-    });
+    const items = deals.map((d) => ({
+      ...serializeDeal(d),
+      daysOverdue: computeDaysOverdue(d.dueDate),
+    }));
 
-    return res.json({ deals: items, count: items.length });
+    return res.json({ ok: true, deals: items, count: items.length });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch overdue deals" });
@@ -755,7 +979,7 @@ async function searchDeals(req, res) {
       take: 50,
     });
 
-    return res.json({ deals, count: deals.length });
+    return dealsListSuccess(res, deals);
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Failed to search deals" });
@@ -766,58 +990,52 @@ async function searchCollections(req, res) {
   try {
     const tenantId = req.user.tenantId;
     const qRaw = req.query.q;
-    const scope = (req.query.scope || "all").toLowerCase(); // all | outstanding | overdue
-
+    const scope = String(req.query.scope || "all").toLowerCase();
     const q = qRaw ? String(qRaw).trim() : "";
 
-    const baseWhere = { borrowerTenantId: tenantId };
-
-    let where = baseWhere;
+    const andWhere = [{ borrowerTenantId: tenantId }];
 
     if (scope === "outstanding") {
-      where = { ...baseWhere, status: "SOLD" };
+      andWhere.push({ status: InterStoreDealStatus.SOLD });
     } else if (scope === "overdue") {
-      where = { ...baseWhere, status: "SOLD", dueDate: { not: null, lt: new Date() } };
+      andWhere.push({
+        status: InterStoreDealStatus.SOLD,
+        dueDate: { not: null, lt: new Date() },
+      });
+    }
+
+    if (q.length >= 2) {
+      andWhere.push({
+        OR: [
+          { serial: { contains: q, mode: "insensitive" } },
+          { resellerPhone: { contains: q, mode: "insensitive" } },
+          { resellerName: { contains: q, mode: "insensitive" } },
+          { productName: { contains: q, mode: "insensitive" } },
+        ],
+      });
     }
 
     const deals = await prisma.interStoreDeal.findMany({
-      where: q.length >= 2
-        ? {
-            ...where,
-            OR: [
-              { serial: { contains: q, mode: "insensitive" } },
-              { resellerPhone: { contains: q, mode: "insensitive" } },
-              { resellerName: { contains: q, mode: "insensitive" } },
-              { productName: { contains: q, mode: "insensitive" } }
-            ],
-          }
-        : where,
+      where: { AND: andWhere },
       orderBy: [{ dueDate: "asc" }, { createdAt: "desc" }],
       take: 100,
     });
 
-    return res.json({ deals, count: deals.length });
+    return dealsListSuccess(res, deals);
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Failed to search collections" });
   }
 }
 
-
-// ----------------------------------------------------
-// ✅ ADD PAYMENT (Installments) — mismatch-proof version
-// Key fixes vs your current version:
-// 1) Always scope payments by (dealId + borrowerTenantId) to prevent cross-tenant mismatch
-// 2) Always write InterStorePayment.tenantId = deal.borrowerTenantId (source of truth)
-// 3) Always sum with tenantId filter
-// 4) Keep SOLD-only policy (simple + safe). PAID blocks new payments.
-// ----------------------------------------------------
+/**
+ * ADD PAYMENT (installments)
+ */
 async function addPayment(req, res) {
   try {
     const tenantId = req.user.tenantId;
     const userId = req.user.userId;
     const id = req.params.id;
-
     const { amount, method, note } = req.body;
 
     const amt = Number(amount);
@@ -825,23 +1043,16 @@ async function addPayment(req, res) {
       return res.status(400).json({ message: "amount must be a positive number" });
     }
 
-    // Normalize + validate method against Prisma enum
-    const m = normalizeInterStoreMethod(method);
-    if (!m) {
-      return res
-        .status(400)
-        .json({ message: "method must be one of CASH, MOMO, BANK, OTHER" });
+    const normalizedMethod = normalizeInterStoreMethod(method);
+    if (!normalizedMethod) {
+      return res.status(400).json({
+        message: "method must be one of CASH, MOMO, BANK, OTHER",
+      });
     }
 
-    const deal = await prisma.interStoreDeal.findUnique({ where: { id } });
+    const deal = await getBorrowerDealOrNull({ id, tenantId });
     if (!deal) return res.status(404).json({ message: "Deal not found" });
 
-    // borrower only can record supplier payments
-    if (deal.borrowerTenantId !== tenantId) {
-      return res.status(403).json({ message: "Not authorized" });
-    }
-
-    // ✅ Policy: installments only after SOLD
     if (deal.status === InterStoreDealStatus.PAID) {
       return res.status(400).json({ message: "Deal already fully paid" });
     }
@@ -852,87 +1063,76 @@ async function addPayment(req, res) {
       });
     }
 
-    // owed = agreedPrice * soldQuantity
-    const owedRaw = Number(deal.agreedPrice) * Number(deal.soldQuantity || 0);
-    const owed = Number.isFinite(owedRaw) ? owedRaw : 0;
-
-    if (owed <= 0) {
-      return res.status(400).json({
-        message: "Invalid owed amount (check agreedPrice and soldQuantity)",
-        owed,
-        soldQuantity: deal.soldQuantity,
-        agreedPrice: deal.agreedPrice,
-      });
-    }
-
     const result = await prisma.$transaction(async (tx) => {
-      // ✅ Recompute current total (scoped to borrower tenant) BEFORE insert
       const aggBefore = await tx.interStorePayment.aggregate({
-        where: {
-          dealId: deal.id,
-          tenantId: deal.borrowerTenantId, // ✅ prevents mismatch
-        },
+        where: { dealId: deal.id },
         _sum: { amount: true },
       });
 
       const totalPaidBefore = Number(aggBefore._sum.amount || 0);
+      const owedRaw = Number(deal.agreedPrice) * Number(deal.soldQuantity || 0);
+      const owed = Number.isFinite(owedRaw) ? owedRaw : 0;
 
-      // ✅ Prevent overpay (race-safe within transaction)
+      if (owed <= 0) throw new Error("INVALID_OWED_AMOUNT");
+
       if (totalPaidBefore + amt > owed) {
-        return {
-          overpay: true,
-          owed,
-          totalPaidBefore,
-        };
+        return { overpay: true, owed, totalPaidBefore };
       }
 
-      // ✅ Force payment tenantId to borrower tenant (source of truth)
       const payment = await tx.interStorePayment.create({
         data: {
           dealId: deal.id,
-          tenantId: deal.borrowerTenantId, // ✅ prevents mismatch
+          tenantId,
           receivedById: userId,
           amount: amt,
-          method: m, // ✅ Prisma enum
-          note: note ? String(note) : null,
+          method: normalizedMethod,
+          note: note ? String(note).slice(0, 2000) : null,
         },
       });
 
-      // ✅ Recompute total after insert (still scoped)
       const aggAfter = await tx.interStorePayment.aggregate({
-        where: {
-          dealId: deal.id,
-          tenantId: deal.borrowerTenantId, // ✅ prevents mismatch
-        },
+        where: { dealId: deal.id },
         _sum: { amount: true },
       });
 
       const totalPaidAfter = Number(aggAfter._sum.amount || 0);
-
       const nextStatus =
         totalPaidAfter >= owed ? InterStoreDealStatus.PAID : InterStoreDealStatus.SOLD;
 
-      const updatedDeal = await tx.interStoreDeal.update({
-        where: { id: deal.id },
+      const updatedDeal = await tx.interStoreDeal.updateMany({
+        where: {
+          id: deal.id,
+          borrowerTenantId: tenantId,
+          status: InterStoreDealStatus.SOLD,
+        },
         data: {
           paidAmount: totalPaidAfter,
-          paymentMethod: m, // field is String? in schema, ok
+          paymentMethod: normalizedMethod,
           paidAt: nextStatus === InterStoreDealStatus.PAID ? new Date() : deal.paidAt,
           status: nextStatus,
         },
       });
 
+      if (updatedDeal.count === 0) return null;
+
+      const reRead = await tx.interStoreDeal.findFirst({
+        where: buildBorrowerDealWhere(deal.id, tenantId),
+      });
+
       return {
         overpay: false,
         payment,
-        updatedDeal,
+        updatedDeal: reRead,
         totalPaid: totalPaidAfter,
         owed,
       };
     });
 
-    // If transaction returned overpay info (no DB changes)
-    if (result && result.overpay) {
+    if (result == null) {
+      return res.status(409).json({ message: "Deal changed; refresh and try again" });
+    }
+
+    if (result.overpay) {
       return res.status(400).json({
         message: "Payment exceeds amount owed",
         owed: result.owed,
@@ -942,99 +1142,231 @@ async function addPayment(req, res) {
       });
     }
 
-    // ✅ Audit log (enum-safe)
     await logAudit({
-      tenantId: deal.borrowerTenantId, // ✅ audit under borrower tenant
+      tenantId,
       userId,
       action: AuditAction.ADD_PAYMENT,
-      entity: "InterStoreDeal",
+      entity: "INTERSTORE_DEAL",
       entityId: deal.id,
       metadata: {
         dealId: deal.id,
         paymentId: result.payment.id,
         amount: amt,
-        method: m,
-        note: note ? String(note) : null,
+        method: normalizedMethod,
+        note: note ? String(note).slice(0, 2000) : null,
         totalPaid: result.totalPaid,
         owed: result.owed,
-        statusAfter: result.updatedDeal.status,
+        statusAfter: result.updatedDeal?.status || null,
       },
     });
 
     return res.json({
+      ok: true,
       message: "Installment recorded",
-      payment: result.payment,
+      payment: serializePayment(result.payment),
       deal: {
         id: result.updatedDeal.id,
         status: result.updatedDeal.status,
-        agreedPrice: result.updatedDeal.agreedPrice,
-        soldQuantity: result.updatedDeal.soldQuantity,
+        agreedPrice: Number(result.updatedDeal.agreedPrice),
+        soldQuantity: Number(result.updatedDeal.soldQuantity || 0),
         owed: result.owed,
         paidAmount: result.totalPaid,
         balanceDue: Math.max(0, result.owed - result.totalPaid),
       },
     });
   } catch (err) {
+    if (err.message === "INVALID_OWED_AMOUNT") {
+      return res.status(400).json({
+        message: "Invalid owed amount (check agreedPrice and soldQuantity)",
+      });
+    }
+
     console.error(err);
     return res.status(500).json({ message: "Failed to add payment" });
   }
 }
 
-/**
- * GET /api/interstore/audit
- */
 async function listDealAudit(req, res) {
   try {
     const tenantId = req.user.tenantId;
+
     const logs = await prisma.auditLog.findMany({
-      where: { tenantId, entity: "InterStoreDeal" },
+      where: { tenantId, entity: "INTERSTORE_DEAL" },
       orderBy: { createdAt: "desc" },
       take: 100,
     });
-    return res.json({ logs });
+
+    return res.json({ ok: true, logs, count: logs.length });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch audit logs" });
   }
 }
-// ----------------------------------------------------
-// ✅ GET DEAL PAYMENTS — borrower OR supplier can view (safe + scoped)
-// ----------------------------------------------------
+
+async function getDeal(req, res) {
+  try {
+    const tenantId = req.user.tenantId;
+    const id = req.params.id;
+
+    const deal = await getVisibleDealOrNull({ id, tenantId });
+    if (!deal) return res.status(404).json({ message: "Deal not found" });
+
+    return dealSuccess(res, deal);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Failed to fetch deal" });
+  }
+}
+
+async function listPayments(req, res) {
+  try {
+    const tenantId = req.user.tenantId;
+    const takeRaw = Number(req.query.take);
+    const take = Number.isFinite(takeRaw) ? Math.min(Math.max(1, takeRaw), 200) : 50;
+    const cursor = req.query.cursor ? String(req.query.cursor) : null;
+    const q = req.query.q ? String(req.query.q).trim() : "";
+    const dealId = req.query.dealId ? String(req.query.dealId).trim() : null;
+    const method = req.query.method ? String(req.query.method).trim().toUpperCase() : null;
+    const status = req.query.status ? String(req.query.status).trim().toUpperCase() : null;
+    const from = req.query.from ? new Date(String(req.query.from)) : null;
+    const to = req.query.to ? new Date(String(req.query.to)) : null;
+
+    if (from && Number.isNaN(from.getTime())) {
+      return res.status(400).json({ message: "from is invalid date" });
+    }
+
+    if (to && Number.isNaN(to.getTime())) {
+      return res.status(400).json({ message: "to is invalid date" });
+    }
+
+    let toInclusive = null;
+    if (to) {
+      toInclusive = new Date(to);
+      toInclusive.setHours(23, 59, 59, 999);
+    }
+
+    let methodFilter = null;
+    if (method) {
+      const m = normalizeInterStoreMethod(method);
+      if (!m) {
+        return res.status(400).json({
+          message: "method must be one of CASH, MOMO, BANK, OTHER",
+        });
+      }
+      methodFilter = m;
+    }
+
+    let statusFilter = null;
+    if (status) {
+      if (!ALLOWED_COLLECTION_STATUSES.has(status)) {
+        return res.status(400).json({
+          message: `status must be one of ${Array.from(ALLOWED_COLLECTION_STATUSES).join(", ")}`,
+        });
+      }
+      statusFilter = status;
+    }
+
+    const andWhere = [
+      {
+        OR: [{ tenantId }, { deal: { supplierTenantId: tenantId } }],
+      },
+    ];
+
+    if (dealId) {
+      andWhere.push({ dealId });
+    }
+
+    if (methodFilter) {
+      andWhere.push({ method: methodFilter });
+    }
+
+    if (from || toInclusive) {
+      andWhere.push({
+        createdAt: {
+          ...(from ? { gte: from } : {}),
+          ...(toInclusive ? { lte: toInclusive } : {}),
+        },
+      });
+    }
+
+    if (statusFilter) {
+      andWhere.push({ deal: { status: statusFilter } });
+    }
+
+    if (q.length >= 2) {
+      andWhere.push({
+        OR: [
+          { deal: { serial: { contains: q, mode: "insensitive" } } },
+          { deal: { productName: { contains: q, mode: "insensitive" } } },
+          { deal: { resellerPhone: { contains: q, mode: "insensitive" } } },
+          { deal: { resellerName: { contains: q, mode: "insensitive" } } },
+        ],
+      });
+    }
+
+    const payments = await prisma.interStorePayment.findMany({
+      where: { AND: andWhere },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: take + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      select: {
+        id: true,
+        dealId: true,
+        amount: true,
+        method: true,
+        note: true,
+        createdAt: true,
+        tenantId: true,
+        receivedById: true,
+        deal: {
+          select: {
+            borrowerTenantId: true,
+            supplierTenantId: true,
+            status: true,
+            productName: true,
+            serial: true,
+            resellerName: true,
+            resellerPhone: true,
+            agreedPrice: true,
+            soldQuantity: true,
+            dueDate: true,
+            paidAmount: true,
+          },
+        },
+      },
+    });
+
+    const hasNextPage = payments.length > take;
+    const items = hasNextPage ? payments.slice(0, take) : payments;
+    const nextCursor = hasNextPage ? items[items.length - 1]?.id : null;
+
+    return paymentsListSuccess(res, items, {
+      page: { take, cursor, nextCursor, hasNextPage },
+      filters: {
+        q: q || null,
+        dealId,
+        method: methodFilter,
+        status: statusFilter,
+        from: from ? from.toISOString() : null,
+        to: toInclusive ? toInclusive.toISOString() : null,
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Failed to fetch payments" });
+  }
+}
+
 async function getDealPayments(req, res) {
   try {
     const tenantId = req.user.tenantId;
     const id = req.params.id;
 
-    const deal = await prisma.interStoreDeal.findUnique({
-      where: { id },
-      select: {
-        id: true,
-        status: true,
-        borrowerTenantId: true,
-        supplierTenantId: true,
-        agreedPrice: true,
-        soldQuantity: true,
-      },
-    });
-
+    const deal = await getVisibleDealOrNull({ id, tenantId });
     if (!deal) return res.status(404).json({ message: "Deal not found" });
 
-    // ✅ Viewer rule (same as your version)
-    const canView =
-      deal.borrowerTenantId === tenantId ||
-      (deal.supplierTenantId && deal.supplierTenantId === tenantId);
-
-    if (!canView) {
-      return res.status(403).json({ message: "Not authorized" });
-    }
-
-    // ✅ CRITICAL: payments always belong to the BORROWER tenant
-    // (because addPayment is borrower-only and writes tenantId = borrowerTenantId)
     const payments = await prisma.interStorePayment.findMany({
-      where: {
-        dealId: deal.id,
-        tenantId: deal.borrowerTenantId, // ✅ prevents poisoned totals
-      },
+      where: { dealId: id },
       orderBy: { createdAt: "asc" },
       select: {
         id: true,
@@ -1051,29 +1383,23 @@ async function getDealPayments(req, res) {
       return Number.isFinite(n) ? sum + n : sum;
     }, 0);
 
-    // ✅ Owed matches addPayment logic: owed = agreedPrice * soldQuantity
-    // (only meaningful when SOLD/PAID)
     const soldQty = Number(deal.soldQuantity || 0);
     const price = Number(deal.agreedPrice);
-
-    const owedBase =
-      Number.isFinite(price) && Number.isFinite(soldQty) ? price * soldQty : 0;
-
     const owed =
-      deal.status === InterStoreDealStatus.SOLD ||
-      deal.status === InterStoreDealStatus.PAID
-        ? owedBase
+      deal.status === InterStoreDealStatus.SOLD || deal.status === InterStoreDealStatus.PAID
+        ? (Number.isFinite(price) ? price : 0) * (Number.isFinite(soldQty) ? soldQty : 0)
         : 0;
 
     return res.json({
-      dealId: deal.id,
+      ok: true,
+      dealId: id,
       status: deal.status,
-      agreedPrice: deal.agreedPrice,
-      soldQuantity: deal.soldQuantity,
+      agreedPrice: Number.isFinite(price) ? price : 0,
+      soldQuantity: Number.isFinite(soldQty) ? soldQty : 0,
       owed,
       totalPaid,
       balanceDue: Math.max(0, owed - totalPaid),
-      payments,
+      payments: payments.map(serializePayment),
       count: payments.length,
     });
   } catch (err) {
@@ -1089,11 +1415,13 @@ module.exports = {
   markReturned,
   markPaid,
   listDeals,
+  getDeal,
+  listPayments,
   listDealAudit,
   listOutstanding,
   listOverdue,
   searchDeals,
   searchCollections,
   addPayment,
-  getDealPayments
+  getDealPayments,
 };

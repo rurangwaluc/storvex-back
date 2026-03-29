@@ -1,6 +1,6 @@
 // src/controllers/repairs.controller.js
-const { PrismaClient } = require("@prisma/client");
-const prisma = new PrismaClient();
+const prisma = require("../../config/database");
+const { RepairStatus, UserRole } = require("@prisma/client");
 
 // CREATE REPAIR
 async function createRepair(req, res) {
@@ -10,8 +10,9 @@ async function createRepair(req, res) {
     return res.status(400).json({ message: "Missing required fields" });
   }
 
-  const customer = await prisma.customer.findUnique({
-    where: { id: customerId },
+  // ✅ Tenant-safe: customer must belong to the same tenant
+  const customer = await prisma.customer.findFirst({
+    where: { id: customerId, tenantId: req.user.tenantId },
   });
 
   if (!customer) return res.status(404).json({ message: "Customer not found" });
@@ -24,7 +25,7 @@ async function createRepair(req, res) {
         device,
         serial,
         issue,
-        status: "RECEIVED",
+        status: RepairStatus.RECEIVED,
         warrantyEnd: warrantyEnd ? new Date(warrantyEnd) : null,
       },
     });
@@ -103,6 +104,13 @@ async function updateRepairStatus(req, res) {
 
   if (!status) return res.status(400).json({ message: "Status is required" });
 
+  // ✅ Enum validation
+  if (!Object.values(RepairStatus).includes(status)) {
+    return res.status(400).json({
+      message: `status must be one of ${Object.values(RepairStatus).join(", ")}`,
+    });
+  }
+
   try {
     const result = await prisma.repair.updateMany({
       where: { id, tenantId: req.user.tenantId },
@@ -119,57 +127,44 @@ async function updateRepairStatus(req, res) {
 
 // Assign or unassign technician
 async function assignTechnician(req, res) {
-  let { technicianId } = req.body;
+  const tenantId = req.user.tenantId;
   const { id } = req.params;
 
-  // Log the technicianId before further processing
-  console.log("Received technicianId:", technicianId);
-
-  // If technicianId is an empty string, set to null to unassign
-  if (technicianId === "") {
-    technicianId = null;
-  }
-
-  // Log technicianId after conversion
-  console.log("Technician ID after handling empty string:", technicianId);
-
-  // If technicianId is still invalid (null or undefined), return an error
-  if (technicianId === null || technicianId === undefined) {
-    console.log("Technician ID is null or undefined, proceeding with unassigning");
-    // Allow null for unassigning
-  }
+  // allow "" to mean unassign
+  const raw = req.body?.technicianId;
+  const technicianId = raw === "" || raw == null ? null : String(raw);
 
   try {
-    const repair = await prisma.repair.findUnique({
-      where: { id },
-      select: {
-        id: true,
-        tenantId: true,
-      },
+    // ✅ If assigning (not unassigning), technician must exist in this tenant and be TECHNICIAN
+    if (technicianId) {
+      const tech = await prisma.user.findFirst({
+        where: { id: technicianId, tenantId, role: UserRole.TECHNICIAN },
+        select: { id: true },
+      });
+      if (!tech) {
+        return res.status(400).json({ message: "Invalid technicianId" });
+      }
+    }
+
+    // ✅ Tenant-safe + race-safe update
+    const result = await prisma.repair.updateMany({
+      where: { id, tenantId },
+      data: { technicianId },
     });
 
-    if (!repair) {
-      console.log("Repair not found");
+    if (result.count === 0) {
       return res.status(404).json({ message: "Repair not found" });
     }
 
-    // Ensure the repair belongs to the correct tenant
-    if (repair.tenantId !== req.user.tenantId) {
-      console.log("Forbidden: Repair does not belong to the current tenant");
-      return res.status(403).json({ message: "Forbidden: Repair does not belong to the current tenant" });
-    }
-
-    // Perform the update to assign/unassign technician
-    const updatedRepair = await prisma.repair.update({
-      where: { id },
-      data: {
-        technicianId: technicianId,  // It will be null if unassigned
+    const updated = await prisma.repair.findFirst({
+      where: { id, tenantId },
+      include: {
+        customer: { select: { name: true, phone: true } },
+        technician: { select: { name: true } },
       },
     });
 
-    console.log("Repair updated successfully:", updatedRepair);
-
-    return res.status(200).json(updatedRepair);
+    return res.status(200).json(updated);
   } catch (err) {
     console.error("Error assigning/unassigning technician:", err);
     return res.status(500).json({ message: "Failed to assign/unassign technician" });
