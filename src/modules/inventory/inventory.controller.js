@@ -1,5 +1,23 @@
 const prisma = require("../../config/database");
 const PDFDocument = require("pdfkit");
+const ExcelJS = require("exceljs");
+
+const INVENTORY_AUDIT_ACTIONS = {
+  PRODUCT_CREATED: "PRODUCT_CREATED",
+  PRODUCT_UPDATED: "PRODUCT_UPDATED",
+  PRODUCT_DEACTIVATED: "PRODUCT_DEACTIVATED",
+  PRODUCT_ACTIVATED: "PRODUCT_ACTIVATED",
+};
+
+const LOSS_REASON_OPTIONS = [
+  "STOLEN",
+  "DAMAGED",
+  "LOST",
+  "EXPIRED",
+  "INTERNAL_USE",
+  "COUNTING_ERROR",
+  "OTHER",
+];
 
 function getTenantId(req) {
   return req.user?.tenantId || null;
@@ -52,6 +70,11 @@ function normalizeAdjustmentType(x) {
   return null;
 }
 
+function normalizeLossReason(x) {
+  const v = String(x || "").trim().toUpperCase();
+  return LOSS_REASON_OPTIONS.includes(v) ? v : null;
+}
+
 function parseDateOnly(s) {
   if (!s) return null;
   const d = new Date(String(s));
@@ -99,7 +122,6 @@ function parseMinStockLevel(x) {
   return Number.isFinite(n) && n >= 0 ? n : NaN;
 }
 
-
 function productSelect() {
   return {
     id: true,
@@ -120,9 +142,12 @@ function productSelect() {
   };
 }
 
-
 async function writeAuditLog(tx, { tenantId, userId, entity, entityId, action, metadata }) {
   try {
+    if (!Object.values(INVENTORY_AUDIT_ACTIONS).includes(action)) {
+      return;
+    }
+
     await tx.auditLog.create({
       data: {
         tenantId,
@@ -138,7 +163,14 @@ async function writeAuditLog(tx, { tenantId, userId, entity, entityId, action, m
   }
 }
 
-async function ensureUniqueProductFields({ tx, tenantId, id = null, serial = null, barcode = null, sku = null }) {
+async function ensureUniqueProductFields({
+  tx,
+  tenantId,
+  id = null,
+  serial = null,
+  barcode = null,
+  sku = null,
+}) {
   if (serial) {
     const existingSerial = await tx.product.findFirst({
       where: {
@@ -269,21 +301,12 @@ function normalizeProductInput(body, { isCreate = false } = {}) {
   return data;
 }
 
-async function getProducts(req, res) {
+function buildProductWhere(req) {
   const tenantId = getTenantId(req);
-  if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
-
   const q = cleanString(req.query.q);
-  const limitRaw = toInt(req.query.limit);
-  const limit = Number.isFinite(limitRaw) && limitRaw > 0 && limitRaw <= 200 ? limitRaw : 50;
-  const cursor = cleanString(req.query.cursor);
-  const sort = normalizeSort(req.query.sort);
   const activeParam = cleanBool(req.query.active);
   const isActive = activeParam == null ? true : activeParam;
-  const lowStock = cleanBool(req.query.lowStock) === true;
   const outOfStock = cleanBool(req.query.outOfStock) === true;
-  const thresholdRaw = toInt(req.query.threshold);
-  const threshold = Number.isFinite(thresholdRaw) && thresholdRaw >= 0 && thresholdRaw <= 9999 ? thresholdRaw : 5;
   const category = cleanString(req.query.category);
   const subcategory = cleanString(req.query.subcategory);
   const brand = cleanString(req.query.brand);
@@ -307,14 +330,115 @@ async function getProducts(req, res) {
   if (subcategory) where.subcategory = { equals: subcategory, mode: "insensitive" };
   if (brand) where.brand = { equals: brand, mode: "insensitive" };
 
-  if (outOfStock) {
-    where.stockQty = 0;
-  }
+  if (outOfStock) where.stockQty = 0;
 
+  return where;
+}
+
+function buildProductOrderBy(sort) {
   let orderBy = [{ createdAt: "desc" }];
   if (sort === "name") orderBy = [{ name: "asc" }, { createdAt: "desc" }];
   if (sort === "stock_low") orderBy = [{ stockQty: "asc" }, { createdAt: "desc" }];
   if (sort === "stock_high") orderBy = [{ stockQty: "desc" }, { createdAt: "desc" }];
+  return orderBy;
+}
+
+function categoryText(p) {
+  const parts = [];
+  if (p.category) parts.push(p.category);
+
+  if (p.category === "Accessories") {
+    if (p.subcategory === "Other") parts.push(p.subcategoryOther || "Other");
+    else if (p.subcategory) parts.push(p.subcategory);
+  }
+
+  return parts.length ? parts.join(" • ") : "—";
+}
+
+function stockThresholdForProduct(product, fallbackThreshold) {
+  const min =
+    Number.isFinite(Number(product?.minStockLevel)) && Number(product?.minStockLevel) >= 0
+      ? Number(product.minStockLevel)
+      : null;
+
+  return min != null ? min : fallbackThreshold;
+}
+
+function makeWorkbookHeaderRow(ws, headers) {
+  ws.addRow(headers);
+  const row = ws.getRow(1);
+  row.font = { bold: true, color: { argb: "FFFFFFFF" } };
+  row.alignment = { vertical: "middle", horizontal: "center" };
+  row.fill = {
+    type: "pattern",
+    pattern: "solid",
+    fgColor: { argb: "FF0F172A" },
+  };
+  row.height = 22;
+}
+
+function autosizeWorksheet(ws, min = 12, max = 36) {
+  ws.columns.forEach((column) => {
+    let longest = min;
+
+    column.eachCell({ includeEmpty: true }, (cell) => {
+      const value = cell.value == null ? "" : String(cell.value);
+      longest = Math.max(longest, value.length + 2);
+    });
+
+    column.width = Math.min(Math.max(longest, min), max);
+  });
+}
+
+function styleDataRows(ws) {
+  ws.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+
+    row.alignment = { vertical: "middle" };
+
+    row.eachCell((cell) => {
+      cell.border = {
+        top: { style: "thin", color: { argb: "FFE2E8F0" } },
+        left: { style: "thin", color: { argb: "FFE2E8F0" } },
+        bottom: { style: "thin", color: { argb: "FFE2E8F0" } },
+        right: { style: "thin", color: { argb: "FFE2E8F0" } },
+      };
+    });
+  });
+}
+
+function buildStockAdjustmentNote({ type, lossReason, note }) {
+  const cleanNote = cleanString(note);
+
+  if (type !== "LOSS") return cleanNote;
+
+  if (!lossReason) return cleanNote;
+
+  if (cleanNote) {
+    return `Reason: ${lossReason}\n${cleanNote}`;
+  }
+
+  return `Reason: ${lossReason}`;
+}
+
+async function getProducts(req, res) {
+  const tenantId = getTenantId(req);
+  if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
+  const limitRaw = toInt(req.query.limit);
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 && limitRaw <= 200 ? limitRaw : 50;
+  const cursor = cleanString(req.query.cursor);
+  const sort = normalizeSort(req.query.sort);
+  const lowStock = cleanBool(req.query.lowStock) === true;
+  const outOfStock = cleanBool(req.query.outOfStock) === true;
+  const thresholdRaw = toInt(req.query.threshold);
+  const threshold =
+    Number.isFinite(thresholdRaw) && thresholdRaw >= 0 && thresholdRaw <= 9999
+      ? thresholdRaw
+      : 5;
+
+  const where = buildProductWhere(req);
+  const orderBy = buildProductOrderBy(sort);
 
   try {
     const products = await prisma.product.findMany({
@@ -329,11 +453,7 @@ async function getProducts(req, res) {
       if (outOfStock) return Number(p.stockQty || 0) === 0;
       if (!lowStock) return true;
 
-      const thresholdToUse =
-        Number.isFinite(Number(p.minStockLevel)) && Number(p.minStockLevel) >= 0
-          ? Number(p.minStockLevel)
-          : threshold;
-
+      const thresholdToUse = stockThresholdForProduct(p, threshold);
       return Number(p.stockQty || 0) > 0 && Number(p.stockQty || 0) <= thresholdToUse;
     });
 
@@ -464,7 +584,7 @@ async function createProduct(req, res) {
         userId,
         entity: "PRODUCT",
         entityId: created.id,
-        action: "PRODUCT_CREATED",
+        action: INVENTORY_AUDIT_ACTIONS.PRODUCT_CREATED,
         metadata: {
           name: created.name,
           sku: created.sku,
@@ -474,36 +594,6 @@ async function createProduct(req, res) {
           sellPrice: created.sellPrice,
         },
       });
-
-      if (Number(created.stockQty || 0) > 0) {
-        await tx.stockAdjustment.create({
-          data: {
-            tenantId,
-            productId: created.id,
-            type: "RESTOCK",
-            delta: Number(created.stockQty),
-            beforeQty: 0,
-            afterQty: Number(created.stockQty),
-            note: "Opening stock on product creation",
-            createdById: userId || null,
-          },
-        });
-
-        await writeAuditLog(tx, {
-          tenantId,
-          userId,
-          entity: "PRODUCT",
-          entityId: created.id,
-          action: "STOCK_ADJUSTED",
-          metadata: {
-            type: "RESTOCK",
-            beforeQty: 0,
-            afterQty: Number(created.stockQty),
-            delta: Number(created.stockQty),
-            reason: "Opening stock on product creation",
-          },
-        });
-      }
 
       return created;
     });
@@ -589,7 +679,7 @@ async function updateProduct(req, res) {
         userId,
         entity: "PRODUCT",
         entityId: next.id,
-        action: "PRODUCT_UPDATED",
+        action: INVENTORY_AUDIT_ACTIONS.PRODUCT_UPDATED,
         metadata: {
           before: {
             name: existing.name,
@@ -697,7 +787,7 @@ async function deleteProduct(req, res) {
         userId,
         entity: "PRODUCT",
         entityId: id,
-        action: "PRODUCT_DEACTIVATED",
+        action: INVENTORY_AUDIT_ACTIONS.PRODUCT_DEACTIVATED,
         metadata: { name: existing.name },
       });
 
@@ -756,7 +846,7 @@ async function activateProduct(req, res) {
         userId,
         entity: "PRODUCT",
         entityId: id,
-        action: "PRODUCT_ACTIVATED",
+        action: INVENTORY_AUDIT_ACTIONS.PRODUCT_ACTIVATED,
         metadata: { name: existing.name },
       });
 
@@ -785,35 +875,74 @@ async function adjustStock(req, res) {
   try {
     const tenantId = req.user?.tenantId;
     const userId = getUserId(req);
+    const userRole = String(req.user?.role || "").toUpperCase();
 
-    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+    if (!tenantId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
     const productId = String(req.params.id || "");
     const type = normalizeAdjustmentType(req.body.type);
-    const note = cleanString(req.body.note);
+    const rawNote = cleanString(req.body.note);
+    const lossReason = normalizeLossReason(req.body.lossReason);
 
-    if (!productId) return res.status(400).json({ message: "Missing product id" });
-    if (!type) return res.status(400).json({ message: "Invalid type. Use RESTOCK, LOSS, or CORRECTION." });
+    if (!productId) {
+      return res.status(400).json({ message: "Missing product id" });
+    }
 
-    if (type === "RESTOCK" && !hasDbPermission(req, "stock.restock")) {
-      return res.status(403).json({
-        message: "Forbidden",
-        requiredPermission: "stock.restock",
+    if (!type) {
+      return res
+        .status(400)
+        .json({ message: "Invalid type. Use RESTOCK, LOSS, or CORRECTION." });
+    }
+
+    if (type === "LOSS" && !lossReason) {
+      return res.status(400).json({
+        message:
+          "LOSS requires lossReason. Use one of: STOLEN, DAMAGED, LOST, EXPIRED, INTERNAL_USE, COUNTING_ERROR, OTHER.",
+        code: "LOSS_REASON_REQUIRED",
       });
     }
 
-    if (type === "LOSS" && !hasDbPermission(req, "stock.loss")) {
-      return res.status(403).json({
-        message: "Forbidden",
-        requiredPermission: "stock.loss",
+    if (type === "LOSS" && (lossReason === "STOLEN" || lossReason === "OTHER") && !rawNote) {
+      return res.status(400).json({
+        message: "A note is required when lossReason is STOLEN or OTHER.",
+        code: "LOSS_NOTE_REQUIRED",
       });
     }
 
-    if (type === "CORRECTION" && !hasDbPermission(req, "stock.correction")) {
-      return res.status(403).json({
-        message: "Forbidden",
-        requiredPermission: "stock.correction",
-      });
+    const note = buildStockAdjustmentNote({
+      type,
+      lossReason,
+      note: rawNote,
+    });
+
+    const isOwner = userRole === "OWNER";
+
+    if (!isOwner) {
+      if (type === "RESTOCK" && !hasDbPermission(req, "stock.restock")) {
+        return res.status(403).json({
+          message: "Forbidden",
+          code: "MISSING_PERMISSION",
+          requiredPermission: "stock.restock",
+        });
+      }
+
+      if (type === "LOSS" && !hasDbPermission(req, "stock.loss")) {
+        return res.status(403).json({
+          message: "Forbidden",
+          code: "MISSING_PERMISSION",
+          requiredPermission: "stock.loss",
+        });
+      }
+
+      if (type === "CORRECTION" && !hasDbPermission(req, "stock.correction")) {
+        return res.status(403).json({
+          message: "Forbidden",
+          code: "MISSING_PERMISSION",
+          requiredPermission: "stock.correction",
+        });
+      }
     }
 
     const quantity = toInt(req.body.quantity);
@@ -821,23 +950,36 @@ async function adjustStock(req, res) {
 
     if (type === "RESTOCK" || type === "LOSS") {
       if (!Number.isInteger(quantity) || quantity <= 0) {
-        return res.status(400).json({ message: "quantity must be a positive number" });
+        return res.status(400).json({
+          message: "quantity must be a positive number",
+        });
       }
     }
 
     if (type === "CORRECTION") {
       if (!Number.isInteger(newStockQty) || newStockQty < 0) {
-        return res.status(400).json({ message: "newStockQty must be 0 or more" });
+        return res.status(400).json({
+          message: "newStockQty must be 0 or more",
+        });
       }
     }
 
     const result = await prisma.$transaction(async (tx) => {
       const product = await tx.product.findFirst({
         where: { id: productId, tenantId },
-        select: { id: true, name: true, stockQty: true },
+        select: {
+          id: true,
+          name: true,
+          stockQty: true,
+          sku: true,
+          barcode: true,
+          serial: true,
+        },
       });
 
-      if (!product) throw new Error("PRODUCT_NOT_FOUND");
+      if (!product) {
+        throw new Error("PRODUCT_NOT_FOUND");
+      }
 
       const beforeQty = Number(product.stockQty || 0);
 
@@ -855,7 +997,9 @@ async function adjustStock(req, res) {
         afterQty = newStockQty;
       }
 
-      if (afterQty < 0) throw new Error("NEGATIVE_STOCK");
+      if (afterQty < 0) {
+        throw new Error("NEGATIVE_STOCK");
+      }
 
       await tx.product.update({
         where: { id: product.id },
@@ -873,23 +1017,14 @@ async function adjustStock(req, res) {
           note: note || null,
           createdById: userId || null,
         },
-        select: { id: true },
-      });
-
-      await writeAuditLog(tx, {
-        tenantId,
-        userId,
-        entity: "PRODUCT",
-        entityId: product.id,
-        action: "STOCK_ADJUSTED",
-        metadata: {
-          adjustmentId: adj.id,
-          type,
-          beforeQty,
-          afterQty,
-          delta,
-          note: note || null,
-          productName: product.name,
+        select: {
+          id: true,
+          type: true,
+          delta: true,
+          beforeQty: true,
+          afterQty: true,
+          note: true,
+          createdAt: true,
         },
       });
 
@@ -901,14 +1036,24 @@ async function adjustStock(req, res) {
         delta,
         type,
         adjustmentId: adj.id,
+        lossReason: type === "LOSS" ? lossReason : null,
       };
     });
 
-    return res.status(201).json({ message: "Stock updated", ...result });
+    return res.status(201).json({
+      message: "Stock updated",
+      ...result,
+    });
   } catch (err) {
     const msg = String(err?.message || "");
-    if (msg === "PRODUCT_NOT_FOUND") return res.status(404).json({ message: "Product not found" });
-    if (msg === "NEGATIVE_STOCK") return res.status(400).json({ message: "Stock cannot go below 0" });
+
+    if (msg === "PRODUCT_NOT_FOUND") {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    if (msg === "NEGATIVE_STOCK") {
+      return res.status(400).json({ message: "Stock cannot go below 0" });
+    }
 
     console.error("adjustStock error:", err);
     return res.status(500).json({ message: "Failed to adjust stock" });
@@ -961,7 +1106,9 @@ async function listAllStockAdjustments(req, res) {
     const limit = Number.isFinite(limitRaw) && limitRaw > 0 && limitRaw <= 200 ? limitRaw : 50;
 
     const now = new Date();
-    const start = from ? startOfDay(from) : startOfDay(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000));
+    const start = from
+      ? startOfDay(from)
+      : startOfDay(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000));
     const end = to ? endOfDay(to) : endOfDay(now);
 
     const where = {
@@ -1118,12 +1265,7 @@ async function reorderPdf(req, res) {
     const lowStock = allActiveProducts.filter((p) => {
       const qty = Number(p.stockQty || 0);
       if (qty <= 0) return false;
-
-      const thresholdToUse =
-        Number.isFinite(Number(p.minStockLevel)) && Number(p.minStockLevel) >= 0
-          ? Number(p.minStockLevel)
-          : threshold;
-
+      const thresholdToUse = stockThresholdForProduct(p, threshold);
       return qty <= thresholdToUse;
     });
 
@@ -1141,25 +1283,8 @@ async function reorderPdf(req, res) {
     const pageH = doc.page.height;
     const contentW = pageW - M * 2;
 
-    function categoryText(p) {
-      const parts = [];
-      if (p.category) parts.push(p.category);
-
-      if (p.category === "Accessories") {
-        if (p.subcategory === "Other") parts.push(p.subcategoryOther || "Other");
-        else if (p.subcategory) parts.push(p.subcategory);
-      }
-
-      return parts.length ? parts.join(" • ") : "—";
-    }
-
     function thresholdText(p) {
-      const thresholdToUse =
-        Number.isFinite(Number(p.minStockLevel)) && Number(p.minStockLevel) >= 0
-          ? Number(p.minStockLevel)
-          : threshold;
-
-      return String(thresholdToUse);
+      return String(stockThresholdForProduct(p, threshold));
     }
 
     function drawHeader() {
@@ -1337,6 +1462,273 @@ async function reorderPdf(req, res) {
   }
 }
 
+async function exportInventoryExcel(req, res) {
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
+    const sort = normalizeSort(req.query.sort);
+    const lowStock = cleanBool(req.query.lowStock) === true;
+    const outOfStock = cleanBool(req.query.outOfStock) === true;
+    const thresholdRaw = toInt(req.query.threshold);
+    const threshold =
+      Number.isFinite(thresholdRaw) && thresholdRaw >= 0 && thresholdRaw <= 9999
+        ? thresholdRaw
+        : 5;
+
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { name: true },
+    });
+
+    const products = await prisma.product.findMany({
+      where: buildProductWhere(req),
+      orderBy: buildProductOrderBy(sort),
+      take: 5000,
+      select: productSelect(),
+    });
+
+    const filtered = products.filter((p) => {
+      if (outOfStock) return Number(p.stockQty || 0) === 0;
+      if (!lowStock) return true;
+
+      const thresholdToUse = stockThresholdForProduct(p, threshold);
+      return Number(p.stockQty || 0) > 0 && Number(p.stockQty || 0) <= thresholdToUse;
+    });
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "Storvex";
+    workbook.created = new Date();
+
+    const ws = workbook.addWorksheet("Inventory");
+
+    ws.properties.defaultRowHeight = 20;
+    ws.views = [{ state: "frozen", ySplit: 1 }];
+
+    makeWorkbookHeaderRow(ws, [
+      "Product Name",
+      "Brand",
+      "Category",
+      "SKU",
+      "Barcode",
+      "Serial / IMEI",
+      "Buy Price",
+      "Sell Price",
+      "Stock Qty",
+      "Min Stock Level",
+      "Stock Status",
+      "Active",
+      "Created At",
+    ]);
+
+    for (const p of filtered) {
+      const qty = Number(p.stockQty || 0);
+      const thresholdToUse = stockThresholdForProduct(p, threshold);
+
+      let stockStatus = "Healthy";
+      if (qty === 0) stockStatus = "Out of stock";
+      else if (qty <= thresholdToUse) stockStatus = "Low stock";
+
+      ws.addRow([
+        p.name || "",
+        p.brand || "",
+        categoryText(p),
+        p.sku || "",
+        p.barcode || "",
+        p.serial || "",
+        Number(p.costPrice || 0),
+        Number(p.sellPrice || 0),
+        qty,
+        thresholdToUse,
+        stockStatus,
+        p.isActive ? "Yes" : "No",
+        p.createdAt ? new Date(p.createdAt).toLocaleString() : "",
+      ]);
+    }
+
+    ws.insertRow(1, [
+      tenant?.name ? `${tenant.name} Inventory Export` : "Inventory Export",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      `Generated ${new Date().toLocaleString()}`,
+    ]);
+    ws.mergeCells("A1:L1");
+    ws.getCell("A1").font = { bold: true, size: 14 };
+    ws.getCell("A1").alignment = { vertical: "middle" };
+    ws.getCell("M1").font = { italic: true, size: 10 };
+    ws.getRow(1).height = 22;
+
+    ws.getColumn(7).numFmt = '#,##0 "RWF"';
+    ws.getColumn(8).numFmt = '#,##0 "RWF"';
+
+    styleDataRows(ws);
+    autosizeWorksheet(ws);
+
+    const filename = `storvex-inventory-${isoDate(new Date())}.xlsx`;
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (err) {
+    console.error("exportInventoryExcel error:", err);
+    return res.status(500).json({ message: "Failed to export inventory Excel" });
+  }
+}
+
+async function exportStockAdjustmentsExcel(req, res) {
+  try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { name: true },
+    });
+
+    const q = cleanString(req.query.q);
+    const type = normalizeAdjustmentType(req.query.type);
+    const from = parseDateOnly(req.query.from);
+    const to = parseDateOnly(req.query.to);
+
+    const now = new Date();
+    const start = from
+      ? startOfDay(from)
+      : startOfDay(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000));
+    const end = to ? endOfDay(to) : endOfDay(now);
+
+    const where = {
+      tenantId,
+      createdAt: { gte: start, lte: end },
+    };
+
+    if (type) where.type = type;
+
+    if (q) {
+      where.product = {
+        OR: [
+          { name: { contains: q, mode: "insensitive" } },
+          { sku: { contains: q, mode: "insensitive" } },
+          { serial: { contains: q, mode: "insensitive" } },
+          { barcode: { contains: q, mode: "insensitive" } },
+        ],
+      };
+    }
+
+    const rows = await prisma.stockAdjustment.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: 10000,
+      select: {
+        id: true,
+        type: true,
+        delta: true,
+        beforeQty: true,
+        afterQty: true,
+        note: true,
+        createdAt: true,
+        product: {
+          select: {
+            id: true,
+            name: true,
+            sku: true,
+            barcode: true,
+            category: true,
+          },
+        },
+        createdBy: { select: { name: true } },
+      },
+    });
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "Storvex";
+    workbook.created = new Date();
+
+    const ws = workbook.addWorksheet("Stock History");
+    ws.properties.defaultRowHeight = 20;
+    ws.views = [{ state: "frozen", ySplit: 1 }];
+
+    makeWorkbookHeaderRow(ws, [
+      "Date",
+      "Product",
+      "SKU",
+      "Barcode",
+      "Category",
+      "Type",
+      "Delta",
+      "Before Qty",
+      "After Qty",
+      "Changed By",
+      "Note",
+    ]);
+
+    for (const row of rows) {
+      ws.addRow([
+        row.createdAt ? new Date(row.createdAt).toLocaleString() : "",
+        row.product?.name || "",
+        row.product?.sku || "",
+        row.product?.barcode || "",
+        row.product?.category || "",
+        row.type || "",
+        Number(row.delta || 0),
+        Number(row.beforeQty || 0),
+        Number(row.afterQty || 0),
+        row.createdBy?.name || "System",
+        row.note || "",
+      ]);
+    }
+
+    ws.insertRow(1, [
+      tenant?.name ? `${tenant.name} Stock History Export` : "Stock History Export",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      `Generated ${new Date().toLocaleString()}`,
+    ]);
+    ws.mergeCells("A1:J1");
+    ws.getCell("A1").font = { bold: true, size: 14 };
+    ws.getCell("A1").alignment = { vertical: "middle" };
+    ws.getCell("K1").font = { italic: true, size: 10 };
+    ws.getRow(1).height = 22;
+
+    styleDataRows(ws);
+    autosizeWorksheet(ws);
+
+    const filename = `storvex-stock-history-${isoDate(new Date())}.xlsx`;
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (err) {
+    console.error("exportStockAdjustmentsExcel error:", err);
+    return res.status(500).json({ message: "Failed to export stock history Excel" });
+  }
+}
+
 module.exports = {
   getProducts,
   searchProducts,
@@ -1350,4 +1742,6 @@ module.exports = {
   listAllStockAdjustments,
   getInventorySummary,
   reorderPdf,
+  exportInventoryExcel,
+  exportStockAdjustmentsExcel,
 };

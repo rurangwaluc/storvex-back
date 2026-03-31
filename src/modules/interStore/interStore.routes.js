@@ -1,4 +1,3 @@
-// src/modules/interstore/interStore.routes.js
 const express = require("express");
 
 const router = express.Router();
@@ -13,30 +12,20 @@ const {
 
 const controller = require("./interStore.controller");
 
-// All routes are tenant-auth protected.
 router.use(authenticate, requireTenant, requireActiveSubscription);
 
-/**
- * Access model
- *
- * READ:
- * - OWNER
- * - MANAGER
- * - CASHIER
- *
- * WRITE / OPERATIONAL:
- * - OWNER
- * - MANAGER
- * - CASHIER
- *
- * HIGH-CONTROL:
- * - OWNER
- * - MANAGER
- */
+router.get(
+  "/internal-suppliers",
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.listInternalSuppliers
+);
 
-//
-// Collections / Search / Listing
-//
+router.get(
+  "/internal-suppliers/:supplierTenantId/products",
+  requireRole("OWNER", "MANAGER", "CASHIER"),
+  controller.searchInternalSupplierProducts
+);
+
 router.get(
   "/outstanding",
   requireRole("OWNER", "MANAGER", "CASHIER"),
@@ -79,9 +68,6 @@ router.get(
   controller.listDeals
 );
 
-//
-// Deal creation / workflow mutations
-//
 router.post(
   "/",
   express.json(),
@@ -136,9 +122,6 @@ router.post(
   controller.addPayment
 );
 
-//
-// Keep this LAST so it does not catch /outstanding, /overdue, /search, etc.
-//
 router.get(
   "/:id",
   requireRole("OWNER", "MANAGER", "CASHIER"),

@@ -48,12 +48,28 @@ router.get(
   inventoryController.getProducts
 );
 
+// Inventory Excel export
+router.get(
+  "/export.xlsx",
+  ...readBase,
+  requireDbPermission("product.view"),
+  inventoryController.exportInventoryExcel
+);
+
 // Whole-store stock history
 router.get(
   "/stock-adjustments",
   ...readBase,
   requireDbPermission("stock.history.view"),
   inventoryController.listAllStockAdjustments
+);
+
+// Stock history Excel export
+router.get(
+  "/stock-adjustments/export.xlsx",
+  ...readBase,
+  requireDbPermission("stock.history.view"),
+  inventoryController.exportStockAdjustmentsExcel
 );
 
 // Get product by ID
@@ -112,7 +128,7 @@ router.get(
   inventoryController.listStockAdjustments
 );
 
-// Reorder export
+// Reorder PDF export
 router.get(
   "/reorder.pdf",
   ...readBase,

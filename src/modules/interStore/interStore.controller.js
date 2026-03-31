@@ -1,4 +1,3 @@
-// src/modules/interstore/interStore.controller.js
 const {
   InterStoreDealStatus,
   AuditAction,
@@ -231,6 +230,131 @@ function computeDaysOverdue(dueDate) {
   const due = new Date(dueDate).getTime();
   if (!Number.isFinite(due)) return null;
   return Math.ceil((Date.now() - due) / (1000 * 60 * 60 * 24));
+}
+
+/**
+ * INTERNAL SUPPLIERS
+ */
+async function listInternalSuppliers(req, res) {
+  try {
+    const tenantId = req.user.tenantId;
+    const q = cleanString(req.query.q);
+    const takeRaw = toInt(req.query.take);
+    const take = Number.isFinite(takeRaw) ? Math.min(Math.max(1, takeRaw), 50) : 20;
+
+    const where = {
+      id: { not: tenantId },
+    };
+
+    if (q) {
+      where.OR = [
+        { name: { contains: q, mode: "insensitive" } },
+        { email: { contains: q, mode: "insensitive" } },
+        { phone: { contains: q, mode: "insensitive" } },
+      ];
+    }
+
+    const rows = await prisma.tenant.findMany({
+      where,
+      orderBy: { name: "asc" },
+      take,
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        email: true,
+      },
+    });
+
+    return res.json({
+      ok: true,
+      suppliers: rows.map((row) => ({
+        id: row.id,
+        name: row.name || "Unnamed store",
+        phone: row.phone || null,
+        email: row.email || null,
+      })),
+      count: rows.length,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Failed to fetch internal suppliers" });
+  }
+}
+
+/**
+ * INTERNAL SUPPLIER PRODUCTS
+ */
+async function searchInternalSupplierProducts(req, res) {
+  try {
+    const borrowerTenantId = req.user.tenantId;
+    const supplierTenantId = cleanString(req.params.supplierTenantId);
+    const q = cleanString(req.query.q);
+    const takeRaw = toInt(req.query.take);
+    const take = Number.isFinite(takeRaw) ? Math.min(Math.max(1, takeRaw), 50) : 20;
+
+    if (!supplierTenantId) {
+      return res.status(400).json({ message: "supplierTenantId is required" });
+    }
+
+    if (supplierTenantId === borrowerTenantId) {
+      return res.status(400).json({ message: "Supplier cannot be your own store" });
+    }
+
+    const where = {
+      tenantId: supplierTenantId,
+      isActive: true,
+      stockQty: { gt: 0 },
+    };
+
+    if (q) {
+      where.OR = [
+        { name: { contains: q, mode: "insensitive" } },
+        { serial: { contains: q, mode: "insensitive" } },
+        { sku: { contains: q, mode: "insensitive" } },
+        { barcode: { contains: q, mode: "insensitive" } },
+        { brand: { contains: q, mode: "insensitive" } },
+        { category: { contains: q, mode: "insensitive" } },
+      ];
+    }
+
+    const rows = await prisma.product.findMany({
+      where,
+      orderBy: [{ name: "asc" }, { createdAt: "desc" }],
+      take,
+      select: {
+        id: true,
+        name: true,
+        serial: true,
+        sku: true,
+        barcode: true,
+        brand: true,
+        category: true,
+        stockQty: true,
+        sellPrice: true,
+        costPrice: true,
+      },
+    });
+
+    return res.json({
+      ok: true,
+      products: rows.map((row) => ({
+        id: row.id,
+        name: row.name || "Unnamed product",
+        serial: row.serial || null,
+        sku: row.sku || null,
+        barcode: row.barcode || null,
+        brand: row.brand || null,
+        category: row.category || null,
+        stockQty: Number(row.stockQty || 0),
+        suggestedPrice: Number(row.sellPrice || row.costPrice || 0),
+      })),
+      count: rows.length,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Failed to fetch supplier products" });
+  }
 }
 
 /**
@@ -1401,6 +1525,12 @@ async function getDealPayments(req, res) {
       balanceDue: Math.max(0, owed - totalPaid),
       payments: payments.map(serializePayment),
       count: payments.length,
+      summary: {
+        owed,
+        totalPaid,
+        balanceDue: Math.max(0, owed - totalPaid),
+        count: payments.length,
+      },
     });
   } catch (err) {
     console.error(err);
@@ -1409,6 +1539,8 @@ async function getDealPayments(req, res) {
 }
 
 module.exports = {
+  listInternalSuppliers,
+  searchInternalSupplierProducts,
   createDeal,
   markReceived,
   markSold,

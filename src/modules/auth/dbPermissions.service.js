@@ -5,6 +5,15 @@ function normalizeRole(role) {
 }
 
 /**
+ * Owner is the tenant super-admin.
+ * In a world-class store system, OWNER should never be blocked by missing
+ * seeded rolePermission rows.
+ */
+function ownerPermissionSet() {
+  return ["*"];
+}
+
+/**
  * Resolve effective permissions for a user:
  * 1) Start with role permissions
  * 2) Apply user-specific overrides
@@ -13,11 +22,17 @@ function normalizeRole(role) {
  *
  * Returns string[] permission keys
  */
-async function resolveEffectiveDbPermissions({ userId, role }) {
+async function resolveEffectiveDbPermissions({ userId, role, tenantId }) {
   const normalizedRole = normalizeRole(role);
   const safeUserId = String(userId || "").trim();
+  const safeTenantId = String(tenantId || "").trim();
 
   if (!normalizedRole || !safeUserId) return [];
+
+  // OWNER bypass: never rely on DB seed completeness for owner access
+  if (normalizedRole === "OWNER") {
+    return ownerPermissionSet();
+  }
 
   const [roleRows, userRows] = await Promise.all([
     prisma.rolePermission.findMany({
@@ -32,7 +47,10 @@ async function resolveEffectiveDbPermissions({ userId, role }) {
     }),
 
     prisma.userPermission.findMany({
-      where: { userId: safeUserId },
+      where: {
+        userId: safeUserId,
+        ...(safeTenantId ? { tenantId: safeTenantId } : {}),
+      },
       select: {
         isGranted: true,
         permission: {
