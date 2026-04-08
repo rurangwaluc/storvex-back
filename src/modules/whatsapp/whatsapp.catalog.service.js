@@ -1,10 +1,16 @@
-// src/modules/whatsapp/whatsapp.catalog.service.js
-
 const prisma = require("../../config/database");
 
 function normalizeText(value) {
   const s = String(value || "").trim();
   return s || null;
+}
+
+function normalizeLower(value) {
+  return String(value || "").toLowerCase().trim();
+}
+
+function collapseSpaces(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
 }
 
 function escapeRegExp(value) {
@@ -17,24 +23,62 @@ function formatMoneyRwf(n) {
   return `${Math.round(x).toLocaleString("en-US")} RWF`;
 }
 
-function tokenizeQuery(value) {
-  const text = String(value || "")
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s-]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+function normalizeSearchText(value) {
+  return collapseSpaces(
+    String(value || "")
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s/-]/gu, " ")
+      .replace(/[_]+/g, " ")
+  );
+}
 
+function tokenizeQuery(value) {
+  const text = normalizeSearchText(value);
   if (!text) return [];
+
+  const stopWords = new Set([
+    "price",
+    "stock",
+    "available",
+    "availability",
+    "buy",
+    "order",
+    "want",
+    "need",
+    "the",
+    "for",
+    "with",
+    "and",
+    "phone",
+    "please",
+  ]);
 
   return text
     .split(" ")
     .map((x) => x.trim())
     .filter(Boolean)
-    .filter((x) => x.length >= 2);
+    .filter((x) => x.length >= 2)
+    .filter((x) => !stopWords.has(x));
+}
+
+function buildSearchHaystack(product) {
+  return normalizeSearchText(
+    [
+      product?.name,
+      product?.brand,
+      product?.category,
+      product?.subcategory,
+      product?.sku,
+      product?.barcode,
+      product?.serial,
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
 }
 
 function extractBudgetFromText(text) {
-  const raw = String(text || "").toLowerCase();
+  const raw = normalizeLower(text);
 
   const patterns = [
     /\b(?:around|about|budget|under|below|max(?:imum)?|up to|near|within)\s*(\d+(?:[.,]\d+)?)\s*(k|m|rwf)?\b/i,
@@ -61,7 +105,7 @@ function extractBudgetFromText(text) {
 }
 
 function detectBrandFromText(text) {
-  const raw = String(text || "").toLowerCase();
+  const raw = normalizeLower(text);
 
   const brands = [
     "samsung",
@@ -123,7 +167,7 @@ function detectBrandFromText(text) {
 }
 
 function detectCategoryFromText(text) {
-  const raw = String(text || "").toLowerCase();
+  const raw = normalizeLower(text);
 
   if (/\b(phone|smartphone|mobile|telephone)\b/i.test(raw)) return "phone";
   if (/\b(laptop|computer|notebook|pc|macbook)\b/i.test(raw)) return "laptop";
@@ -147,7 +191,7 @@ function detectCategoryFromText(text) {
 function buildCategoryWhere(category) {
   if (!category) return null;
 
-  const q = String(category).toLowerCase();
+  const q = normalizeLower(category);
 
   const map = {
     phone: ["phone", "smartphone", "mobile", "iphone", "galaxy"],
@@ -180,18 +224,7 @@ function buildCategoryWhere(category) {
 }
 
 function scoreProductAgainstQuery(product, queryTokens) {
-  const hay = [
-    product?.name,
-    product?.brand,
-    product?.category,
-    product?.subcategory,
-    product?.sku,
-    product?.barcode,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-
+  const hay = buildSearchHaystack(product);
   let score = 0;
 
   for (const token of queryTokens) {
@@ -199,16 +232,28 @@ function scoreProductAgainstQuery(product, queryTokens) {
 
     const exactWord = new RegExp(`\\b${escapeRegExp(token)}\\b`, "i");
     if (exactWord.test(hay)) {
-      score += 5;
+      score += 8;
       continue;
     }
 
     if (hay.includes(token.toLowerCase())) {
-      score += 2;
+      score += 3;
     }
   }
 
-  if (product?.stockQty > 0) score += 1;
+  const fullName = normalizeLower(product?.name);
+  const fullSku = normalizeLower(product?.sku);
+  const fullBarcode = normalizeLower(product?.barcode);
+
+  const joinedQuery = queryTokens.join(" ").trim();
+  if (joinedQuery) {
+    if (fullName === joinedQuery) score += 10;
+    if (fullSku === joinedQuery) score += 12;
+    if (fullBarcode === joinedQuery) score += 12;
+    if (fullName.includes(joinedQuery)) score += 5;
+  }
+
+  if (Number(product?.stockQty || 0) > 0) score += 1;
 
   return score;
 }
@@ -228,31 +273,60 @@ function buildProductSelect() {
   };
 }
 
+function dedupeProducts(products) {
+  const seen = new Set();
+  const out = [];
+
+  for (const p of products || []) {
+    const key =
+      p?.id ||
+      `${normalizeLower(p?.name)}|${normalizeLower(p?.sku)}|${normalizeLower(p?.barcode)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(p);
+  }
+
+  return out;
+}
+
 async function searchProducts({ tenantId, q, take = 3 }) {
   const query = normalizeText(q);
   if (!query || query.length < 2) return [];
 
   const tokens = tokenizeQuery(query);
+  if (tokens.length === 0) return [];
+
+  const exactOr = [
+    { name: { contains: query, mode: "insensitive" } },
+    { category: { contains: query, mode: "insensitive" } },
+    { subcategory: { contains: query, mode: "insensitive" } },
+    { brand: { contains: query, mode: "insensitive" } },
+    { sku: { contains: query, mode: "insensitive" } },
+    { barcode: { contains: query, mode: "insensitive" } },
+    { serial: { contains: query, mode: "insensitive" } },
+  ];
+
+  const tokenOr = tokens.flatMap((token) => [
+    { name: { contains: token, mode: "insensitive" } },
+    { brand: { contains: token, mode: "insensitive" } },
+    { category: { contains: token, mode: "insensitive" } },
+    { subcategory: { contains: token, mode: "insensitive" } },
+    { sku: { contains: token, mode: "insensitive" } },
+    { barcode: { contains: token, mode: "insensitive" } },
+  ]);
 
   const products = await prisma.product.findMany({
     where: {
       tenantId,
       isActive: true,
       stockQty: { gt: 0 },
-      OR: [
-        { name: { contains: query, mode: "insensitive" } },
-        { category: { contains: query, mode: "insensitive" } },
-        { subcategory: { contains: query, mode: "insensitive" } },
-        { brand: { contains: query, mode: "insensitive" } },
-        { sku: { contains: query, mode: "insensitive" } },
-        { barcode: { contains: query, mode: "insensitive" } },
-      ],
+      OR: [...exactOr, ...tokenOr],
     },
     select: buildProductSelect(),
-    take: Math.max(10, Number(take) || 3),
+    take: Math.max(20, Number(take) * 6 || 18),
   });
 
-  return products
+  return dedupeProducts(products)
     .map((p) => ({
       ...p,
       _score: scoreProductAgainstQuery(p, tokens),
@@ -262,8 +336,12 @@ async function searchProducts({ tenantId, q, take = 3 }) {
       if (Number(b.stockQty || 0) !== Number(a.stockQty || 0)) {
         return Number(b.stockQty || 0) - Number(a.stockQty || 0);
       }
+      if (Number(a.sellPrice || 0) !== Number(b.sellPrice || 0)) {
+        return Number(a.sellPrice || 0) - Number(b.sellPrice || 0);
+      }
       return String(a.name || "").localeCompare(String(b.name || ""));
     })
+    .filter((p) => p._score > 0)
     .slice(0, take)
     .map(({ _score, ...rest }) => rest);
 }
@@ -310,12 +388,12 @@ async function searchProductsByBudgetIntent({ tenantId, text, take = 3 }) {
         ],
       },
       select: buildProductSelect(),
-      take: 20,
+      take: 25,
     });
   }
 
   if (strictProducts.length > 0) {
-    const products = strictProducts
+    const products = dedupeProducts(strictProducts)
       .sort((a, b) => {
         const da = Math.abs(Number(a.sellPrice || 0) - budget);
         const db = Math.abs(Number(b.sellPrice || 0) - budget);
@@ -345,7 +423,7 @@ async function searchProductsByBudgetIntent({ tenantId, text, take = 3 }) {
     take: 30,
   });
 
-  const products = relaxedProducts
+  const products = dedupeProducts(relaxedProducts)
     .sort((a, b) => {
       if (budget) {
         const da = Math.abs(Number(a.sellPrice || 0) - budget);
@@ -393,30 +471,46 @@ async function findBestProductMatch({ tenantId, query }) {
     return { kind: "ONE", product: candidates[0], candidates };
   }
 
-  const normalizedQuery = cleanQuery.toLowerCase();
+  const normalizedQuery = normalizeLower(cleanQuery);
+  const tokens = tokenizeQuery(cleanQuery);
 
   const exactName = candidates.find(
-    (p) => String(p.name || "").trim().toLowerCase() === normalizedQuery
+    (p) => normalizeLower(p.name) === normalizedQuery
   );
   if (exactName) {
     return { kind: "ONE", product: exactName, candidates };
   }
 
   const exactSku = candidates.find(
-    (p) => String(p.sku || "").trim().toLowerCase() === normalizedQuery
+    (p) => normalizeLower(p.sku) === normalizedQuery
   );
   if (exactSku) {
     return { kind: "ONE", product: exactSku, candidates };
   }
 
-  const first = candidates[0];
-  const second = candidates[1];
+  const exactBarcode = candidates.find(
+    (p) => normalizeLower(p.barcode) === normalizedQuery
+  );
+  if (exactBarcode) {
+    return { kind: "ONE", product: exactBarcode, candidates };
+  }
 
-  const firstScore = scoreProductAgainstQuery(first, tokenizeQuery(cleanQuery));
-  const secondScore = scoreProductAgainstQuery(second, tokenizeQuery(cleanQuery));
+  const scored = candidates.map((p) => ({
+    product: p,
+    score: scoreProductAgainstQuery(p, tokens),
+  }));
 
-  if (firstScore >= secondScore + 3) {
-    return { kind: "ONE", product: first, candidates };
+  scored.sort((a, b) => b.score - a.score);
+
+  const first = scored[0];
+  const second = scored[1];
+
+  if (!second) {
+    return { kind: "ONE", product: first.product, candidates };
+  }
+
+  if (first.score >= second.score + 4) {
+    return { kind: "ONE", product: first.product, candidates };
   }
 
   return {
@@ -426,40 +520,59 @@ async function findBestProductMatch({ tenantId, query }) {
   };
 }
 
+function formatProductLine(p) {
+  const pieces = [];
+
+  if (p?.brand) pieces.push(p.brand);
+  if (p?.category) pieces.push(p.category);
+  if (p?.sku) pieces.push(`SKU ${p.sku}`);
+
+  return pieces.join(" • ");
+}
+
 function buildProductsReply({ businessName, q, products }) {
   if (!products || products.length === 0) {
-    return `❌ *${businessName}*\nI could not find "${q}" in stock right now.\nReply with another model name, SKU, or brand.`;
+    return (
+      `❌ *${businessName}*\n` +
+      `I could not find "${q}" in stock right now.\n` +
+      `Reply with another model name, SKU, barcode, or brand.`
+    );
   }
 
   const lines = [];
   lines.push(`✅ *${businessName}*`);
-  lines.push(`🔎 Results for: "${q}"`);
+  lines.push(`Here are the closest matches for: "${q}"`);
   lines.push("");
 
   for (const p of products) {
     lines.push(`📦 *${p.name}*`);
+    if (formatProductLine(p)) lines.push(`${formatProductLine(p)}`);
     lines.push(`💰 Price: ${formatMoneyRwf(p.sellPrice)}`);
-    lines.push(`📦 Stock: ${p.stockQty}`);
+    lines.push(`📦 In stock: ${p.stockQty}`);
     lines.push("");
   }
 
-  lines.push(`To reserve: reply *BUY <exact product name>*`);
+  lines.push(`To reserve, reply: *BUY <exact product name>*`);
   return lines.join("\n").trim();
 }
 
 function buildBudgetProductsReply({ businessName, originalText, products, meta }) {
   if (!products || products.length === 0) {
-    return `❌ *${businessName}*\nI could not find a close in-stock match for "${originalText}".\nReply with a model name, exact brand, SKU, or barcode.`;
+    return (
+      `❌ *${businessName}*\n` +
+      `I could not find a close in-stock match for "${originalText}".\n` +
+      `Reply with a model name, exact brand, SKU, or barcode.`
+    );
   }
 
   const lines = [];
   lines.push(`✅ *${businessName}*`);
 
   if (meta?.relaxed) {
-    lines.push(`I did not find an exact in-budget match for: "${originalText}"`);
-    lines.push(`Here are the closest in-stock options:`);
+    lines.push(`I did not find an exact match for your budget request.`);
+    lines.push(`Here are the closest available options:`);
   } else {
-    lines.push(`I found close matches for: "${originalText}"`);
+    lines.push(`I found close matches for your request:`);
   }
 
   const hints = [];
@@ -475,12 +588,13 @@ function buildBudgetProductsReply({ businessName, originalText, products, meta }
 
   for (const p of products) {
     lines.push(`📦 *${p.name}*`);
+    if (formatProductLine(p)) lines.push(`${formatProductLine(p)}`);
     lines.push(`💰 Price: ${formatMoneyRwf(p.sellPrice)}`);
-    lines.push(`📦 Stock: ${p.stockQty}`);
+    lines.push(`📦 In stock: ${p.stockQty}`);
     lines.push("");
   }
 
-  lines.push(`To reserve: reply *BUY <exact product name>*`);
+  lines.push(`To reserve, reply: *BUY <exact product name>*`);
   return lines.join("\n").trim();
 }
 
@@ -489,7 +603,7 @@ function buildBuyCreatedReply({ businessName, product, quantity, draftId }) {
 
   const lines = [];
   lines.push(`✅ *${businessName}*`);
-  lines.push(`Draft created for your request.`);
+  lines.push(`Your draft order has been created.`);
   lines.push("");
   lines.push(`📦 Product: *${product.name}*`);
   lines.push(`🔢 Quantity: *${quantity}*`);

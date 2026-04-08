@@ -1,5 +1,3 @@
-// src/modules/whatsapp/whatsapp.ai.service.js
-
 const OpenAI = require("openai");
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -24,6 +22,10 @@ function normalizeText(value) {
   return s || null;
 }
 
+function collapseSpaces(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
 function safeJsonParse(text) {
   try {
     return JSON.parse(text);
@@ -40,11 +42,35 @@ function clampStringArray(arr, max = 8) {
     .slice(0, max);
 }
 
-function normalizeAiExtraction(raw) {
+function clampConfidence(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+}
+
+function cleanSearchQuery(value) {
+  const text = collapseSpaces(
+    String(value || "")
+      .replace(/[^\p{L}\p{N}\s/+.-]/gu, " ")
+      .replace(/\b(price|stock|available|availability|how much|cost|buy|order|please|need|want)\b/gi, " ")
+  );
+
+  return text && text.length >= 2 ? text : null;
+}
+
+function normalizeAiExtraction(raw, fallbackText = null) {
   const data = raw && typeof raw === "object" ? raw : {};
 
+  const normalizedQuery =
+    cleanSearchQuery(data.normalizedQuery) ||
+    cleanSearchQuery(data.model) ||
+    cleanSearchQuery(data.productType) ||
+    cleanSearchQuery(fallbackText);
+
   return {
-    normalizedQuery: normalizeText(data.normalizedQuery),
+    normalizedQuery,
     brand: normalizeText(data.brand),
     category: normalizeText(data.category),
     productType: normalizeText(data.productType),
@@ -54,14 +80,29 @@ function normalizeAiExtraction(raw) {
     condition: normalizeText(data.condition),
     accessories: clampStringArray(data.accessories),
     alternatives: clampStringArray(data.alternatives),
-    confidence:
-      Number.isFinite(Number(data.confidence)) &&
-      Number(data.confidence) >= 0 &&
-      Number(data.confidence) <= 1
-        ? Number(data.confidence)
-        : 0,
+    confidence: clampConfidence(data.confidence),
     needsHumanReview: Boolean(data.needsHumanReview),
     notes: normalizeText(data.notes),
+  };
+}
+
+function buildFallbackExtraction(text, note) {
+  const normalized = cleanSearchQuery(text);
+
+  return {
+    normalizedQuery: normalized,
+    brand: null,
+    category: null,
+    productType: null,
+    model: null,
+    storage: null,
+    color: null,
+    condition: null,
+    accessories: [],
+    alternatives: [],
+    confidence: normalized ? 0.25 : 0,
+    needsHumanReview: true,
+    notes: note || "Fallback extraction used",
   };
 }
 
@@ -69,34 +110,32 @@ async function extractProductIntent({ messageText }) {
   const text = normalizeText(messageText);
 
   if (!text) {
-    return {
-      normalizedQuery: null,
-      brand: null,
-      category: null,
-      productType: null,
-      model: null,
-      storage: null,
-      color: null,
-      condition: null,
-      accessories: [],
-      alternatives: [],
-      confidence: 0,
-      needsHumanReview: true,
-      notes: "Empty message",
-    };
+    return buildFallbackExtraction("", "Empty message");
   }
 
-  const openai = getClient();
+  let openai;
+  try {
+    openai = getClient();
+  } catch (err) {
+    return buildFallbackExtraction(text, "OpenAI key missing");
+  }
 
   const system = `
-You extract shopping/product intent from a customer's WhatsApp message for a retail inventory system.
+You extract shopping intent from a customer's WhatsApp message for a retail inventory system.
+
+Your job:
+- understand what product the customer most likely means
+- rewrite that into a short database-friendly search query
+- do not invent stock, price, or availability
+- do not invent exact model details if the message is unclear
+- prefer a concise normalized search phrase useful for inventory lookup
 
 Rules:
-- Return JSON only.
-- Do not invent stock, price, or availability.
-- Do not claim certainty when unclear.
-- Your job is only to normalize the user's wording into a better product search query.
-- Prefer concise normalized search text that can be used against a store inventory database.
+- return JSON only
+- do not include markdown
+- keep normalizedQuery short and practical
+- if unclear, set needsHumanReview to true
+- confidence must be between 0 and 1
 
 Return exactly this JSON shape:
 {
@@ -117,55 +156,60 @@ Return exactly this JSON shape:
 `.trim();
 
   const user = `
-Customer message:
+Customer WhatsApp message:
 ${text}
 
-Extract the likely intended product in a way useful for database lookup.
+Extract only what is reasonably supported by the message.
 `.trim();
 
-  const response = await openai.responses.create({
-    model: OPENAI_MODEL,
-    input: [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
-    temperature: 0.1,
-    max_output_tokens: 300,
-  });
+  try {
+    const response = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0.1,
+      max_output_tokens: 300,
+    });
 
-  const outputText = response.output_text || "";
-  const parsed = safeJsonParse(outputText);
+    const outputText = response.output_text || "";
+    const parsed = safeJsonParse(outputText);
 
-  if (!parsed) {
-    return {
-      normalizedQuery: text,
-      brand: null,
-      category: null,
-      productType: null,
-      model: null,
-      storage: null,
-      color: null,
-      condition: null,
-      accessories: [],
-      alternatives: [],
-      confidence: 0.2,
-      needsHumanReview: true,
-      notes: "AI returned non-JSON output",
-    };
+    if (!parsed) {
+      return buildFallbackExtraction(text, "AI returned non-JSON output");
+    }
+
+    const normalized = normalizeAiExtraction(parsed, text);
+
+    if (!normalized.normalizedQuery) {
+      return buildFallbackExtraction(text, "AI did not return a usable query");
+    }
+
+    return normalized;
+  } catch (err) {
+    console.error("extractProductIntent error:", err?.message || err);
+    return buildFallbackExtraction(text, "AI request failed");
   }
-
-  return normalizeAiExtraction(parsed);
 }
 
 function shouldUseAiFallback({ text, deterministicQuery, searchResultsCount }) {
   const cleanText = normalizeText(text);
-  const cleanDeterministic = normalizeText(deterministicQuery);
+  const cleanDeterministic = cleanSearchQuery(deterministicQuery);
 
   if (!cleanText) return false;
-  if (!cleanDeterministic) return true;
   if (Number(searchResultsCount || 0) > 0) return false;
 
-  return cleanText.length >= 4;
+  if (!cleanDeterministic) return true;
+
+  const rawLower = cleanText.toLowerCase();
+  const deterministicLower = cleanDeterministic.toLowerCase();
+
+  if (rawLower === deterministicLower) return false;
+
+  if (cleanText.length >= 4) return true;
+
+  return false;
 }
 
 module.exports = {

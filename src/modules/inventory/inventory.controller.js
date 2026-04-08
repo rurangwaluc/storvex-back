@@ -550,36 +550,36 @@ async function createProduct(req, res) {
   try {
     const data = normalizeProductInput(req.body || {}, { isCreate: true });
 
-    const product = await prisma.$transaction(async (tx) => {
-      await ensureUniqueProductFields({
-        tx,
+    await ensureUniqueProductFields({
+      tx: prisma,
+      tenantId,
+      serial: data.serial,
+      barcode: data.barcode,
+      sku: data.sku,
+    });
+
+    const created = await prisma.product.create({
+      data: {
         tenantId,
+        name: data.name,
+        sku: data.sku,
         serial: data.serial,
         barcode: data.barcode,
-        sku: data.sku,
-      });
+        category: data.category,
+        subcategory: data.subcategory,
+        subcategoryOther: data.subcategoryOther,
+        brand: data.brand,
+        minStockLevel: data.minStockLevel,
+        costPrice: data.costPrice,
+        sellPrice: data.sellPrice,
+        stockQty: data.stockQty,
+        isActive: true,
+      },
+      select: productSelect(),
+    });
 
-      const created = await tx.product.create({
-        data: {
-          tenantId,
-          name: data.name,
-          sku: data.sku,
-          serial: data.serial,
-          barcode: data.barcode,
-          category: data.category,
-          subcategory: data.subcategory,
-          subcategoryOther: data.subcategoryOther,
-          brand: data.brand,
-          minStockLevel: data.minStockLevel,
-          costPrice: data.costPrice,
-          sellPrice: data.sellPrice,
-          stockQty: data.stockQty,
-          isActive: true,
-        },
-        select: productSelect(),
-      });
-
-      await writeAuditLog(tx, {
+    try {
+      await writeAuditLog(prisma, {
         tenantId,
         userId,
         entity: "PRODUCT",
@@ -594,11 +594,11 @@ async function createProduct(req, res) {
           sellPrice: created.sellPrice,
         },
       });
+    } catch (auditErr) {
+      console.error("createProduct audit log failed:", auditErr);
+    }
 
-      return created;
-    });
-
-    return res.status(201).json(product);
+    return res.status(201).json(created);
   } catch (err) {
     const code = err?.code;
     const msg = String(err?.message || "");
@@ -647,34 +647,32 @@ async function updateProduct(req, res) {
       return res.status(400).json({ message: "No fields to update" });
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
-      const existing = await tx.product.findFirst({
-        where: { id, tenantId },
-        select: productSelect(),
-      });
+    const existing = await prisma.product.findFirst({
+      where: { id, tenantId },
+      select: productSelect(),
+    });
 
-      if (!existing) {
-        const e = new Error("PRODUCT_NOT_FOUND");
-        e.code = "PRODUCT_NOT_FOUND";
-        throw e;
-      }
+    if (!existing) {
+      return res.status(404).json({ message: "Product not found" });
+    }
 
-      await ensureUniqueProductFields({
-        tx,
-        tenantId,
-        id,
-        serial: data.serial,
-        barcode: data.barcode,
-        sku: data.sku,
-      });
+    await ensureUniqueProductFields({
+      tx: prisma,
+      tenantId,
+      id,
+      serial: data.serial,
+      barcode: data.barcode,
+      sku: data.sku,
+    });
 
-      const next = await tx.product.update({
-        where: { id },
-        data,
-        select: productSelect(),
-      });
+    const next = await prisma.product.update({
+      where: { id },
+      data,
+      select: productSelect(),
+    });
 
-      await writeAuditLog(tx, {
+    try {
+      await writeAuditLog(prisma, {
         tenantId,
         userId,
         entity: "PRODUCT",
@@ -709,11 +707,11 @@ async function updateProduct(req, res) {
           },
         },
       });
+    } catch (auditErr) {
+      console.error("updateProduct audit log failed:", auditErr);
+    }
 
-      return next;
-    });
-
-    return res.json(updated);
+    return res.json(next);
   } catch (err) {
     const code = err?.code;
     const msg = String(err?.message || "");

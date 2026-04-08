@@ -17,9 +17,6 @@ function normalizeEmail(x) {
   return s || null;
 }
 
-/**
- * Accepts "2507XXXXXXXX" or "07XXXXXXXX" and normalizes to "2507XXXXXXXX".
- */
 function normalizePhone(x) {
   const raw = String(x || "").trim().replace(/[^\d]/g, "");
   if (!raw) return null;
@@ -145,7 +142,7 @@ async function enforceTrialGuardOrThrowTx(
       (dup.browserFingerprint === cleanFingerprint || dup.fingerprintHash === fingerprintHash)
     ) {
       blockedReason = "TRIAL_ALREADY_USED_BY_BROWSER";
-    } else if (cleanIp && (dup.ip === cleanIp || dup.ipHash === cleanIp)) {
+    } else if (cleanIp && (dup.ip === cleanIp || dup.ipHash === ipHash)) {
       blockedReason = "TRIAL_ALREADY_USED_BY_IP";
     }
 
@@ -192,7 +189,6 @@ async function enforceTrialGuardOrThrowTx(
   });
 }
 
-// OWNER INTENT (STEP 1)
 async function ownerIntent(req, res) {
   try {
     const {
@@ -258,24 +254,20 @@ async function ownerIntent(req, res) {
         ownerName: String(ownerName).trim(),
         email: emailNorm,
         phone: phoneNorm,
-
         shopType: shopType ? String(shopType).trim() : null,
         district: district ? String(district).trim() : null,
         sector: sector ? String(sector).trim() : null,
         address: address ? String(address).trim() : null,
-
         deviceId: cleanString(deviceId),
         browserFingerprint: cleanString(browserFingerprint),
         signupIp: getClientIp(req),
         signupUserAgent: getUserAgent(req),
-
         requestedPlanKey: requestedSnapshot?.planKey || null,
         requestedTierKey: requestedSnapshot?.tierKey || null,
         requestedCycleKey: requestedSnapshot?.cycleKey || null,
         requestedStaffLimit: requestedSnapshot?.staffLimit ?? null,
         requestedPriceAmount: requestedSnapshot?.requestedPriceAmount ?? null,
         requestedCurrency: requestedSnapshot?.requestedCurrency || null,
-
         expiresAt,
         status: "PENDING",
       },
@@ -316,7 +308,6 @@ async function ownerIntent(req, res) {
   }
 }
 
-// LOGIN
 async function login(req, res) {
   try {
     assertJwtSecret();
@@ -331,10 +322,22 @@ async function login(req, res) {
 
     const user = await prisma.user.findUnique({
       where: { email: emailNorm },
+      select: {
+        id: true,
+        tenantId: true,
+        role: true,
+        email: true,
+        password: true,
+        isActive: true,
+      },
     });
 
     if (!user) {
       return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    if (user.isActive === false) {
+      return res.status(403).json({ message: "Account is deactivated" });
     }
 
     const validPassword = await bcrypt.compare(String(password), user.password);
@@ -342,8 +345,44 @@ async function login(req, res) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
+    const tokenId = crypto.randomUUID();
+    const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000);
+
+    await prisma.userSession.create({
+      data: {
+        tenantId: user.tenantId,
+        userId: user.id,
+        tokenId,
+        ipAddress: getClientIp(req),
+        userAgent: getUserAgent(req),
+        expiresAt,
+        isRevoked: false,
+        lastSeenAt: new Date(),
+      },
+    });
+
+    await prisma.loginEvent.create({
+      data: {
+        tenantId: user.tenantId,
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        status: "SUCCESS",
+        method: "PASSWORD",
+        ipAddress: getClientIp(req),
+        userAgent: getUserAgent(req),
+        deviceLabel: getUserAgent(req),
+      },
+    }).catch(() => null);
+
     const token = jwt.sign(
-      { userId: user.id, role: user.role, tenantId: user.tenantId },
+      {
+        userId: user.id,
+        role: user.role,
+        tenantId: user.tenantId,
+        email: user.email,
+        tokenId,
+      },
       JWT_SECRET,
       { expiresIn: "8h" }
     );
@@ -355,7 +394,6 @@ async function login(req, res) {
   }
 }
 
-// SIGNUP CONFIRM (PAID or TRIAL)
 async function confirmSignup(req, res) {
   try {
     assertJwtSecret();
@@ -579,29 +617,29 @@ async function confirmSignup(req, res) {
 
       const accessMode = signupMode === "TRIAL" ? "TRIAL" : "ACTIVE";
 
-      const subscriptionData = {
-        tenantId: tenant.id,
-        status: "ACTIVE",
-        accessMode,
-        planKey: planSnapshot.planKey,
-        tierKey: planSnapshot.tierKey,
-        cycleKey: planSnapshot.cycleKey,
-        staffLimit: planSnapshot.staffLimit,
-        priceAmount: planSnapshot.price,
-        currency: planSnapshot.currency,
-        startDate,
-        endDate,
-        graceEndDate: null,
-        readOnlySince: null,
-        lastPaymentAt: signupMode === "PAID" ? new Date() : null,
-        renewedAt: signupMode === "PAID" ? new Date() : null,
-        trialConsumed: signupMode === "TRIAL",
-        trialSourceIntentId: signupMode === "TRIAL" ? intent.id : null,
-        trialStartDate: signupMode === "TRIAL" ? startDate : null,
-        trialEndDate: signupMode === "TRIAL" ? endDate : null,
-      };
-
-      await tx.subscription.create({ data: subscriptionData });
+      await tx.subscription.create({
+        data: {
+          tenantId: tenant.id,
+          status: "ACTIVE",
+          accessMode,
+          planKey: planSnapshot.planKey,
+          tierKey: planSnapshot.tierKey,
+          cycleKey: planSnapshot.cycleKey,
+          staffLimit: planSnapshot.staffLimit,
+          priceAmount: planSnapshot.price,
+          currency: planSnapshot.currency,
+          startDate,
+          endDate,
+          graceEndDate: null,
+          readOnlySince: null,
+          lastPaymentAt: signupMode === "PAID" ? new Date() : null,
+          renewedAt: signupMode === "PAID" ? new Date() : null,
+          trialConsumed: signupMode === "TRIAL",
+          trialSourceIntentId: signupMode === "TRIAL" ? intent.id : null,
+          trialStartDate: signupMode === "TRIAL" ? startDate : null,
+          trialEndDate: signupMode === "TRIAL" ? endDate : null,
+        },
+      });
 
       await tx.ownerIntent.update({
         where: { id: intent.id },
@@ -635,8 +673,30 @@ async function confirmSignup(req, res) {
       return { tenant, owner, planSnapshot };
     });
 
+    const tokenId = crypto.randomUUID();
+    const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000);
+
+    await prisma.userSession.create({
+      data: {
+        tenantId: result.tenant.id,
+        userId: result.owner.id,
+        tokenId,
+        ipAddress: getClientIp(req),
+        userAgent: getUserAgent(req),
+        expiresAt,
+        isRevoked: false,
+        lastSeenAt: new Date(),
+      },
+    });
+
     const token = jwt.sign(
-      { userId: result.owner.id, tenantId: result.tenant.id, role: "OWNER" },
+      {
+        userId: result.owner.id,
+        tenantId: result.tenant.id,
+        role: "OWNER",
+        email: result.owner.email,
+        tokenId,
+      },
       JWT_SECRET,
       { expiresIn: "8h" }
     );

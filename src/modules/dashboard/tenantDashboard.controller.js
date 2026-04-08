@@ -1,4 +1,3 @@
-// src/modules/dashboard/tenantDashboard.controller.js
 const prisma = require("../../config/database");
 
 function money(n) {
@@ -25,9 +24,117 @@ function startOfMonth(d) {
   return x;
 }
 
+function safeDateLabel(value, prefix = "Ends") {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return `${prefix} ${d.toLocaleDateString()}`;
+}
+
+function diffDaysFromNow(endDateValue) {
+  if (!endDateValue) return null;
+
+  const now = new Date();
+  const end = new Date(endDateValue);
+
+  if (Number.isNaN(end.getTime())) return null;
+
+  const ms = end.getTime() - now.getTime();
+  return Math.max(0, Math.ceil(ms / (1000 * 60 * 60 * 24)));
+}
+
+function formatSubscriptionState(subscription) {
+  if (!subscription) {
+    return {
+      label: "No subscription",
+      tone: "warning",
+      detail: "No commercial access data",
+      canOperate: false,
+      planKey: null,
+      endDate: null,
+      daysLeft: null,
+      accessMode: null,
+      status: null,
+    };
+  }
+
+  const status = String(subscription.status || "").trim().toUpperCase();
+  const accessMode = String(subscription.accessMode || "").trim().toUpperCase();
+
+  const isExpired = status === "EXPIRED";
+  const isReadOnly = status === "READ_ONLY" || accessMode === "READ_ONLY";
+  const isTrial = status === "TRIAL" || accessMode === "TRIAL";
+
+  const computedDaysLeft = diffDaysFromNow(
+    subscription.trialEndDate || subscription.endDate || null
+  );
+
+  if (isExpired) {
+    return {
+      label: "Expired",
+      tone: "danger",
+      detail:
+        safeDateLabel(subscription.endDate, "Ended") ||
+        "Renew to continue operations",
+      canOperate: false,
+      planKey: subscription.planKey || null,
+      endDate: subscription.endDate || null,
+      daysLeft: computedDaysLeft,
+      accessMode,
+      status,
+    };
+  }
+
+  if (isReadOnly) {
+    return {
+      label: "Read-only",
+      tone: "warning",
+      detail:
+        safeDateLabel(subscription.graceEndDate, "Grace ends") ||
+        safeDateLabel(subscription.readOnlySince, "Read-only since") ||
+        safeDateLabel(subscription.endDate, "Ends") ||
+        "Limited access",
+      canOperate: false,
+      planKey: subscription.planKey || null,
+      endDate: subscription.endDate || null,
+      daysLeft: computedDaysLeft,
+      accessMode,
+      status,
+    };
+  }
+
+  if (isTrial) {
+    return {
+      label: "Trial",
+      tone: "info",
+      detail: `${computedDaysLeft ?? 0} day${computedDaysLeft === 1 ? "" : "s"} left`,
+      canOperate: true,
+      planKey: subscription.planKey || null,
+      endDate: subscription.trialEndDate || subscription.endDate || null,
+      daysLeft: computedDaysLeft,
+      accessMode,
+      status,
+    };
+  }
+
+  return {
+    label: "Active",
+    tone: "success",
+    detail:
+      safeDateLabel(subscription.endDate, "Ends") ||
+      "Commercial access active",
+    canOperate: true,
+    planKey: subscription.planKey || null,
+    endDate: subscription.endDate || null,
+    daysLeft: computedDaysLeft,
+    accessMode,
+    status,
+  };
+}
+
 /**
  * GET /api/dashboard
- * Returns numbers the dashboard needs, including low stock alerts.
+ * Returns dashboard numbers the store needs.
  */
 async function getTenantDashboard(req, res) {
   try {
@@ -39,7 +146,6 @@ async function getTenantDashboard(req, res) {
     const todayEnd = endOfDay(now);
     const monthStart = startOfMonth(now);
 
-    // Low stock threshold (simple default)
     const thresholdRaw = Number(process.env.LOW_STOCK_THRESHOLD || 5);
     const threshold =
       Number.isFinite(thresholdRaw) && thresholdRaw >= 1 && thresholdRaw <= 9999
@@ -47,6 +153,7 @@ async function getTenantDashboard(req, res) {
         : 5;
 
     const [
+      tenant,
       todaySalesAgg,
       monthSalesAgg,
       productCount,
@@ -57,13 +164,57 @@ async function getTenantDashboard(req, res) {
       pendingDeals,
       recentAudit,
     ] = await Promise.all([
+      prisma.tenant.findUnique({
+        where: { id: tenantId },
+        select: {
+          id: true,
+          name: true,
+          district: true,
+          sector: true,
+          shopType: true,
+          logoUrl: true,
+          subscription: {
+            select: {
+              id: true,
+              tenantId: true,
+              planKey: true,
+              status: true,
+              accessMode: true,
+              tierKey: true,
+              cycleKey: true,
+              staffLimit: true,
+              priceAmount: true,
+              currency: true,
+              startDate: true,
+              endDate: true,
+              trialStartDate: true,
+              trialEndDate: true,
+              readOnlySince: true,
+              graceEndDate: true,
+              lastPaymentAt: true,
+              renewedAt: true,
+              createdAt: true,
+              trialConsumed: true,
+              trialSourceIntentId: true,
+              nextPlanKey: true,
+            },
+          },
+        },
+      }),
+
       prisma.sale.aggregate({
-        where: { tenantId, createdAt: { gte: todayStart, lte: todayEnd } },
+        where: {
+          tenantId,
+          createdAt: { gte: todayStart, lte: todayEnd },
+        },
         _sum: { total: true },
       }),
 
       prisma.sale.aggregate({
-        where: { tenantId, createdAt: { gte: monthStart, lte: now } },
+        where: {
+          tenantId,
+          createdAt: { gte: monthStart, lte: now },
+        },
         _sum: { total: true },
       }),
 
@@ -123,15 +274,33 @@ async function getTenantDashboard(req, res) {
         where: { tenantId },
         orderBy: { createdAt: "desc" },
         take: 10,
-        select: { id: true, action: true, entity: true, createdAt: true },
+        select: {
+          id: true,
+          action: true,
+          entity: true,
+          createdAt: true,
+        },
       }),
     ]);
 
     return res.json({
       threshold,
 
-      todaySales: money(todaySalesAgg._sum.total),
-      monthlyRevenue: money(monthSalesAgg._sum.total),
+      tenant: tenant
+        ? {
+            id: tenant.id,
+            name: tenant.name,
+            district: tenant.district,
+            sector: tenant.sector,
+            shopType: tenant.shopType,
+            logoUrl: tenant.logoUrl,
+          }
+        : null,
+
+      subscriptionSummary: formatSubscriptionState(tenant?.subscription || null),
+
+      todaySales: money(todaySalesAgg?._sum?.total),
+      monthlyRevenue: money(monthSalesAgg?._sum?.total),
 
       productCount,
       lowStockCount,

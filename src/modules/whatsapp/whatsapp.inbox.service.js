@@ -2,6 +2,13 @@ const prisma = require("../../config/database");
 const whatsappService = require("./whatsapp.service");
 const { reserveSaleDocumentNumbersTx } = require("../documents/documentNumber.service");
 
+function appError(code, extra = {}) {
+  const err = new Error(code);
+  err.code = code;
+  Object.assign(err, extra);
+  return err;
+}
+
 function normalizeText(value) {
   const s = String(value || "").trim();
   return s || null;
@@ -32,6 +39,12 @@ function normalizePaymentMethod(value) {
   return "CASH";
 }
 
+function normalizeConversationStatus(value) {
+  const v = String(value || "").toUpperCase();
+  if (v === "OPEN" || v === "CLOSED") return v;
+  return "OPEN";
+}
+
 function toNumber(value, fallback = NaN) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -40,6 +53,86 @@ function toNumber(value, fallback = NaN) {
 function toInt(value, fallback = NaN) {
   const n = Number(value);
   return Number.isFinite(n) ? Math.floor(n) : fallback;
+}
+
+function safeDate(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function getModelFields(delegate) {
+  return delegate?.fields || {};
+}
+
+function buildCustomerSelectShape(delegate = prisma.customer) {
+  const fields = getModelFields(delegate);
+  return {
+    id: true,
+    name: true,
+    phone: true,
+    ...(typeof fields.email !== "undefined" ? { email: true } : {}),
+    ...(typeof fields.address !== "undefined" ? { address: true } : {}),
+    ...(typeof fields.tinNumber !== "undefined" ? { tinNumber: true } : {}),
+    ...(typeof fields.idNumber !== "undefined" ? { idNumber: true } : {}),
+    ...(typeof fields.notes !== "undefined" ? { notes: true } : {}),
+    ...(typeof fields.isActive !== "undefined" ? { isActive: true } : {}),
+    ...(typeof fields.whatsappOptIn !== "undefined" ? { whatsappOptIn: true } : {}),
+  };
+}
+
+function buildDraftItemSelectShape() {
+  return {
+    id: true,
+    saleId: true,
+    productId: true,
+    quantity: true,
+    price: true,
+    product: {
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        serial: true,
+        sellPrice: true,
+        stockQty: true,
+      },
+    },
+  };
+}
+
+function buildDraftSaleSelectShape(delegate = prisma.sale) {
+  const saleFields = getModelFields(delegate);
+
+  return {
+    id: true,
+    tenantId: true,
+    cashierId: true,
+    customerId: true,
+    total: true,
+    saleType: true,
+    amountPaid: true,
+    balanceDue: true,
+    dueDate: true,
+    status: true,
+    createdAt: true,
+    ...(typeof saleFields.isDraft !== "undefined" ? { isDraft: true } : {}),
+    ...(typeof saleFields.draftSource !== "undefined" ? { draftSource: true } : {}),
+    ...(typeof saleFields.finalizedAt !== "undefined" ? { finalizedAt: true } : {}),
+    cashier: {
+      select: {
+        id: true,
+        name: true,
+      },
+    },
+    customer: {
+      select: buildCustomerSelectShape(),
+    },
+    items: {
+      orderBy: [{ id: "asc" }],
+      select: buildDraftItemSelectShape(),
+    },
+  };
 }
 
 function computeSaleStatus({ saleType, total, amountPaid, dueDate }) {
@@ -63,6 +156,26 @@ function computeSaleStatus({ saleType, total, amountPaid, dueDate }) {
   }
 
   return { status: overdue ? "OVERDUE" : "UNPAID", balanceDue };
+}
+
+async function createAuditLogTx(
+  tx,
+  { tenantId, userId = null, entity, entityId = null, action, metadata = null }
+) {
+  try {
+    await tx.auditLog.create({
+      data: {
+        tenantId,
+        userId,
+        entity,
+        entityId,
+        action,
+        metadata,
+      },
+    });
+  } catch (err) {
+    console.error("createAuditLogTx error:", err);
+  }
 }
 
 async function getOpenCashSessionId(tx, tenantId) {
@@ -115,79 +228,41 @@ async function tenantBlocksCashSales(db, tenantId) {
   return v == null ? true : Boolean(v);
 }
 
-function buildCustomerSelectShape() {
-  const fields = prisma.customer.fields || {};
-  return {
-    id: true,
-    name: true,
-    phone: true,
-    ...(typeof fields.email !== "undefined" ? { email: true } : {}),
-    ...(typeof fields.address !== "undefined" ? { address: true } : {}),
-    ...(typeof fields.tinNumber !== "undefined" ? { tinNumber: true } : {}),
-    ...(typeof fields.idNumber !== "undefined" ? { idNumber: true } : {}),
-    ...(typeof fields.notes !== "undefined" ? { notes: true } : {}),
-    ...(typeof fields.isActive !== "undefined" ? { isActive: true } : {}),
-    ...(typeof fields.whatsappOptIn !== "undefined" ? { whatsappOptIn: true } : {}),
-  };
-}
+function mapConversationListItem(conversation) {
+  const latestMessage = conversation.messages?.[0] || null;
 
-function buildDraftItemSelectShape() {
   return {
-    id: true,
-    saleId: true,
-    productId: true,
-    quantity: true,
-    price: true,
-    product: {
-      select: {
-        id: true,
-        name: true,
-        sku: true,
-        serial: true,
-        sellPrice: true,
-        stockQty: true,
-      },
-    },
-  };
-}
-
-function buildDraftSaleSelectShape() {
-  const saleFields = prisma.sale.fields || {};
-  return {
-    id: true,
-    tenantId: true,
-    cashierId: true,
-    customerId: true,
-    total: true,
-    saleType: true,
-    amountPaid: true,
-    balanceDue: true,
-    dueDate: true,
-    status: true,
-    createdAt: true,
-    ...(typeof saleFields.isDraft !== "undefined" ? { isDraft: true } : {}),
-    ...(typeof saleFields.draftSource !== "undefined" ? { draftSource: true } : {}),
-    ...(typeof saleFields.finalizedAt !== "undefined" ? { finalizedAt: true } : {}),
-    cashier: {
-      select: {
-        id: true,
-        name: true,
-      },
-    },
-    customer: {
-      select: buildCustomerSelectShape(),
-    },
-    items: {
-      orderBy: [{ id: "asc" }],
-      select: buildDraftItemSelectShape(),
-    },
+    id: conversation.id,
+    phone: conversation.phone,
+    status: conversation.status,
+    assignedToId: conversation.assignedToId,
+    accountId: conversation.accountId,
+    customerId: conversation.customerId,
+    updatedAt: conversation.updatedAt,
+    createdAt: conversation.createdAt,
+    customer: conversation.customer || null,
+    assignedTo: conversation.assignedTo || null,
+    account: conversation.account || null,
+    latestMessage: latestMessage
+      ? {
+          id: latestMessage.id,
+          direction: latestMessage.direction,
+          type: latestMessage.type,
+          textContent: latestMessage.textContent,
+          mediaUrl: latestMessage.mediaUrl,
+          messageId: latestMessage.messageId || null,
+          createdAt: latestMessage.createdAt,
+          sentById: latestMessage.sentById || null,
+        }
+      : null,
+    messageCount: Number(conversation._count?.messages || 0),
   };
 }
 
 async function listConversations({ tenantId }) {
-  return prisma.whatsAppConversation.findMany({
+  const conversations = await prisma.whatsAppConversation.findMany({
     where: { tenantId },
-    orderBy: { updatedAt: "desc" },
+    orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
     take: 50,
     select: {
       id: true,
@@ -201,17 +276,80 @@ async function listConversations({ tenantId }) {
       customer: {
         select: buildCustomerSelectShape(),
       },
+      assignedTo: {
+        select: {
+          id: true,
+          name: true,
+          role: true,
+        },
+      },
+      account: {
+        select: {
+          id: true,
+          phoneNumber: true,
+          businessName: true,
+          isActive: true,
+        },
+      },
+      messages: {
+        orderBy: { createdAt: "desc" },
+        take: 1,
+        select: {
+          id: true,
+          direction: true,
+          type: true,
+          textContent: true,
+          mediaUrl: true,
+          messageId: true,
+          createdAt: true,
+          sentById: true,
+        },
+      },
+      _count: {
+        select: {
+          messages: true,
+        },
+      },
     },
   });
+
+  return conversations.map(mapConversationListItem);
 }
 
 async function listMessages({ tenantId, conversationId }) {
   const convo = await prisma.whatsAppConversation.findFirst({
     where: { id: conversationId, tenantId },
-    select: { id: true },
+    select: {
+      id: true,
+      phone: true,
+      status: true,
+      assignedToId: true,
+      accountId: true,
+      customerId: true,
+      updatedAt: true,
+      createdAt: true,
+      customer: {
+        select: buildCustomerSelectShape(),
+      },
+      assignedTo: {
+        select: {
+          id: true,
+          name: true,
+          role: true,
+        },
+      },
+      account: {
+        select: {
+          id: true,
+          phoneNumber: true,
+          businessName: true,
+          isActive: true,
+        },
+      },
+    },
   });
 
-  if (!convo) throw new Error("NOT_FOUND");
+  if (!convo) throw appError("NOT_FOUND");
 
   const messages = await prisma.whatsAppMessage.findMany({
     where: { conversationId },
@@ -228,10 +366,13 @@ async function listMessages({ tenantId, conversationId }) {
     },
   });
 
-  return { conversationId, messages };
+  return { conversationId, conversation: convo, messages };
 }
 
 async function reply({ tenantId, conversationId, userId, text }) {
+  const cleanText = normalizeText(text);
+  if (!cleanText) throw appError("TEXT_REQUIRED");
+
   const convo = await prisma.whatsAppConversation.findFirst({
     where: { id: conversationId, tenantId },
     select: {
@@ -241,60 +382,112 @@ async function reply({ tenantId, conversationId, userId, text }) {
     },
   });
 
-  if (!convo) throw new Error("NOT_FOUND");
+  if (!convo) throw appError("NOT_FOUND");
 
   const account = await prisma.whatsAppAccount.findFirst({
     where: { id: convo.accountId, tenantId, isActive: true },
   });
 
-  if (!account) throw new Error("ACCOUNT_INACTIVE");
+  if (!account) throw appError("ACCOUNT_INACTIVE");
 
   const to = normalizePhoneLoose(convo.phone);
-  if (!to) throw new Error("ACCOUNT_INACTIVE");
+  if (!to) throw appError("ACCOUNT_INACTIVE");
 
-  const resp = await whatsappService.sendText({ account, to, text });
+  const resp = await whatsappService.sendText({
+    account,
+    to,
+    text: cleanText,
+  });
+
   const metaMsgId = resp?.messages?.[0]?.id || null;
+  const now = new Date();
 
-  const saved = await prisma.whatsAppMessage.create({
-    data: {
-      conversationId: convo.id,
+  const result = await prisma.$transaction(async (tx) => {
+    const saved = await tx.whatsAppMessage.create({
+      data: {
+        conversationId: convo.id,
+        tenantId,
+        accountId: account.id,
+        direction: "OUTBOUND",
+        type: "TEXT",
+        textContent: cleanText,
+        messageId: metaMsgId,
+        sentById: userId,
+        createdAt: now,
+      },
+      select: {
+        id: true,
+        messageId: true,
+        createdAt: true,
+        textContent: true,
+        direction: true,
+        type: true,
+      },
+    });
+
+    await tx.whatsAppConversation.update({
+      where: { id: convo.id },
+      data: { updatedAt: now },
+    });
+
+    await createAuditLogTx(tx, {
       tenantId,
-      accountId: account.id,
-      direction: "OUTBOUND",
-      type: "TEXT",
-      textContent: text,
-      messageId: metaMsgId,
-      sentById: userId,
-      createdAt: new Date(),
-    },
-    select: { id: true, messageId: true, createdAt: true },
+      userId,
+      entity: "WHATSAPP_MESSAGE",
+      entityId: saved.id,
+      action: "WHATSAPP_REPLY_SENT",
+      metadata: {
+        conversationId: convo.id,
+        accountId: account.id,
+        phone: convo.phone,
+        textLength: cleanText.length,
+        providerMessageId: metaMsgId,
+      },
+    });
+
+    return saved;
   });
 
-  await prisma.whatsAppConversation.update({
-    where: { id: convo.id },
-    data: { updatedAt: new Date() },
-  });
-
-  return { sent: true, message: saved };
+  return { sent: true, message: result };
 }
 
-async function updateStatus({ tenantId, conversationId, status }) {
+async function updateStatus({ tenantId, conversationId, status, userId = null }) {
+  const normalizedStatus = normalizeConversationStatus(status);
+
   const convo = await prisma.whatsAppConversation.findFirst({
     where: { id: conversationId, tenantId },
-    select: { id: true },
+    select: { id: true, status: true },
   });
 
-  if (!convo) throw new Error("NOT_FOUND");
+  if (!convo) throw appError("NOT_FOUND");
 
-  return prisma.whatsAppConversation.update({
-    where: { id: conversationId },
-    data: { status, updatedAt: new Date() },
-    select: { id: true, status: true, updatedAt: true },
+  const updated = await prisma.$transaction(async (tx) => {
+    const row = await tx.whatsAppConversation.update({
+      where: { id: conversationId },
+      data: { status: normalizedStatus, updatedAt: new Date() },
+      select: { id: true, status: true, updatedAt: true },
+    });
+
+    await createAuditLogTx(tx, {
+      tenantId,
+      userId,
+      entity: "WHATSAPP_CONVERSATION",
+      entityId: row.id,
+      action: "WHATSAPP_CONVERSATION_STATUS_UPDATED",
+      metadata: {
+        previousStatus: convo.status,
+        nextStatus: normalizedStatus,
+      },
+    });
+
+    return row;
   });
+
+  return updated;
 }
 
 async function resolveOrCreateCustomerTx(tx, tenantId, { customerId, customer, conversation }) {
-  const customerFields = tx.customer.fields || {};
+  const customerFields = getModelFields(tx.customer);
 
   if (customerId) {
     const existing = await tx.customer.findFirst({
@@ -306,7 +499,7 @@ async function resolveOrCreateCustomerTx(tx, tenantId, { customerId, customer, c
       select: { id: true },
     });
 
-    if (!existing) throw new Error("CUSTOMER_NOT_FOUND");
+    if (!existing) throw appError("CUSTOMER_NOT_FOUND");
     return existing.id;
   }
 
@@ -335,7 +528,7 @@ async function resolveOrCreateCustomerTx(tx, tenantId, { customerId, customer, c
   const cleanNotes = normalizeText(payload.notes);
 
   if (!cleanName || !cleanPhone) {
-    throw new Error("INVALID_CUSTOMER_FIELDS");
+    throw appError("INVALID_CUSTOMER_FIELDS");
   }
 
   const existing = await tx.customer.findFirst({
@@ -422,7 +615,7 @@ async function resolveOrCreateCustomerTx(tx, tenantId, { customerId, customer, c
 }
 
 async function getSaleDraftTx(tx, tenantId, saleId) {
-  const saleFields = tx.sale.fields || {};
+  const saleFields = getModelFields(tx.sale);
 
   const draft = await tx.sale.findFirst({
     where: {
@@ -432,14 +625,14 @@ async function getSaleDraftTx(tx, tenantId, saleId) {
       ...(typeof saleFields.draftSource !== "undefined" ? { draftSource: "WHATSAPP" } : {}),
       isCancelled: false,
     },
-    select: buildDraftSaleSelectShape(),
+    select: buildDraftSaleSelectShape(tx.sale),
   });
 
-  if (!draft) throw new Error("SALE_DRAFT_NOT_FOUND");
+  if (!draft) throw appError("SALE_DRAFT_NOT_FOUND");
   return draft;
 }
 
-async function recomputeDraftTotalsTx(tx, saleId) {
+async function recomputeDraftTotalsTx(tx, tenantId, saleId) {
   const sale = await tx.sale.findUnique({
     where: { id: saleId },
     select: {
@@ -456,7 +649,7 @@ async function recomputeDraftTotalsTx(tx, saleId) {
     },
   });
 
-  if (!sale) throw new Error("SALE_NOT_FOUND");
+  if (!sale) throw appError("SALE_NOT_FOUND");
 
   let total = 0;
   for (const item of sale.items || []) {
@@ -480,13 +673,13 @@ async function recomputeDraftTotalsTx(tx, saleId) {
     },
   });
 
-  return getSaleDraftTx(tx, (await tx.sale.findUnique({ where: { id: saleId }, select: { tenantId: true } })).tenantId, saleId);
+  return getSaleDraftTx(tx, tenantId, saleId);
 }
 
 async function listSaleDrafts({ tenantId }) {
-  const saleFields = prisma.sale.fields || {};
+  const saleFields = getModelFields(prisma.sale);
 
-  const drafts = await prisma.sale.findMany({
+  return prisma.sale.findMany({
     where: {
       tenantId,
       ...(typeof saleFields.isDraft !== "undefined" ? { isDraft: true } : {}),
@@ -494,15 +687,12 @@ async function listSaleDrafts({ tenantId }) {
       isCancelled: false,
     },
     orderBy: { createdAt: "desc" },
-    select: buildDraftSaleSelectShape(),
+    select: buildDraftSaleSelectShape(prisma.sale),
   });
-
-  return drafts;
 }
 
 async function getSaleDraft({ tenantId, saleId }) {
-  const draft = await getSaleDraftTx(prisma, tenantId, saleId);
-  return draft;
+  return getSaleDraftTx(prisma, tenantId, saleId);
 }
 
 async function createSaleDraft({ tenantId, conversationId, userId, body }) {
@@ -520,24 +710,22 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
     },
   });
 
-  if (!convo) throw new Error("NOT_FOUND");
+  if (!convo) throw appError("NOT_FOUND");
 
   const items = Array.isArray(body?.items) ? body.items : [];
-  if (items.length === 0) throw new Error("NO_ITEMS");
+  if (items.length === 0) throw appError("NO_ITEMS");
 
   for (const item of items) {
-    if (!item?.productId) throw new Error("PRODUCT_ID_REQUIRED");
+    if (!item?.productId) throw appError("PRODUCT_ID_REQUIRED");
     const qty = toInt(item.quantity, NaN);
-    if (!Number.isInteger(qty) || qty <= 0) throw new Error("INVALID_QUANTITY");
+    if (!Number.isInteger(qty) || qty <= 0) throw appError("INVALID_QUANTITY");
   }
 
   const requestedSaleType = normalizeSaleType(body?.saleType || "CREDIT");
-  const parsedDueDate = body?.dueDate ? new Date(body.dueDate) : null;
-  if (body?.dueDate && Number.isNaN(parsedDueDate.getTime())) {
-    throw new Error("INVALID_DUE_DATE");
-  }
+  const parsedDueDate = body?.dueDate ? safeDate(body.dueDate) : null;
+  if (body?.dueDate && !parsedDueDate) throw appError("INVALID_DUE_DATE");
 
-  const result = await prisma.$transaction(async (tx) => {
+  return prisma.$transaction(async (tx) => {
     const resolvedCustomerId = await resolveOrCreateCustomerTx(tx, tenantId, {
       customerId: body?.customerId || convo.customerId || null,
       customer: body?.customer || null,
@@ -572,7 +760,7 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
 
     for (const item of items) {
       const pid = String(item.productId);
-      if (!byId.has(pid)) throw new Error("PRODUCT_NOT_FOUND");
+      if (!byId.has(pid)) throw appError("PRODUCT_NOT_FOUND");
     }
 
     let total = 0;
@@ -605,8 +793,8 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
       dueDate: requestedSaleType === "CREDIT" ? parsedDueDate : null,
     });
 
+    const saleFields = getModelFields(tx.sale);
     const draftCashierId = convo.assignedToId || userId;
-    const saleFields = tx.sale.fields || {};
 
     const sale = await tx.sale.create({
       data: {
@@ -619,6 +807,7 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
         balanceDue,
         status,
         dueDate: requestedSaleType === "CREDIT" ? parsedDueDate : null,
+        conversationId: convo.id,
         ...(typeof saleFields.isDraft !== "undefined" ? { isDraft: true } : {}),
         ...(typeof saleFields.draftSource !== "undefined" ? { draftSource: "WHATSAPP" } : {}),
       },
@@ -638,17 +827,29 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
       });
     }
 
-    const hydrated = await getSaleDraftTx(tx, tenantId, sale.id);
-    return { created: true, draft: hydrated };
-  });
+    await createAuditLogTx(tx, {
+      tenantId,
+      userId,
+      entity: "SALE",
+      entityId: sale.id,
+      action: "WHATSAPP_SALE_DRAFT_CREATED",
+      metadata: {
+        source: "WHATSAPP",
+        conversationId: convo.id,
+        itemCount: normalizedItems.length,
+        saleType: requestedSaleType,
+        total,
+        customerId: resolvedCustomerId,
+      },
+    });
 
-  return result;
+    const draft = await getSaleDraftTx(tx, tenantId, sale.id);
+    return { created: true, draft };
+  });
 }
 
 async function updateSaleDraft({ tenantId, saleId, userId, body }) {
-  void userId;
-
-  const saleFields = prisma.sale.fields || {};
+  const saleFields = getModelFields(prisma.sale);
 
   const draft = await prisma.sale.findFirst({
     where: {
@@ -667,9 +868,9 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
     },
   });
 
-  if (!draft) throw new Error("SALE_DRAFT_NOT_FOUND");
+  if (!draft) throw appError("SALE_DRAFT_NOT_FOUND");
 
-  const result = await prisma.$transaction(async (tx) => {
+  return prisma.$transaction(async (tx) => {
     let resolvedCustomerId = draft.customerId || null;
 
     if (body?.customerId || body?.customer) {
@@ -690,8 +891,8 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
       if (!body.dueDate) {
         patch.dueDate = null;
       } else {
-        const parsedDueDate = new Date(body.dueDate);
-        if (Number.isNaN(parsedDueDate.getTime())) throw new Error("INVALID_DUE_DATE");
+        const parsedDueDate = safeDate(body.dueDate);
+        if (!parsedDueDate) throw appError("INVALID_DUE_DATE");
         patch.dueDate = parsedDueDate;
       }
     }
@@ -709,12 +910,12 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
 
     if (body?.items !== undefined) {
       const items = Array.isArray(body.items) ? body.items : [];
-      if (items.length === 0) throw new Error("NO_ITEMS");
+      if (items.length === 0) throw appError("NO_ITEMS");
 
       for (const item of items) {
-        if (!item?.productId) throw new Error("PRODUCT_ID_REQUIRED");
+        if (!item?.productId) throw appError("PRODUCT_ID_REQUIRED");
         const qty = toInt(item.quantity, NaN);
-        if (!Number.isInteger(qty) || qty <= 0) throw new Error("INVALID_QUANTITY");
+        if (!Number.isInteger(qty) || qty <= 0) throw appError("INVALID_QUANTITY");
       }
 
       const productIds = items.map((i) => String(i.productId));
@@ -738,7 +939,7 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
 
       for (const item of items) {
         const pid = String(item.productId);
-        if (!byId.has(pid)) throw new Error("PRODUCT_NOT_FOUND");
+        if (!byId.has(pid)) throw appError("PRODUCT_NOT_FOUND");
       }
 
       await tx.saleItem.deleteMany({
@@ -767,15 +968,29 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
       }
     }
 
-    const recomputed = await recomputeDraftTotalsTx(tx, draft.id);
+    const recomputed = await recomputeDraftTotalsTx(tx, tenantId, draft.id);
+
+    await createAuditLogTx(tx, {
+      tenantId,
+      userId,
+      entity: "SALE",
+      entityId: draft.id,
+      action: "WHATSAPP_SALE_DRAFT_UPDATED",
+      metadata: {
+        source: "WHATSAPP",
+        hasItemsPatch: body?.items !== undefined,
+        hasCustomerPatch: Boolean(body?.customerId || body?.customer),
+        hasSaleTypePatch: body?.saleType !== undefined,
+        hasDueDatePatch: body?.dueDate !== undefined,
+      },
+    });
+
     return { updated: true, draft: recomputed };
   });
-
-  return result;
 }
 
-async function deleteSaleDraft({ tenantId, saleId }) {
-  const saleFields = prisma.sale.fields || {};
+async function deleteSaleDraft({ tenantId, saleId, userId = null }) {
+  const saleFields = getModelFields(prisma.sale);
 
   const draft = await prisma.sale.findFirst({
     where: {
@@ -787,10 +1002,11 @@ async function deleteSaleDraft({ tenantId, saleId }) {
     },
     select: {
       id: true,
+      conversationId: true,
     },
   });
 
-  if (!draft) throw new Error("SALE_DRAFT_NOT_FOUND");
+  if (!draft) throw appError("SALE_DRAFT_NOT_FOUND");
 
   await prisma.$transaction(async (tx) => {
     await tx.saleItem.deleteMany({
@@ -800,13 +1016,25 @@ async function deleteSaleDraft({ tenantId, saleId }) {
     await tx.sale.delete({
       where: { id: draft.id },
     });
+
+    await createAuditLogTx(tx, {
+      tenantId,
+      userId,
+      entity: "SALE",
+      entityId: draft.id,
+      action: "WHATSAPP_SALE_DRAFT_DELETED",
+      metadata: {
+        source: "WHATSAPP",
+        conversationId: draft.conversationId || null,
+      },
+    });
   });
 
   return { deleted: true, saleId: draft.id };
 }
 
 async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
-  const saleFields = prisma.sale.fields || {};
+  const saleFields = getModelFields(prisma.sale);
 
   const draft = await prisma.sale.findFirst({
     where: {
@@ -823,6 +1051,7 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
       saleType: true,
       dueDate: true,
       customerId: true,
+      conversationId: true,
       items: {
         orderBy: [{ id: "asc" }],
         select: {
@@ -835,8 +1064,8 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
     },
   });
 
-  if (!draft) throw new Error("SALE_DRAFT_NOT_FOUND");
-  if (!draft.items || draft.items.length === 0) throw new Error("NO_ITEMS");
+  if (!draft) throw appError("SALE_DRAFT_NOT_FOUND");
+  if (!draft.items || draft.items.length === 0) throw appError("NO_ITEMS");
 
   const finalSaleType = normalizeSaleType(body?.saleType || draft.saleType || "CREDIT");
   const method = normalizePaymentMethod(body?.paymentMethod || body?.method || "CASH");
@@ -844,12 +1073,12 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
   const parsedDueDate =
     body?.dueDate !== undefined
       ? body.dueDate
-        ? new Date(body.dueDate)
+        ? safeDate(body.dueDate)
         : null
       : draft.dueDate || null;
 
-  if (body?.dueDate && Number.isNaN(parsedDueDate.getTime())) {
-    throw new Error("INVALID_DUE_DATE");
+  if (body?.dueDate && !parsedDueDate) {
+    throw appError("INVALID_DUE_DATE");
   }
 
   const requestedPaid = Math.max(0, toNumber(body?.amountPaid, 0));
@@ -857,7 +1086,7 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
     finalSaleType === "CASH" ? Number(draft.total) : Math.min(requestedPaid, Number(draft.total));
 
   if (finalSaleType === "CREDIT" && initialPaid > Number(draft.total) + 0.000001) {
-    throw new Error("PAYMENT_EXCEEDS_TOTAL");
+    throw appError("PAYMENT_EXCEEDS_TOTAL");
   }
 
   if (finalSaleType === "CASH") {
@@ -865,9 +1094,7 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
     if (blockCashSales) {
       const openSessionId = await getOpenCashSessionId(prisma, tenantId);
       if (!openSessionId) {
-        const err = new Error("CASH_DRAWER_CLOSED");
-        err.code = "CASH_DRAWER_CLOSED";
-        throw err;
+        throw appError("CASH_DRAWER_CLOSED", { code: "CASH_DRAWER_CLOSED" });
       }
     }
   }
@@ -883,11 +1110,11 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
   for (const it of draft.items) {
     const p = byId.get(it.productId);
     if (!p || Number(p.stockQty || 0) < Number(it.quantity || 0)) {
-      throw new Error("INSUFFICIENT_STOCK");
+      throw appError("INSUFFICIENT_STOCK");
     }
   }
 
-  const result = await prisma.$transaction(
+  return prisma.$transaction(
     async (tx) => {
       let resolvedCustomerId = draft.customerId || null;
 
@@ -911,7 +1138,7 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
         });
 
         if (!updated || updated.count !== 1) {
-          throw new Error("INSUFFICIENT_STOCK");
+          throw appError("INSUFFICIENT_STOCK");
         }
       }
 
@@ -939,9 +1166,13 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
           dueDate: finalSaleType === "CREDIT" ? parsedDueDate : null,
           receiptNumber: doc.receiptNumber,
           invoiceNumber: doc.invoiceNumber,
-          ...(typeof tx.sale.fields?.isDraft !== "undefined" ? { isDraft: false } : {}),
-          ...(typeof tx.sale.fields?.draftSource !== "undefined" ? { draftSource: null } : {}),
-          ...(typeof tx.sale.fields?.finalizedAt !== "undefined" ? { finalizedAt } : {}),
+          ...(typeof getModelFields(tx.sale).isDraft !== "undefined" ? { isDraft: false } : {}),
+          ...(typeof getModelFields(tx.sale).draftSource !== "undefined"
+            ? { draftSource: null }
+            : {}),
+          ...(typeof getModelFields(tx.sale).finalizedAt !== "undefined"
+            ? { finalizedAt }
+            : {}),
         },
         select: {
           id: true,
@@ -955,9 +1186,14 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
           invoiceNumber: true,
           customerId: true,
           createdAt: true,
-          ...(typeof tx.sale.fields?.isDraft !== "undefined" ? { isDraft: true } : {}),
-          ...(typeof tx.sale.fields?.draftSource !== "undefined" ? { draftSource: true } : {}),
-          ...(typeof tx.sale.fields?.finalizedAt !== "undefined" ? { finalizedAt: true } : {}),
+          conversationId: true,
+          ...(typeof getModelFields(tx.sale).isDraft !== "undefined" ? { isDraft: true } : {}),
+          ...(typeof getModelFields(tx.sale).draftSource !== "undefined"
+            ? { draftSource: true }
+            : {}),
+          ...(typeof getModelFields(tx.sale).finalizedAt !== "undefined"
+            ? { finalizedAt: true }
+            : {}),
         },
       });
 
@@ -999,6 +1235,25 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
         }
       }
 
+      await createAuditLogTx(tx, {
+        tenantId,
+        userId,
+        entity: "SALE",
+        entityId: draft.id,
+        action: "WHATSAPP_SALE_DRAFT_FINALIZED",
+        metadata: {
+          source: "WHATSAPP",
+          conversationId: draft.conversationId || null,
+          saleType: finalSaleType,
+          total: draft.total,
+          amountPaid: initialPaid,
+          paymentMethod: initialPaid > 0 ? method : null,
+          receiptNumber: updatedSale.receiptNumber || null,
+          invoiceNumber: updatedSale.invoiceNumber || null,
+          customerId: resolvedCustomerId || null,
+        },
+      });
+
       return {
         finalized: true,
         sale: updatedSale,
@@ -1021,8 +1276,6 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
       timeout: 20000,
     }
   );
-
-  return result;
 }
 
 module.exports = {

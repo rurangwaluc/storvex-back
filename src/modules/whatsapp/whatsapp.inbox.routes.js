@@ -7,13 +7,32 @@ const requireRole = require("../../middlewares/requireRole");
 
 const controller = require("./whatsapp.inbox.controller");
 
-router.use(authenticate, requireTenant, requireRole("OWNER", "CASHIER"));
+/**
+ * Locked access:
+ * - OWNER: full operational control
+ * - MANAGER: operational visibility and inbox coordination
+ * - CASHIER: sales follow-up, replies, draft-to-sale conversion
+ *
+ * We keep the middleware on the router level so every WhatsApp inbox route
+ * stays protected consistently.
+ */
+router.use(
+  authenticate,
+  requireTenant,
+  requireRole("OWNER", "MANAGER", "CASHIER")
+);
 
+/**
+ * Conversations
+ */
 router.get("/inbox/conversations", controller.listConversations);
 router.get("/inbox/conversations/:id/messages", controller.listMessages);
 router.post("/inbox/conversations/:id/reply", controller.reply);
 router.patch("/inbox/conversations/:id/status", controller.updateStatus);
 
+/**
+ * WhatsApp sale drafts
+ */
 router.get("/inbox/sale-drafts", controller.listSaleDrafts);
 router.get("/inbox/sale-drafts/:saleId", controller.getSaleDraft);
 router.post("/inbox/conversations/:id/create-sale-draft", controller.createSaleDraft);

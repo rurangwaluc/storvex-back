@@ -35,6 +35,8 @@ const warrantiesRoutes = require("./modules/warranties/warranties.routes");
 
 const permissionsRoutes = require("./modules/auth/permissions.routes");
 
+const securityRoutes = require("./modules/settings/security.routes");
+
 const app = express();
 
 app.use(cors());
@@ -116,7 +118,15 @@ app.use("/api/reports", reportRoutes);
 app.use("/api/interstore", interstoreRoutes);
 
 // WhatsApp webhook (public)
-app.use("/api/whatsapp", whatsappRoutes);
+app.use(
+  "/api/whatsapp",
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+  whatsappRoutes
+);
 
 // WhatsApp accounts (OWNER only)
 app.use(
@@ -129,5 +139,7 @@ app.use(
 
 // WhatsApp inbox / protected actions inside its own route layer
 app.use("/api/whatsapp", whatsappInboxRoutes);
+
+app.use("/api/settings/security", securityRoutes);
 
 module.exports = app;

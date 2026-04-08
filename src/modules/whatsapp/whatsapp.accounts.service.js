@@ -5,8 +5,13 @@ function normalizeStr(value) {
   return s || null;
 }
 
+function digitsOnly(value) {
+  return String(value || "").replace(/[^\d]/g, "");
+}
+
 function normalizePhone(value) {
-  return normalizeStr(value);
+  const raw = digitsOnly(value);
+  return raw || null;
 }
 
 function normalizeBoolean(value, fallback = null) {
@@ -14,32 +19,11 @@ function normalizeBoolean(value, fallback = null) {
   return Boolean(value);
 }
 
-function assertActiveCredentials(data, existing = null) {
-  const finalIsActive =
-    data?.isActive == null
-      ? existing?.isActive == null
-        ? true
-        : Boolean(existing.isActive)
-      : Boolean(data.isActive);
-
-  if (!finalIsActive) return;
-
-  const phoneNumberId = normalizeStr(
-    data?.phoneNumberId != null ? data.phoneNumberId : existing?.phoneNumberId
-  );
-  if (!phoneNumberId) {
-    throw new Error("phoneNumberId required when isActive=true");
-  }
-
-  const accessToken = normalizeStr(
-    data?.accessToken != null ? data.accessToken : existing?.accessToken
-  );
-  if (!accessToken) {
-    throw new Error("accessToken required when isActive=true");
-  }
+function maskSecret(value) {
+  return value ? "********" : null;
 }
 
-function toPublicAccount(account) {
+function buildPublicAccount(account) {
   if (!account) return null;
 
   return {
@@ -49,72 +33,182 @@ function toPublicAccount(account) {
     businessName: account.businessName,
     phoneNumberId: account.phoneNumberId,
     wabaId: account.wabaId,
-    webhookVerifyToken: account.webhookVerifyToken ? "********" : null,
-    appSecret: account.appSecret ? "********" : null,
+    webhookVerifyToken: maskSecret(account.webhookVerifyToken),
+    appSecret: maskSecret(account.appSecret),
     hasAccessToken: Boolean(account.accessToken),
-    isActive: account.isActive,
+    isActive: Boolean(account.isActive),
     createdAt: account.createdAt,
     updatedAt: account.updatedAt,
   };
 }
 
-async function createAccount(tenantId, data) {
-  const phoneNumber = normalizePhone(data?.phoneNumber);
-  if (!phoneNumber) throw new Error("phoneNumber required");
+function resolveFinalValue(nextValue, existingValue) {
+  if (nextValue === undefined) return existingValue;
+  return nextValue;
+}
 
-  assertActiveCredentials(data);
+function validateRequiredPhoneNumber(phoneNumber) {
+  if (!phoneNumber) {
+    throw new Error("PHONE_NUMBER_REQUIRED");
+  }
+
+  if (String(phoneNumber).length < 8) {
+    throw new Error("PHONE_NUMBER_INVALID");
+  }
+}
+
+function validateActiveCredentials({
+  phoneNumberId,
+  accessToken,
+  isActive,
+}) {
+  if (!isActive) return;
+
+  if (!normalizeStr(phoneNumberId)) {
+    throw new Error("PHONE_NUMBER_ID_REQUIRED_WHEN_ACTIVE");
+  }
+
+  if (!normalizeStr(accessToken)) {
+    throw new Error("ACCESS_TOKEN_REQUIRED_WHEN_ACTIVE");
+  }
+}
+
+async function ensureTenantExists(tenantId) {
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantId },
+    select: { id: true },
+  });
+
+  if (!tenant) {
+    throw new Error("TENANT_NOT_FOUND");
+  }
+}
+
+async function createAccount(tenantId, data) {
+  await ensureTenantExists(tenantId);
+
+  const phoneNumber = normalizePhone(data?.phoneNumber);
+  const businessName = normalizeStr(data?.businessName);
+  const phoneNumberId = normalizeStr(data?.phoneNumberId);
+  const wabaId = normalizeStr(data?.wabaId);
+  const accessToken = normalizeStr(data?.accessToken);
+  const webhookVerifyToken = normalizeStr(data?.webhookVerifyToken);
+  const appSecret = normalizeStr(data?.appSecret);
+  const isActive = normalizeBoolean(data?.isActive, true);
+
+  validateRequiredPhoneNumber(phoneNumber);
+  validateActiveCredentials({
+    phoneNumberId,
+    accessToken,
+    isActive,
+  });
 
   const created = await prisma.whatsAppAccount.create({
     data: {
       tenantId,
       phoneNumber,
-      businessName: normalizeStr(data?.businessName),
-      phoneNumberId: normalizeStr(data?.phoneNumberId),
-      wabaId: normalizeStr(data?.wabaId),
-      accessToken: normalizeStr(data?.accessToken),
-      webhookVerifyToken: normalizeStr(data?.webhookVerifyToken),
-      appSecret: normalizeStr(data?.appSecret),
-      isActive: data?.isActive == null ? true : Boolean(data.isActive),
+      businessName,
+      phoneNumberId,
+      wabaId,
+      accessToken,
+      webhookVerifyToken,
+      appSecret,
+      isActive,
     },
   });
 
-  return toPublicAccount(created);
+  return buildPublicAccount(created);
 }
 
 async function listAccounts(tenantId) {
+  await ensureTenantExists(tenantId);
+
   const accounts = await prisma.whatsAppAccount.findMany({
     where: { tenantId },
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ isActive: "desc" }, { createdAt: "desc" }],
   });
 
-  return accounts.map(toPublicAccount);
+  return accounts.map(buildPublicAccount);
 }
 
 async function updateAccount(tenantId, id, data) {
+  await ensureTenantExists(tenantId);
+
   const existing = await prisma.whatsAppAccount.findFirst({
-    where: { id: String(id), tenantId },
+    where: {
+      id: String(id),
+      tenantId,
+    },
   });
 
-  if (!existing) throw new Error("NOT_FOUND");
+  if (!existing) {
+    throw new Error("NOT_FOUND");
+  }
 
-  assertActiveCredentials(data, existing);
+  const nextPhoneNumber = resolveFinalValue(
+    data?.phoneNumber !== undefined ? normalizePhone(data.phoneNumber) : undefined,
+    existing.phoneNumber
+  );
+
+  const nextBusinessName = resolveFinalValue(
+    data?.businessName !== undefined ? normalizeStr(data.businessName) : undefined,
+    existing.businessName
+  );
+
+  const nextPhoneNumberId = resolveFinalValue(
+    data?.phoneNumberId !== undefined ? normalizeStr(data.phoneNumberId) : undefined,
+    existing.phoneNumberId
+  );
+
+  const nextWabaId = resolveFinalValue(
+    data?.wabaId !== undefined ? normalizeStr(data.wabaId) : undefined,
+    existing.wabaId
+  );
+
+  const nextAccessToken = resolveFinalValue(
+    data?.accessToken !== undefined ? normalizeStr(data.accessToken) : undefined,
+    existing.accessToken
+  );
+
+  const nextWebhookVerifyToken = resolveFinalValue(
+    data?.webhookVerifyToken !== undefined
+      ? normalizeStr(data.webhookVerifyToken)
+      : undefined,
+    existing.webhookVerifyToken
+  );
+
+  const nextAppSecret = resolveFinalValue(
+    data?.appSecret !== undefined ? normalizeStr(data.appSecret) : undefined,
+    existing.appSecret
+  );
+
+  const nextIsActive = resolveFinalValue(
+    data?.isActive !== undefined ? normalizeBoolean(data.isActive, false) : undefined,
+    Boolean(existing.isActive)
+  );
+
+  validateRequiredPhoneNumber(nextPhoneNumber);
+  validateActiveCredentials({
+    phoneNumberId: nextPhoneNumberId,
+    accessToken: nextAccessToken,
+    isActive: nextIsActive,
+  });
 
   const updated = await prisma.whatsAppAccount.update({
     where: { id: existing.id },
     data: {
-      businessName: data?.businessName != null ? normalizeStr(data.businessName) : undefined,
-      phoneNumber: data?.phoneNumber != null ? normalizePhone(data.phoneNumber) : undefined,
-      phoneNumberId: data?.phoneNumberId != null ? normalizeStr(data.phoneNumberId) : undefined,
-      wabaId: data?.wabaId != null ? normalizeStr(data.wabaId) : undefined,
-      accessToken: data?.accessToken != null ? normalizeStr(data.accessToken) : undefined,
-      webhookVerifyToken:
-        data?.webhookVerifyToken != null ? normalizeStr(data.webhookVerifyToken) : undefined,
-      appSecret: data?.appSecret != null ? normalizeStr(data.appSecret) : undefined,
-      isActive: data?.isActive != null ? Boolean(data.isActive) : undefined,
+      phoneNumber: nextPhoneNumber,
+      businessName: nextBusinessName,
+      phoneNumberId: nextPhoneNumberId,
+      wabaId: nextWabaId,
+      accessToken: nextAccessToken,
+      webhookVerifyToken: nextWebhookVerifyToken,
+      appSecret: nextAppSecret,
+      isActive: nextIsActive,
     },
   });
 
-  return toPublicAccount(updated);
+  return buildPublicAccount(updated);
 }
 
 module.exports = {

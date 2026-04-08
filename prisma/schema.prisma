@@ -144,7 +144,11 @@ model Tenant {
   receiptFooter                String?                   @db.Text
   logoKey                      String?                   @db.Text
 
-  proformas Proforma[]
+  proformas                    Proforma[]
+
+  sessions                     UserSession[]
+  loginEvents                  LoginEvent[]
+  passwordChangeEvents         PasswordChangeEvent[]
 
   shopType                     String?                   @db.Text
   district                     String?                   @db.Text
@@ -155,11 +159,10 @@ model Tenant {
   timezone                     String                    @default("Africa/Kigali") @db.Text
   onboardingCompleted          Boolean                   @default(false)
   onboardingCompletedAt        DateTime?
-
   cash_drawer_block_cash_sales Boolean                   @default(true)
 
-  documentSettings              TenantDocumentSettings?
-  documentCounter               TenantDocumentCounter?
+  documentSettings             TenantDocumentSettings?
+  documentCounter              TenantDocumentCounter?
 
   customers                    Customer[]
   deliveryNotes                DeliveryNote[]
@@ -247,11 +250,14 @@ model User {
   role                       UserRole
   createdAt                  DateTime               @default(now())
   isActive                   Boolean                @default(true) @map("is_active")
-  
-  userPermissions UserPermission[]
 
-  createdProformas Proforma[] @relation("ProformaCreatedBy")
+  userPermissions            UserPermission[]
+  createdProformas           Proforma[]             @relation("ProformaCreatedBy")
 
+  sessions                   UserSession[]
+  loginEvents                LoginEvent[]
+  passwordChanges            PasswordChangeEvent[]  @relation("PasswordChangedUser")
+  passwordChangesMade        PasswordChangeEvent[]  @relation("PasswordChangedBy")
 
   auditLogs                  AuditLog[]
   createdDeliveryNotes       DeliveryNote[]
@@ -277,7 +283,6 @@ model User {
   @@index([tenantId, id])
   @@map("User")
 }
-
 
 model Subscription {
   id                  String                  @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
@@ -1222,6 +1227,66 @@ model SaleWarrantyUnit {
   @@map("SaleWarrantyUnit")
 }
 
+model UserSession {
+  id         String   @id @default(uuid())
+  tenantId   String
+  userId     String
+  tokenId    String   @unique
+  ipAddress  String?
+  userAgent  String?
+  expiresAt  DateTime?
+  isRevoked  Boolean  @default(false)
+  revokedAt  DateTime?
+  lastSeenAt DateTime?
+  createdAt  DateTime @default(now())
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, userId])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, userId, isRevoked])
+}
+
+model LoginEvent {
+  id          String   @id @default(uuid())
+  tenantId    String
+  userId      String?
+  email       String?
+  role        String?
+  status      String
+  method      String?
+  ipAddress   String?
+  userAgent   String?
+  deviceLabel String?
+  reason      String?
+  createdAt   DateTime @default(now())
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, userId, createdAt])
+  @@index([tenantId, status, createdAt])
+}
+
+model PasswordChangeEvent {
+  id          String   @id @default(uuid())
+  tenantId    String
+  userId      String
+  changedById String?
+  createdAt   DateTime @default(now())
+  ipAddress   String?
+  userAgent   String?
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user        User     @relation("PasswordChangedUser", fields: [userId], references: [id], onDelete: Cascade)
+  changedBy   User?    @relation("PasswordChangedBy", fields: [changedById], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, userId, createdAt])
+  @@index([tenantId, changedById, createdAt])
+}
+
 enum UserRole {
   OWNER
   MANAGER
@@ -1319,6 +1384,17 @@ enum AuditAction {
   CUSTOMER_UPDATED
   CUSTOMER_DEACTIVATED
   CUSTOMER_REACTIVATED
+
+  WHATSAPP_REPLY_SENT
+  WHATSAPP_CONVERSATION_STATUS_UPDATED
+  WHATSAPP_SALE_DRAFT_CREATED
+  WHATSAPP_SALE_DRAFT_UPDATED
+  WHATSAPP_SALE_DRAFT_DELETED
+  WHATSAPP_SALE_DRAFT_FINALIZED
+  WHATSAPP_BROADCAST_CREATED
+  WHATSAPP_BROADCAST_QUEUED
+  WHATSAPP_BROADCAST_SENT
+  WHATSAPP_BROADCAST_FAILED
 }
 
 enum AuditEntity {
@@ -1332,6 +1408,10 @@ enum AuditEntity {
   TENANT
   SUBSCRIPTION
   PAYMENT
+
+  WHATSAPP_CONVERSATION
+  WHATSAPP_MESSAGE
+  WHATSAPP_BROADCAST
 }
 
 enum SaleType {
