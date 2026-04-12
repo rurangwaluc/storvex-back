@@ -1,6 +1,7 @@
 const prisma = require("../../config/database");
 const whatsappService = require("./whatsapp.service");
 const { reserveSaleDocumentNumbersTx } = require("../documents/documentNumber.service");
+const { WHATSAPP_ASSIGNABLE_ROLES } = require("./whatsapp.roles");
 
 function appError(code, extra = {}) {
   const err = new Error(code);
@@ -8,6 +9,12 @@ function appError(code, extra = {}) {
   Object.assign(err, extra);
   return err;
 }
+
+function normalizeId(value) {
+  const s = String(value || "").trim();
+  return s || null;
+}
+
 
 function normalizeText(value) {
   const s = String(value || "").trim();
@@ -280,7 +287,9 @@ async function listConversations({ tenantId }) {
         select: {
           id: true,
           name: true,
+          email: true,
           role: true,
+          isActive: true,
         },
       },
       account: {
@@ -335,7 +344,9 @@ async function listMessages({ tenantId, conversationId }) {
         select: {
           id: true,
           name: true,
+          email: true,
           role: true,
+          isActive: true,
         },
       },
       account: {
@@ -1278,6 +1289,348 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
   );
 }
 
+const ASSIGNABLE_USER_ROLES = [
+  "OWNER",
+  "MANAGER",
+  "CASHIER",
+  "SELLER",
+  "STOREKEEPER",
+  "TECHNICIAN",
+];
+
+function normalizeConversationPublic(conversation) {
+  if (!conversation) return null;
+
+  return {
+    id: conversation.id,
+    tenantId: conversation.tenantId,
+    accountId: conversation.accountId,
+    customerId: conversation.customerId,
+    phone: conversation.phone,
+    status: conversation.status,
+    assignedToId: conversation.assignedToId || null,
+    createdAt: conversation.createdAt,
+    updatedAt: conversation.updatedAt,
+    account: conversation.account
+      ? {
+          id: conversation.account.id,
+          phoneNumber: conversation.account.phoneNumber || null,
+          businessName: conversation.account.businessName || null,
+          isActive: Boolean(conversation.account.isActive),
+        }
+      : null,
+    customer: conversation.customer
+      ? {
+          id: conversation.customer.id,
+          name: conversation.customer.name || null,
+          phone: conversation.customer.phone || null,
+          email: conversation.customer.email || null,
+        }
+      : null,
+    assignedTo: conversation.assignedTo
+      ? {
+          id: conversation.assignedTo.id,
+          name: conversation.assignedTo.name || null,
+          email: conversation.assignedTo.email || null,
+          role: conversation.assignedTo.role || null,
+          isActive: Boolean(conversation.assignedTo.isActive),
+        }
+      : null,
+  };
+}
+
+/**
+ * Do not write unsupported enum values into auditLog.action.
+ * Your Prisma AuditAction enum does not currently include the custom
+ * WhatsApp assignment action names, so we skip them safely for now.
+ */
+async function createAuditLogSafe({
+  tenantId,
+  userId = null,
+  entity = "WHATSAPP_CONVERSATION",
+  entityId = null,
+  action,
+  metadata = null,
+}) {
+  try {
+    if (!action) return;
+
+    // Skip unsupported custom action enums for now.
+    // This avoids Prisma validation crashes until AuditAction is extended.
+    return;
+  } catch (err) {
+    console.error("WHATSAPP inbox audit log error:", err?.message || err);
+  }
+}
+
+async function getConversationForTenant({ tenantId, conversationId }) {
+  const id = normalizeId(conversationId);
+  if (!tenantId || !id) throw appError("INVALID_ARGS");
+
+  const conversation = await prisma.whatsAppConversation.findFirst({
+    where: {
+      id,
+      tenantId,
+    },
+    select: {
+      id: true,
+      tenantId: true,
+      accountId: true,
+      customerId: true,
+      phone: true,
+      status: true,
+      assignedToId: true,
+      createdAt: true,
+      updatedAt: true,
+      account: {
+        select: {
+          id: true,
+          phoneNumber: true,
+          businessName: true,
+          isActive: true,
+        },
+      },
+      customer: {
+        select: {
+          id: true,
+          name: true,
+          phone: true,
+          email: true,
+        },
+      },
+      assignedTo: {
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          role: true,
+          isActive: true,
+        },
+      },
+    },
+  });
+
+  if (!conversation) {
+    throw appError("CONVERSATION_NOT_FOUND");
+  }
+
+  return conversation;
+}
+
+async function resolveAssignableUser({ tenantId, userId }) {
+  const id = normalizeId(userId);
+  if (!tenantId || !id) throw appError("INVALID_ASSIGNEE");
+
+  const user = await prisma.user.findFirst({
+    where: {
+      id,
+      tenantId,
+      isActive: true,
+      role: {
+        in: WHATSAPP_ASSIGNABLE_ROLES,
+      },
+    },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      role: true,
+      isActive: true,
+    },
+  });
+
+  if (!user) {
+    throw appError("ASSIGNEE_NOT_FOUND");
+  }
+
+  return user;
+}
+
+async function listAssignableStaff({ tenantId }) {
+  if (!tenantId) throw appError("INVALID_ARGS");
+
+  const users = await prisma.user.findMany({
+    where: {
+      tenantId,
+      isActive: true,
+      role: {
+        in: WHATSAPP_ASSIGNABLE_ROLES,
+      },
+    },
+    orderBy: [{ name: "asc" }, { createdAt: "asc" }],
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      role: true,
+      isActive: true,
+    },
+  });
+
+  return users.map((user) => ({
+    id: user.id,
+    name: user.name || "",
+    email: user.email || "",
+    role: user.role || "",
+    isActive: Boolean(user.isActive),
+  }));
+}
+
+async function assignConversation({
+  tenantId,
+  conversationId,
+  assignedToId,
+  actorUserId,
+}) {
+  const cleanAssignedToId = normalizeId(assignedToId);
+  if (!cleanAssignedToId) {
+    throw appError("ASSIGNED_TO_REQUIRED");
+  }
+
+  const conversation = await getConversationForTenant({
+    tenantId,
+    conversationId,
+  });
+
+  const assignee = await resolveAssignableUser({
+    tenantId,
+    userId: cleanAssignedToId,
+  });
+
+  const updated = await prisma.whatsAppConversation.update({
+    where: { id: conversation.id },
+    data: {
+      assignedToId: assignee.id,
+      updatedAt: new Date(),
+    },
+    select: {
+      id: true,
+      tenantId: true,
+      accountId: true,
+      customerId: true,
+      phone: true,
+      status: true,
+      assignedToId: true,
+      createdAt: true,
+      updatedAt: true,
+      account: {
+        select: {
+          id: true,
+          phoneNumber: true,
+          businessName: true,
+          isActive: true,
+        },
+      },
+      customer: {
+        select: {
+          id: true,
+          name: true,
+          phone: true,
+          email: true,
+        },
+      },
+      assignedTo: {
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          role: true,
+          isActive: true,
+        },
+      },
+    },
+  });
+
+  await createAuditLogSafe({
+    tenantId,
+    userId: actorUserId || null,
+    entity: "WHATSAPP_CONVERSATION",
+    entityId: conversation.id,
+    action: "WHATSAPP_CONVERSATION_ASSIGNED",
+    metadata: {
+      previousAssignedToId: conversation.assignedToId || null,
+      nextAssignedToId: assignee.id,
+      phone: conversation.phone,
+    },
+  });
+
+  return {
+    conversation: normalizeConversationPublic(updated),
+  };
+}
+
+async function unassignConversation({
+  tenantId,
+  conversationId,
+  actorUserId,
+}) {
+  const conversation = await getConversationForTenant({
+    tenantId,
+    conversationId,
+  });
+
+  const updated = await prisma.whatsAppConversation.update({
+    where: { id: conversation.id },
+    data: {
+      assignedToId: null,
+      updatedAt: new Date(),
+    },
+    select: {
+      id: true,
+      tenantId: true,
+      accountId: true,
+      customerId: true,
+      phone: true,
+      status: true,
+      assignedToId: true,
+      createdAt: true,
+      updatedAt: true,
+      account: {
+        select: {
+          id: true,
+          phoneNumber: true,
+          businessName: true,
+          isActive: true,
+        },
+      },
+      customer: {
+        select: {
+          id: true,
+          name: true,
+          phone: true,
+          email: true,
+        },
+      },
+      assignedTo: {
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          role: true,
+          isActive: true,
+        },
+      },
+    },
+  });
+
+  await createAuditLogSafe({
+    tenantId,
+    userId: actorUserId || null,
+    entity: "WHATSAPP_CONVERSATION",
+    entityId: conversation.id,
+    action: "WHATSAPP_CONVERSATION_UNASSIGNED",
+    metadata: {
+      previousAssignedToId: conversation.assignedToId || null,
+      phone: conversation.phone,
+    },
+  });
+
+  return {
+    conversation: normalizeConversationPublic(updated),
+  };
+}
+
+
 module.exports = {
   listConversations,
   listMessages,
@@ -1289,4 +1642,7 @@ module.exports = {
   updateSaleDraft,
   deleteSaleDraft,
   finalizeSaleDraft,
+  listAssignableStaff,
+  assignConversation,
+  unassignConversation,
 };

@@ -64,6 +64,28 @@ function mapServiceError(err, res, fallbackMessage) {
     });
   }
 
+  if (code === "INVALID_ARGS") {
+    return res.status(400).json({ message: "Invalid request" });
+  }
+
+  if (code === "ASSIGNED_TO_REQUIRED") {
+    return res.status(400).json({ message: "assignedToId is required" });
+  }
+
+  if (code === "INVALID_ASSIGNEE") {
+    return res.status(400).json({ message: "Invalid assignee" });
+  }
+
+  if (code === "CONVERSATION_NOT_FOUND") {
+    return res.status(404).json({ message: "Conversation not found" });
+  }
+
+  if (code === "ASSIGNEE_NOT_FOUND") {
+    return res.status(404).json({
+      message: "Staff member not found or cannot be assigned",
+    });
+  }
+
   return res.status(500).json({ message: fallbackMessage });
 }
 
@@ -140,6 +162,21 @@ async function updateStatus(req, res) {
   } catch (err) {
     console.error("updateStatus error:", err);
     return mapServiceError(err, res, "Failed to update status");
+  }
+}
+
+async function listAssignableStaff(req, res) {
+  try {
+    const tenantId = req.user?.tenantId;
+    const staff = await service.listAssignableStaff({ tenantId });
+
+    return res.json({
+      ok: true,
+      staff,
+    });
+  } catch (err) {
+    console.error("listAssignableStaff error:", err);
+    return mapServiceError(err, res, "Failed to list assignable staff");
   }
 }
 
@@ -246,15 +283,66 @@ async function finalizeSaleDraft(req, res) {
   }
 }
 
+async function assignConversation(req, res) {
+  try {
+    const tenantId = req.user?.tenantId;
+    const actorUserId = req.user?.id || null;
+    const conversationId = req.params?.id;
+    const assignedToId = req.body?.assignedToId;
+
+    const result = await service.assignConversation({
+      tenantId,
+      conversationId,
+      assignedToId,
+      actorUserId,
+    });
+
+    return res.json({
+      ok: true,
+      message: "Conversation assigned successfully",
+      conversation: result.conversation,
+    });
+  } catch (err) {
+    console.error("assignConversation error:", err);
+    return mapServiceError(err, res, "Failed to assign conversation");
+  }
+}
+
+async function unassignConversation(req, res) {
+  try {
+    const tenantId = req.user?.tenantId;
+    const actorUserId = req.user?.id || null;
+    const conversationId = req.params?.id;
+
+    const result = await service.unassignConversation({
+      tenantId,
+      conversationId,
+      actorUserId,
+    });
+
+    return res.json({
+      ok: true,
+      message: "Conversation unassigned successfully",
+      conversation: result.conversation,
+    });
+  } catch (err) {
+    console.error("unassignConversation error:", err);
+    return mapServiceError(err, res, "Failed to unassign conversation");
+  }
+}
+
 module.exports = {
   listConversations,
   listMessages,
   reply,
   updateStatus,
+  listAssignableStaff,
   listSaleDrafts,
   getSaleDraft,
   createSaleDraft,
   updateSaleDraft,
   deleteSaleDraft,
   finalizeSaleDraft,
+  assignConversation,
+  unassignConversation,
 };
