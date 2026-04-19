@@ -447,6 +447,7 @@ async function printReceiptHtml(req, res) {
         cashier: payload.cashierName,
         saleType: payload.saleType,
         status: payload.status,
+        isCancelled: Boolean(payload.isCancelled),
         notes: payload.isCancelled
           ? `This receipt was cancelled.${payload.cancelNote ? ` Note: ${payload.cancelNote}` : ""}`
           : "Keep this receipt for support and warranty.",

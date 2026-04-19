@@ -35,6 +35,17 @@ router.get(
   repairsController.getRepairs
 );
 
+// IMPORTANT: static routes must come before /:id to avoid being shadowed
+// Get technicians list (OWNER, CASHIER, TECHNICIAN)
+router.get(
+  "/technicians",
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+  requireRole("OWNER", "CASHIER", "TECHNICIAN"),
+  repairsController.getTechnicians
+);
+
 // Get single repair (OWNER, CASHIER, TECHNICIAN)
 router.get(
   "/:id",
@@ -98,15 +109,6 @@ router.delete(
   requireWritableSubscription,
   requireRole("OWNER"),
   repairsController.deleteRepair
-);
-
-router.get(
-  "/technicians",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER", "CASHIER", "TECHNICIAN"),
-  repairsController.getTechnicians
 );
 
 module.exports = router;
