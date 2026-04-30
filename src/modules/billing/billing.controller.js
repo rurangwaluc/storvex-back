@@ -1,4 +1,3 @@
-// src/modules/billing/billing.controller.js
 const crypto = require("crypto");
 const prisma = require("../../config/database");
 
@@ -53,7 +52,56 @@ function toIsoDate(date) {
   return d.toISOString();
 }
 
-function serializeSubscription(subscription, activeUsersCount = null) {
+function getBranchLimitFromPlan(plan) {
+  const raw = plan?.branchLimit;
+  if (Number.isFinite(Number(raw)) && Number(raw) > 0) {
+    return Number(raw);
+  }
+  return 1;
+}
+
+function computeBranchUsage(subscription, activeBranchesCount = null) {
+  const includedBranchLimit = Number.isFinite(Number(subscription?.branchLimit))
+    ? Number(subscription.branchLimit)
+    : null;
+
+  const extraBranchCount = Number.isFinite(Number(subscription?.extraBranchCount))
+    ? Number(subscription.extraBranchCount)
+    : 0;
+
+  const effectiveBranchLimit =
+    includedBranchLimit != null ? includedBranchLimit + extraBranchCount : null;
+
+  const activeBranches =
+    Number.isFinite(Number(activeBranchesCount)) && Number(activeBranchesCount) >= 0
+      ? Number(activeBranchesCount)
+      : null;
+
+  return {
+    activeBranches,
+    includedBranchLimit,
+    extraBranchCount,
+    effectiveBranchLimit,
+    overLimit:
+      effectiveBranchLimit != null && activeBranches != null
+        ? Number(activeBranches) > Number(effectiveBranchLimit)
+        : false,
+    atLimit:
+      effectiveBranchLimit != null && activeBranches != null
+        ? Number(activeBranches) >= Number(effectiveBranchLimit)
+        : false,
+    canAddBranch:
+      effectiveBranchLimit == null || activeBranches == null
+        ? true
+        : Number(activeBranches) < Number(effectiveBranchLimit),
+  };
+}
+
+function serializeSubscription(
+  subscription,
+  activeUsersCount = null,
+  activeBranchesCount = null
+) {
   if (!subscription) return null;
 
   const staffLimit = Number.isFinite(Number(subscription.staffLimit))
@@ -65,6 +113,8 @@ function serializeSubscription(subscription, activeUsersCount = null) {
       ? Number(activeUsersCount)
       : null;
 
+  const branchUsage = computeBranchUsage(subscription, activeBranchesCount);
+
   return {
     id: subscription.id,
     tenantId: subscription.tenantId,
@@ -74,6 +124,13 @@ function serializeSubscription(subscription, activeUsersCount = null) {
     tierKey: subscription.tierKey || null,
     cycleKey: subscription.cycleKey || null,
     staffLimit,
+    branchLimit:
+      Number.isFinite(Number(subscription.branchLimit)) ? Number(subscription.branchLimit) : null,
+    extraBranchCount:
+      Number.isFinite(Number(subscription.extraBranchCount))
+        ? Number(subscription.extraBranchCount)
+        : 0,
+    effectiveBranchLimit: branchUsage.effectiveBranchLimit,
     priceAmount: Number.isFinite(Number(subscription.priceAmount))
       ? Number(subscription.priceAmount)
       : null,
@@ -91,8 +148,12 @@ function serializeSubscription(subscription, activeUsersCount = null) {
     nextPlanKey: subscription.nextPlanKey || null,
     createdAt: toIsoDate(subscription.createdAt),
     activeUsers,
+    activeBranches: branchUsage.activeBranches,
     overLimit:
       staffLimit != null && activeUsers != null ? Number(activeUsers) > Number(staffLimit) : false,
+    branchOverLimit: branchUsage.overLimit,
+    branchAtLimit: branchUsage.atLimit,
+    canAddBranch: branchUsage.canAddBranch,
   };
 }
 
@@ -108,6 +169,17 @@ async function countActiveBillableUsers(tenantId) {
   });
 }
 
+async function countActiveBranches(tenantId) {
+  return prisma.branch.count({
+    where: {
+      tenantId,
+      status: {
+        in: ["ACTIVE", "CLOSED"],
+      },
+    },
+  });
+}
+
 async function getTenantOrThrow(tenantId) {
   const tenant = await prisma.tenant.findUnique({
     where: { id: tenantId },
@@ -117,6 +189,17 @@ async function getTenantOrThrow(tenantId) {
       email: true,
       phone: true,
       status: true,
+      mainBranchId: true,
+      mainBranch: {
+        select: {
+          id: true,
+          name: true,
+          code: true,
+          type: true,
+          status: true,
+          isMain: true,
+        },
+      },
     },
   });
 
@@ -141,6 +224,8 @@ async function getSubscriptionOrThrow(tenantId) {
       tierKey: true,
       cycleKey: true,
       staffLimit: true,
+      branchLimit: true,
+      extraBranchCount: true,
       priceAmount: true,
       currency: true,
       startDate: true,
@@ -211,7 +296,8 @@ async function listBillingPlans(req, res) {
       tierLabel: p.tierLabel,
       cycleKey: p.cycleKey,
       cycleLabel: p.cycleLabel,
-      staffLimit: p.staffLimit,
+      staffLimit: Number.isFinite(Number(p.staffLimit)) ? Number(p.staffLimit) : null,
+      branchLimit: getBranchLimitFromPlan(p),
       days: p.days,
       price: p.price,
       currency: p.currency,
@@ -232,10 +318,11 @@ async function getBillingOverview(req, res) {
       return res.status(400).json({ message: "tenantId is required" });
     }
 
-    const [tenant, subscription, activeUsers, recentPayments] = await Promise.all([
+    const [tenant, subscription, activeUsers, activeBranches, recentPayments] = await Promise.all([
       getTenantOrThrow(tenantId),
       getSubscriptionOrThrow(tenantId),
       countActiveBillableUsers(tenantId),
+      countActiveBranches(tenantId),
       prisma.payment.findMany({
         where: {
           tenantId,
@@ -259,14 +346,17 @@ async function getBillingOverview(req, res) {
           tierKey: true,
           cycleKey: true,
           staffLimit: true,
+          branchLimit: true,
           priceAmount: true,
         },
       }),
     ]);
 
+    const branchUsage = computeBranchUsage(subscription, activeBranches);
+
     return res.json({
       tenant,
-      subscription: serializeSubscription(subscription, activeUsers),
+      subscription: serializeSubscription(subscription, activeUsers, activeBranches),
       usage: {
         activeStaff: activeUsers,
         staffLimit: subscription.staffLimit ?? null,
@@ -274,6 +364,17 @@ async function getBillingOverview(req, res) {
           subscription.staffLimit != null
             ? Number(activeUsers) > Number(subscription.staffLimit)
             : false,
+        activeBranches,
+        branchLimit:
+          Number.isFinite(Number(subscription.branchLimit)) ? Number(subscription.branchLimit) : null,
+        extraBranchCount:
+          Number.isFinite(Number(subscription.extraBranchCount))
+            ? Number(subscription.extraBranchCount)
+            : 0,
+        effectiveBranchLimit: branchUsage.effectiveBranchLimit,
+        branchOverLimit: branchUsage.overLimit,
+        branchAtLimit: branchUsage.atLimit,
+        canAddBranch: branchUsage.canAddBranch,
       },
       payments: recentPayments.map((p) => ({
         id: p.id,
@@ -289,6 +390,7 @@ async function getBillingOverview(req, res) {
         tierKey: p.tierKey || null,
         cycleKey: p.cycleKey || null,
         staffLimit: Number.isFinite(Number(p.staffLimit)) ? Number(p.staffLimit) : null,
+        branchLimit: Number.isFinite(Number(p.branchLimit)) ? Number(p.branchLimit) : null,
         priceAmount: Number.isFinite(Number(p.priceAmount)) ? Number(p.priceAmount) : null,
       })),
     });
@@ -313,9 +415,10 @@ async function initiateRenewalPayment(req, res) {
       return res.status(400).json({ message: "planKey is required" });
     }
 
-    const [tenant, subscription] = await Promise.all([
+    const [tenant, subscription, activeBranches] = await Promise.all([
       getTenantOrThrow(tenantId),
       getSubscriptionOrThrow(tenantId),
+      countActiveBranches(tenantId),
     ]);
 
     const plan = assertRenewalPlanOrThrow(requestedPlanKey);
@@ -335,6 +438,7 @@ async function initiateRenewalPayment(req, res) {
         tierKey: snap.tierKey,
         cycleKey: snap.cycleKey,
         staffLimit: snap.staffLimit,
+        branchLimit: getBranchLimitFromPlan(plan),
         priceAmount: snap.price,
       },
       create: {
@@ -349,6 +453,7 @@ async function initiateRenewalPayment(req, res) {
         tierKey: snap.tierKey,
         cycleKey: snap.cycleKey,
         staffLimit: snap.staffLimit,
+        branchLimit: getBranchLimitFromPlan(plan),
         priceAmount: snap.price,
       },
       select: {
@@ -366,6 +471,7 @@ async function initiateRenewalPayment(req, res) {
         tierKey: true,
         cycleKey: true,
         staffLimit: true,
+        branchLimit: true,
         priceAmount: true,
       },
     });
@@ -373,9 +479,12 @@ async function initiateRenewalPayment(req, res) {
     return res.status(201).json({
       message: "Renewal payment initiated",
       tenant,
-      currentSubscription: serializeSubscription(subscription),
+      currentSubscription: serializeSubscription(subscription, null, activeBranches),
       payment,
-      plan: snap,
+      plan: {
+        ...snap,
+        branchLimit: getBranchLimitFromPlan(plan),
+      },
     });
   } catch (err) {
     console.error("initiateRenewalPayment error:", err);
@@ -409,6 +518,7 @@ async function devMarkRenewalPaymentSuccessful(req, res) {
         tierKey: true,
         cycleKey: true,
         staffLimit: true,
+        branchLimit: true,
         priceAmount: true,
       },
     });
@@ -437,6 +547,7 @@ async function devMarkRenewalPaymentSuccessful(req, res) {
 
     const plan = assertRenewalPlanOrThrow(effectivePlanKey);
     const snap = getPlanSnapshot(plan.key);
+    const branchLimit = getBranchLimitFromPlan(plan);
 
     const renewalStart = resolveRenewalStartDate(currentSubscription);
     const newEndDate = addDays(renewalStart, snap.days);
@@ -455,6 +566,7 @@ async function devMarkRenewalPaymentSuccessful(req, res) {
           tierKey: snap.tierKey,
           cycleKey: snap.cycleKey,
           staffLimit: snap.staffLimit,
+          branchLimit,
           priceAmount: snap.price,
         },
         select: {
@@ -472,6 +584,7 @@ async function devMarkRenewalPaymentSuccessful(req, res) {
           tierKey: true,
           cycleKey: true,
           staffLimit: true,
+          branchLimit: true,
           priceAmount: true,
         },
       });
@@ -485,6 +598,7 @@ async function devMarkRenewalPaymentSuccessful(req, res) {
           tierKey: snap.tierKey,
           cycleKey: snap.cycleKey,
           staffLimit: snap.staffLimit,
+          branchLimit,
           priceAmount: snap.price,
           currency: snap.currency,
           startDate: renewalStart,
@@ -504,6 +618,8 @@ async function devMarkRenewalPaymentSuccessful(req, res) {
           tierKey: true,
           cycleKey: true,
           staffLimit: true,
+          branchLimit: true,
+          extraBranchCount: true,
           priceAmount: true,
           currency: true,
           startDate: true,
@@ -524,7 +640,12 @@ async function devMarkRenewalPaymentSuccessful(req, res) {
       return { payment: updatedPayment, subscription: updatedSubscription };
     });
 
-    const activeUsers = await countActiveBillableUsers(payment.tenantId);
+    const [activeUsers, activeBranches] = await Promise.all([
+      countActiveBillableUsers(payment.tenantId),
+      countActiveBranches(payment.tenantId),
+    ]);
+
+    const branchUsage = computeBranchUsage(result.subscription, activeBranches);
 
     return res.json({
       message: "Renewal payment marked successful",
@@ -546,11 +667,14 @@ async function devMarkRenewalPaymentSuccessful(req, res) {
         staffLimit: Number.isFinite(Number(result.payment.staffLimit))
           ? Number(result.payment.staffLimit)
           : null,
+        branchLimit: Number.isFinite(Number(result.payment.branchLimit))
+          ? Number(result.payment.branchLimit)
+          : null,
         priceAmount: Number.isFinite(Number(result.payment.priceAmount))
           ? Number(result.payment.priceAmount)
           : null,
       },
-      subscription: serializeSubscription(result.subscription, activeUsers),
+      subscription: serializeSubscription(result.subscription, activeUsers, activeBranches),
       usage: {
         activeStaff: activeUsers,
         staffLimit: result.subscription.staffLimit ?? null,
@@ -558,6 +682,19 @@ async function devMarkRenewalPaymentSuccessful(req, res) {
           result.subscription.staffLimit != null
             ? Number(activeUsers) > Number(result.subscription.staffLimit)
             : false,
+        activeBranches,
+        branchLimit:
+          Number.isFinite(Number(result.subscription.branchLimit))
+            ? Number(result.subscription.branchLimit)
+            : null,
+        extraBranchCount:
+          Number.isFinite(Number(result.subscription.extraBranchCount))
+            ? Number(result.subscription.extraBranchCount)
+            : 0,
+        effectiveBranchLimit: branchUsage.effectiveBranchLimit,
+        branchOverLimit: branchUsage.overLimit,
+        branchAtLimit: branchUsage.atLimit,
+        canAddBranch: branchUsage.canAddBranch,
       },
     });
   } catch (err) {
@@ -593,6 +730,7 @@ async function getRenewalPaymentStatus(req, res) {
         tierKey: true,
         cycleKey: true,
         staffLimit: true,
+        branchLimit: true,
         priceAmount: true,
       },
     });
@@ -617,6 +755,9 @@ async function getRenewalPaymentStatus(req, res) {
         tierKey: payment.tierKey || null,
         cycleKey: payment.cycleKey || null,
         staffLimit: Number.isFinite(Number(payment.staffLimit)) ? Number(payment.staffLimit) : null,
+        branchLimit: Number.isFinite(Number(payment.branchLimit))
+          ? Number(payment.branchLimit)
+          : null,
         priceAmount: Number.isFinite(Number(payment.priceAmount))
           ? Number(payment.priceAmount)
           : null,
@@ -640,21 +781,35 @@ async function getBillingUsage(req, res) {
       return res.status(400).json({ message: "tenantId is required" });
     }
 
-    const [subscription, activeUsers] = await Promise.all([
+    const [subscription, activeUsers, activeBranches] = await Promise.all([
       getSubscriptionOrThrow(tenantId),
       countActiveBillableUsers(tenantId),
+      countActiveBranches(tenantId),
     ]);
 
     const staffLimit = Number.isFinite(Number(subscription.staffLimit))
       ? Number(subscription.staffLimit)
       : null;
 
+    const branchUsage = computeBranchUsage(subscription, activeBranches);
+
     return res.json({
       tenantId,
       activeStaff: activeUsers,
       staffLimit,
       overLimit: staffLimit != null ? Number(activeUsers) > Number(staffLimit) : false,
-      subscription: serializeSubscription(subscription, activeUsers),
+      activeBranches,
+      branchLimit:
+        Number.isFinite(Number(subscription.branchLimit)) ? Number(subscription.branchLimit) : null,
+      extraBranchCount:
+        Number.isFinite(Number(subscription.extraBranchCount))
+          ? Number(subscription.extraBranchCount)
+          : 0,
+      effectiveBranchLimit: branchUsage.effectiveBranchLimit,
+      branchOverLimit: branchUsage.overLimit,
+      branchAtLimit: branchUsage.atLimit,
+      canAddBranch: branchUsage.canAddBranch,
+      subscription: serializeSubscription(subscription, activeUsers, activeBranches),
     });
   } catch (err) {
     console.error("getBillingUsage error:", err);

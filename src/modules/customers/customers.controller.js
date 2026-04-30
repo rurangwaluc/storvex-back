@@ -20,6 +20,97 @@ function safeNumber(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function cleanString(value) {
+  const s = String(value || "").trim();
+  return s || null;
+}
+
+function canViewAllBranches(req) {
+  return Boolean(req.user?.canViewAllBranches);
+}
+
+function getActiveBranchId(req) {
+  return req.user?.branchId || req.branch?.id || null;
+}
+
+function resolveCustomerBranchScope(req) {
+  const requestedBranchId =
+    cleanString(req.query?.branchId) ||
+    cleanString(req.headers["x-branch-id"]) ||
+    null;
+
+  const allBranchesRequested =
+    String(req.query?.allBranches || "")
+      .trim()
+      .toLowerCase() === "true";
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (allBranchesRequested) {
+    if (!canViewAllBranches(req)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "ALL_BRANCHES",
+      branchId: null,
+      allowedBranchIds,
+    };
+  }
+
+  if (requestedBranchId) {
+    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "SINGLE_BRANCH",
+      branchId: requestedBranchId,
+      allowedBranchIds,
+    };
+  }
+
+  return {
+    mode: "SINGLE_BRANCH",
+    branchId: getActiveBranchId(req),
+    allowedBranchIds,
+  };
+}
+
+function applySaleBranchScope(where, scope) {
+  const next = { ...(where || {}) };
+  if (scope?.mode === "SINGLE_BRANCH" && scope?.branchId) {
+    next.branchId = scope.branchId;
+  }
+  return next;
+}
+
+function customerSelectShape() {
+  return {
+    id: true,
+    tenantId: true,
+    name: true,
+    phone: true,
+    createdAt: true,
+    updatedAt: true,
+    ...(typeof prisma.customer.fields?.email !== "undefined" ? { email: true } : {}),
+    ...(typeof prisma.customer.fields?.address !== "undefined" ? { address: true } : {}),
+    ...(typeof prisma.customer.fields?.tinNumber !== "undefined" ? { tinNumber: true } : {}),
+    ...(typeof prisma.customer.fields?.idNumber !== "undefined" ? { idNumber: true } : {}),
+    ...(typeof prisma.customer.fields?.notes !== "undefined" ? { notes: true } : {}),
+    ...(typeof prisma.customer.fields?.whatsappOptIn !== "undefined"
+      ? { whatsappOptIn: true }
+      : {}),
+    ...(typeof prisma.customer.fields?.isActive !== "undefined" ? { isActive: true } : {}),
+  };
+}
+
 // CREATE
 async function createCustomer(req, res) {
   const {
@@ -35,12 +126,12 @@ async function createCustomer(req, res) {
 
   const cleanName = normalizeText(name);
   const cleanPhone = normalizePhone(phone);
+  const tenantId = req.user?.tenantId;
 
   if (!cleanName || !cleanPhone) {
     return res.status(400).json({ message: "Name and phone are required" });
   }
 
-  const tenantId = req.user?.tenantId;
   if (!tenantId) {
     return res.status(400).json({ message: "Tenant ID is missing" });
   }
@@ -61,6 +152,7 @@ async function createCustomer(req, res) {
           : {}),
         ...(typeof prisma.customer.fields?.isActive !== "undefined" ? { isActive: true } : {}),
       },
+      select: customerSelectShape(),
     });
 
     return res.status(201).json(customer);
@@ -74,7 +166,7 @@ async function createCustomer(req, res) {
   }
 }
 
-// SEARCH / READ ALL
+// LIST / SEARCH
 async function getCustomers(req, res) {
   try {
     const tenantId = req.user?.tenantId;
@@ -82,9 +174,9 @@ async function getCustomers(req, res) {
       return res.status(400).json({ message: "Tenant ID is missing" });
     }
 
+    const scope = resolveCustomerBranchScope(req);
     const q = String(req.query.q || "").trim();
-    const includeInactive =
-      String(req.query.includeInactive || "").toLowerCase() === "true";
+    const includeInactive = String(req.query.includeInactive || "").toLowerCase() === "true";
 
     const where = {
       tenantId,
@@ -114,33 +206,46 @@ async function getCustomers(req, res) {
       prisma.customer.findMany({
         where,
         orderBy: { createdAt: "desc" },
+        select: customerSelectShape(),
       }),
       prisma.sale.groupBy({
         by: ["customerId"],
-        where: {
-          tenantId,
-          saleType: "CREDIT",
-          balanceDue: { gt: 0 },
-          customerId: { not: null },
-        },
+        where: applySaleBranchScope(
+          {
+            tenantId,
+            saleType: "CREDIT",
+            balanceDue: { gt: 0 },
+            customerId: { not: null },
+            isCancelled: false,
+          },
+          scope
+        ),
         _sum: { balanceDue: true },
       }),
     ]);
 
-    const map = new Map();
+    const outstandingByCustomerId = new Map();
     for (const row of creditAgg) {
       if (row.customerId) {
-        map.set(row.customerId, safeNumber(row._sum.balanceDue, 0));
+        outstandingByCustomerId.set(row.customerId, safeNumber(row._sum?.balanceDue, 0));
       }
     }
 
-    const enriched = customers.map((c) => ({
-      ...c,
-      outstanding: map.get(c.id) || 0,
+    const enriched = customers.map((customer) => ({
+      ...customer,
+      outstanding: outstandingByCustomerId.get(customer.id) || 0,
     }));
 
-    return res.json(enriched);
+    return res.json({
+      customers: enriched,
+      count: enriched.length,
+      branchScope: scope,
+    });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("Failed to fetch customers", err);
     return res.status(500).json({ message: "Failed to fetch customers" });
   }
@@ -152,7 +257,11 @@ async function getCustomerById(req, res) {
 
   try {
     const customer = await prisma.customer.findFirst({
-      where: { id, tenantId: req.user.tenantId },
+      where: {
+        id,
+        tenantId: req.user?.tenantId,
+      },
+      select: customerSelectShape(),
     });
 
     if (!customer) {
@@ -193,8 +302,7 @@ async function updateCustomer(req, res) {
       ...(whatsappOptIn !== undefined
         ? { whatsappOptIn: normalizeBoolean(whatsappOptIn, false) }
         : {}),
-      ...(isActive !== undefined &&
-      typeof prisma.customer.fields?.isActive !== "undefined"
+      ...(isActive !== undefined && typeof prisma.customer.fields?.isActive !== "undefined"
         ? { isActive: Boolean(isActive) }
         : {}),
     };
@@ -204,7 +312,7 @@ async function updateCustomer(req, res) {
     }
 
     const updated = await prisma.customer.updateMany({
-      where: { id, tenantId: req.user.tenantId },
+      where: { id, tenantId: req.user?.tenantId },
       data,
     });
 
@@ -213,7 +321,8 @@ async function updateCustomer(req, res) {
     }
 
     const customer = await prisma.customer.findFirst({
-      where: { id, tenantId: req.user.tenantId },
+      where: { id, tenantId: req.user?.tenantId },
+      select: customerSelectShape(),
     });
 
     return res.json(customer);
@@ -227,7 +336,7 @@ async function updateCustomer(req, res) {
   }
 }
 
-// REACTIVATE CUSTOMER
+// REACTIVATE
 async function reactivateCustomer(req, res) {
   const { id } = req.params;
 
@@ -239,7 +348,11 @@ async function reactivateCustomer(req, res) {
     }
 
     const result = await prisma.customer.updateMany({
-      where: { id, tenantId: req.user.tenantId, isActive: false },
+      where: {
+        id,
+        tenantId: req.user?.tenantId,
+        isActive: false,
+      },
       data: { isActive: true },
     });
 
@@ -248,7 +361,8 @@ async function reactivateCustomer(req, res) {
     }
 
     const customer = await prisma.customer.findFirst({
-      where: { id, tenantId: req.user.tenantId },
+      where: { id, tenantId: req.user?.tenantId },
+      select: customerSelectShape(),
     });
 
     return res.json(customer);
@@ -258,7 +372,7 @@ async function reactivateCustomer(req, res) {
   }
 }
 
-// SOFT DELETE (DEACTIVATE)
+// DEACTIVATE
 async function deactivateCustomer(req, res) {
   const { id } = req.params;
 
@@ -270,7 +384,11 @@ async function deactivateCustomer(req, res) {
     }
 
     const result = await prisma.customer.updateMany({
-      where: { id, tenantId: req.user.tenantId, isActive: true },
+      where: {
+        id,
+        tenantId: req.user?.tenantId,
+        isActive: true,
+      },
       data: { isActive: false },
     });
 
@@ -285,17 +403,12 @@ async function deactivateCustomer(req, res) {
   }
 }
 
-/**
- * GET /api/customers/:id/ledger
- * Shows:
- * - all sales for customer
- * - payments per sale
- * - totals (total credit, paid, outstanding)
- */
+// LEDGER
 async function getCustomerLedger(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = req.user?.tenantId;
     const { id: customerId } = req.params;
+    const scope = resolveCustomerBranchScope(req);
 
     const customer = await prisma.customer.findFirst({
       where: { id: customerId, tenantId },
@@ -316,10 +429,18 @@ async function getCustomerLedger(req, res) {
     }
 
     const sales = await prisma.sale.findMany({
-      where: { tenantId, customerId },
+      where: applySaleBranchScope(
+        {
+          tenantId,
+          customerId,
+          isCancelled: false,
+        },
+        scope
+      ),
       orderBy: { createdAt: "desc" },
       select: {
         id: true,
+        branchId: true,
         createdAt: true,
         total: true,
         saleType: true,
@@ -329,6 +450,15 @@ async function getCustomerLedger(req, res) {
         dueDate: true,
         receiptNumber: true,
         invoiceNumber: true,
+        branch: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+            status: true,
+            isMain: true,
+          },
+        },
         items: {
           select: {
             quantity: true,
@@ -338,7 +468,13 @@ async function getCustomerLedger(req, res) {
         },
         payments: {
           orderBy: { createdAt: "asc" },
-          select: { amount: true, method: true, createdAt: true, note: true },
+          select: {
+            amount: true,
+            method: true,
+            createdAt: true,
+            note: true,
+            branchId: true,
+          },
         },
       },
     });
@@ -348,17 +484,20 @@ async function getCustomerLedger(req, res) {
     let totalPaid = 0;
     let totalOutstanding = 0;
 
-    for (const s of sales) {
-      totalAll += safeNumber(s.total, 0);
-      totalPaid += safeNumber(s.amountPaid, 0);
-      if (s.saleType === "CREDIT") {
-        totalCredit += safeNumber(s.total, 0);
+    for (const sale of sales) {
+      totalAll += safeNumber(sale.total, 0);
+      totalPaid += safeNumber(sale.amountPaid, 0);
+
+      if (sale.saleType === "CREDIT") {
+        totalCredit += safeNumber(sale.total, 0);
       }
-      totalOutstanding += safeNumber(s.balanceDue, 0);
+
+      totalOutstanding += safeNumber(sale.balanceDue, 0);
     }
 
     return res.json({
       customer,
+      branchScope: scope,
       summary: {
         totalSales: sales.length,
         totalAll,
@@ -369,35 +508,58 @@ async function getCustomerLedger(req, res) {
       sales,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("Failed to fetch ledger", err);
     return res.status(500).json({ message: "Failed to fetch ledger" });
   }
 }
 
-/**
- * GET /api/customers/ledger/summary/outstanding
- * Returns top debtors + overall totals
- */
+// CREDIT SUMMARY
 async function getCreditSummary(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = req.user?.tenantId;
+    const scope = resolveCustomerBranchScope(req);
 
     const totals = await prisma.sale.aggregate({
-      where: { tenantId, saleType: "CREDIT" },
-      _sum: { balanceDue: true, total: true, amountPaid: true },
-      _count: { _all: true },
+      where: applySaleBranchScope(
+        {
+          tenantId,
+          saleType: "CREDIT",
+          isCancelled: false,
+        },
+        scope
+      ),
+      _sum: {
+        balanceDue: true,
+        total: true,
+        amountPaid: true,
+      },
+      _count: {
+        _all: true,
+      },
     });
 
     const grouped = await prisma.sale.groupBy({
       by: ["customerId"],
-      where: {
-        tenantId,
-        saleType: "CREDIT",
-        balanceDue: { gt: 0 },
-        customerId: { not: null },
+      where: applySaleBranchScope(
+        {
+          tenantId,
+          saleType: "CREDIT",
+          balanceDue: { gt: 0 },
+          customerId: { not: null },
+          isCancelled: false,
+        },
+        scope
+      ),
+      _sum: {
+        balanceDue: true,
       },
-      _sum: { balanceDue: true },
-      orderBy: { _sum: { balanceDue: "desc" } },
+      orderBy: {
+        _sum: { balanceDue: "desc" },
+      },
       take: 10,
     });
 
@@ -413,31 +575,36 @@ async function getCreditSummary(req, res) {
       },
     });
 
-    const cMap = new Map(customers.map((c) => [c.id, c]));
+    const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
 
-    const topDebtors = grouped.map((g) => ({
+    const topDebtors = grouped.map((group) => ({
       customer:
-        cMap.get(g.customerId) || {
-          id: g.customerId,
+        customerMap.get(group.customerId) || {
+          id: group.customerId,
           name: "Unknown",
           phone: "",
           ...(typeof prisma.customer.fields?.isActive !== "undefined"
             ? { isActive: false }
             : {}),
         },
-      outstanding: safeNumber(g._sum.balanceDue, 0),
+      outstanding: safeNumber(group._sum?.balanceDue, 0),
     }));
 
     return res.json({
+      branchScope: scope,
       totals: {
-        creditSalesCount: totals._count._all,
-        totalCredit: safeNumber(totals._sum.total, 0),
-        totalPaid: safeNumber(totals._sum.amountPaid, 0),
-        totalOutstanding: safeNumber(totals._sum.balanceDue, 0),
+        creditSalesCount: totals._count?._all || 0,
+        totalCredit: safeNumber(totals._sum?.total, 0),
+        totalPaid: safeNumber(totals._sum?.amountPaid, 0),
+        totalOutstanding: safeNumber(totals._sum?.balanceDue, 0),
       },
       topDebtors,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("Failed to fetch credit summary", err);
     return res.status(500).json({ message: "Failed to fetch credit summary" });
   }

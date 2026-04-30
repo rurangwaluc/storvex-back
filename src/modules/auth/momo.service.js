@@ -197,6 +197,8 @@ async function getSubscriptionOrThrow(tenantId) {
       tierKey: true,
       cycleKey: true,
       staffLimit: true,
+      branchLimit: true,
+      extraBranchCount: true,
       priceAmount: true,
       currency: true,
       startDate: true,
@@ -392,6 +394,7 @@ async function createOrUpdateOwnerSignupPayment({
         tierKey: snap.tierKey,
         cycleKey: snap.cycleKey,
         staffLimit: snap.staffLimit,
+        branchLimit: snap.branchLimit,
         priceAmount: snap.price,
       },
       select: {
@@ -409,6 +412,7 @@ async function createOrUpdateOwnerSignupPayment({
         tierKey: true,
         cycleKey: true,
         staffLimit: true,
+        branchLimit: true,
         priceAmount: true,
       },
     });
@@ -438,6 +442,7 @@ async function createOrUpdateRenewalPayment({
       tierKey: snap.tierKey,
       cycleKey: snap.cycleKey,
       staffLimit: snap.staffLimit,
+      branchLimit: snap.branchLimit,
       priceAmount: snap.price,
     },
     select: {
@@ -455,6 +460,7 @@ async function createOrUpdateRenewalPayment({
       tierKey: true,
       cycleKey: true,
       staffLimit: true,
+      branchLimit: true,
       priceAmount: true,
     },
   });
@@ -501,40 +507,41 @@ async function createPaymentFromPlan(intentId, planKey, phone) {
     let finalPayment = payment;
 
     if (providerResult?.mock) {
-  const [updatedPayment] = await prisma.$transaction([
-    prisma.payment.update({
-      where: { reference: payment.reference },
-      data: {
-        status: "SUCCESS",
-      },
-      select: {
-        id: true,
-        intentId: true,
-        amount: true,
-        currency: true,
-        reference: true,
-        provider: true,
-        status: true,
-        purpose: true,
-        createdAt: true,
-        updatedAt: true,
-        planKey: true,
-        tierKey: true,
-        cycleKey: true,
-        staffLimit: true,
-        priceAmount: true,
-      },
-    }),
-    prisma.ownerIntent.update({
-      where: { id: intent.id },
-      data: {
-        status: "PAID",
-      },
-    }),
-  ]);
+      const [updatedPayment] = await prisma.$transaction([
+        prisma.payment.update({
+          where: { reference: payment.reference },
+          data: {
+            status: "SUCCESS",
+          },
+          select: {
+            id: true,
+            intentId: true,
+            amount: true,
+            currency: true,
+            reference: true,
+            provider: true,
+            status: true,
+            purpose: true,
+            createdAt: true,
+            updatedAt: true,
+            planKey: true,
+            tierKey: true,
+            cycleKey: true,
+            staffLimit: true,
+            branchLimit: true,
+            priceAmount: true,
+          },
+        }),
+        prisma.ownerIntent.update({
+          where: { id: intent.id },
+          data: {
+            status: "PAID",
+          },
+        }),
+      ]);
 
-  finalPayment = updatedPayment;
-}
+      finalPayment = updatedPayment;
+    }
 
     return {
       ok: true,
@@ -615,6 +622,7 @@ async function createRenewalPaymentFromPlan(tenantId, planKey, phone) {
           tierKey: true,
           cycleKey: true,
           staffLimit: true,
+          branchLimit: true,
           priceAmount: true,
         },
       });
@@ -660,6 +668,7 @@ async function getPaymentStatus(reference) {
       tierKey: true,
       cycleKey: true,
       staffLimit: true,
+      branchLimit: true,
       priceAmount: true,
     },
   });

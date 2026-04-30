@@ -1,5 +1,22 @@
 "use strict";
+/**
+ * documentRender.service.js
+ *
+ * Produces A4-ready HTML for receipts, invoices, proformas, delivery notes,
+ * and warranty certificates. The design matches the Document Centre mockup:
+ *
+ *   • Flat white card — no hero gradients or decorative curves
+ *   • Header: brand name in primary color (left) + document type large bold (right)
+ *   • Horizontal rule in primary color
+ *   • 3-column info strip: Billed To | Payment / Details | Issued By
+ *   • Items table: # | PRODUCT | SKU | QTY | UNIT PRICE | SUBTOTAL
+ *   • Totals inline right: Subtotal plain, Amount Paid green, Balance Due amber + large
+ *   • Footer: Terms left | Authorized Signature right
+ *   • Tenant brand color applied to accents, rule, logo fallback, totals gradient
+ *   • Print-safe: @media print hides action buttons, removes margin/shadow
+ */
 
+// ─── Escape ───────────────────────────────────────────────────────────────────
 function esc(s) {
   return String(s ?? "")
     .replaceAll("&", "&amp;")
@@ -9,1422 +26,1002 @@ function esc(s) {
     .replaceAll("'", "&#039;");
 }
 
-function cleanString(x) {
+function cleanStr(x) {
   const s = String(x ?? "").trim();
   return s || "";
 }
 
-function normalizeHexColor(input, fallback = "#0F4C81") {
-  const value = cleanString(input);
-  if (!value) return fallback;
-
-  const normalized = value.startsWith("#") ? value : `#${value}`;
-
-  if (/^#[0-9a-fA-F]{6}$/.test(normalized)) return normalized.toUpperCase();
-
-  if (/^#[0-9a-fA-F]{3}$/.test(normalized)) {
-    const r = normalized[1];
-    const g = normalized[2];
-    const b = normalized[3];
+// ─── Color helpers ────────────────────────────────────────────────────────────
+function normalizeHexColor(input, fallback = "#1a56db") {
+  const v = cleanStr(input);
+  if (!v) return fallback;
+  const n = v.startsWith("#") ? v : `#${v}`;
+  if (/^#[0-9a-fA-F]{6}$/.test(n)) return n.toUpperCase();
+  if (/^#[0-9a-fA-F]{3}$/.test(n)) {
+    const [, r, g, b] = n;
     return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
   }
-
   return fallback;
 }
 
-function hexToRgb(hex, fallback = { r: 15, g: 76, b: 129 }) {
-  const safe = normalizeHexColor(hex, "#0F4C81");
-  const match = safe.match(/^#([0-9a-fA-F]{6})$/);
-  if (!match) return fallback;
-
-  const value = match[1];
+function hexToRgb(hex) {
+  const safe = normalizeHexColor(hex, "#1a56db");
+  const m    = safe.match(/^#([0-9a-fA-F]{6})$/);
+  if (!m) return { r: 26, g: 86, b: 219 };
   return {
-    r: parseInt(value.slice(0, 2), 16),
-    g: parseInt(value.slice(2, 4), 16),
-    b: parseInt(value.slice(4, 6), 16),
+    r: parseInt(m[1].slice(0,2), 16),
+    g: parseInt(m[1].slice(2,4), 16),
+    b: parseInt(m[1].slice(4,6), 16),
   };
 }
 
 function rgba(hex, alpha = 1) {
   const { r, g, b } = hexToRgb(hex);
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  return `rgba(${r},${g},${b},${alpha})`;
 }
 
+// ─── Format helpers ───────────────────────────────────────────────────────────
 function money(n, currency = "RWF") {
-  const value = Number(n || 0);
-  return `${currency} ${value.toLocaleString()}`;
+  return `${currency} ${Number(n || 0).toLocaleString()}`;
 }
 
 function fmtDate(d) {
   if (!d) return "—";
-
   try {
-    return new Date(d).toLocaleDateString("en-GB", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    });
-  } catch {
-    return "—";
-  }
+    return new Date(d).toLocaleDateString("en-GB", { year:"numeric", month:"2-digit", day:"2-digit" });
+  } catch { return "—"; }
 }
 
 function fmtDateLong(d) {
   if (!d) return "—";
-
   try {
-    return new Date(d).toLocaleDateString("en-GB", {
-      year: "numeric",
-      month: "short",
-      day: "2-digit",
-    });
-  } catch {
-    return "—";
-  }
+    return new Date(d).toLocaleDateString("en-GB", { year:"numeric", month:"short", day:"2-digit" });
+  } catch { return "—"; }
 }
 
 function fmtDateTime(d) {
   if (!d) return "—";
-
-  try {
-    return new Date(d).toLocaleString("en-GB");
-  } catch {
-    return "—";
-  }
+  try { return new Date(d).toLocaleString("en-GB"); } catch { return "—"; }
 }
 
+// ─── Item normalizer ──────────────────────────────────────────────────────────
 function normalizeItems(items = []) {
   if (!Array.isArray(items)) return [];
-
-  return items.map((it) => {
-    const quantity = Number(it.quantity || 0);
+  return items.map(it => {
+    const qty       = Number(it.quantity || 0);
     const unitPrice = Number(it.unitPrice ?? it.price ?? 0);
-    const total = Number(it.total ?? quantity * unitPrice);
-
+    const total     = Number(it.total ?? qty * unitPrice);
     return {
-      productName: cleanString(it.productName || it.name || it.product || "—"),
-      serial: cleanString(it.serial || it.imei1 || ""),
-      sku: cleanString(it.sku || ""),
-      barcode: cleanString(it.barcode || ""),
-      quantity,
-      unitPrice,
-      total,
+      productName: cleanStr(it.productName || it.name || it.product || "—"),
+      serial:      cleanStr(it.serial || it.imei1 || ""),
+      sku:         cleanStr(it.sku || ""),
+      barcode:     cleanStr(it.barcode || ""),
+      quantity: qty, unitPrice, total,
     };
   });
 }
 
-function computeTotals(items = [], providedTotals = {}, fallbackCurrency = "RWF") {
-  const subtotal =
-    providedTotals.subtotal != null
-      ? Number(providedTotals.subtotal || 0)
-      : items.reduce((sum, it) => sum + Number(it.total || 0), 0);
-
-  const total =
-    providedTotals.total != null ? Number(providedTotals.total || 0) : subtotal;
-
-  const amountPaid = Number(providedTotals.amountPaid || 0);
-
-  const balanceDue =
-    providedTotals.balanceDue != null
-      ? Number(providedTotals.balanceDue || 0)
-      : Math.max(0, total - amountPaid);
-
+// ─── Totals computer ─────────────────────────────────────────────────────────
+function computeTotals(items = [], provided = {}, fallbackCurrency = "RWF") {
+  const subtotal   = provided.subtotal != null ? Number(provided.subtotal || 0)
+                   : items.reduce((s, it) => s + Number(it.total || 0), 0);
+  const total      = provided.total    != null ? Number(provided.total    || 0) : subtotal;
+  const amountPaid = Number(provided.amountPaid || 0);
+  const balanceDue = provided.balanceDue != null ? Number(provided.balanceDue || 0)
+                   : Math.max(0, total - amountPaid);
   return {
-    currency: cleanString(providedTotals.currency || fallbackCurrency || "RWF"),
-    subtotal,
-    total,
-    amountPaid,
-    balanceDue,
+    currency: cleanStr(provided.currency || fallbackCurrency || "RWF"),
+    subtotal, total, amountPaid, balanceDue,
   };
 }
 
+// ─── Brand theme ──────────────────────────────────────────────────────────────
 function resolveBrandTheme(tenant = {}, overrides = {}) {
   const primary = normalizeHexColor(
-    overrides.primaryColor ||
-      tenant.documentPrimaryColor ||
-      tenant.brandColor ||
-      "#0F4C81",
-    "#0F4C81"
+    overrides.primaryColor || tenant.documentPrimaryColor || tenant.brandColor,
+    "#1a56db"
   );
-
-  const accent = normalizeHexColor(
-    overrides.accentColor ||
-      tenant.documentAccentColor ||
-      "#E8EEF5",
-    "#E8EEF5"
-  );
-
   return {
     primary,
-    accent,
-    ink: "#0F172A",
-    inkSoft: "#334155",
-    muted: "#64748B",
-    line: "#D9E3EF",
-    lineStrong: "#C9D5E4",
-    soft: "#F8FAFC",
-    softAlt: "#F1F5F9",
-    pageBg: "#FFFFFF",
-
-    primarySoft: rgba(primary, 0.08),
-    primaryBorder: rgba(primary, 0.22),
-    primaryDeep: rgba(primary, 0.96),
-    primaryMuted: rgba(primary, 0.16),
-
-    accentSoft: rgba(accent, 0.72),
-    accentStrong: rgba(accent, 0.96),
-
-    heroGlow: rgba(primary, 0.20),
-    shadow: "0 26px 80px rgba(15, 23, 42, 0.16)",
+    primarySoft:   rgba(primary, 0.08),
+    primaryBorder: rgba(primary, 0.25),
+    primaryDeep:   rgba(primary, 0.96),
+    ink:      "#0f172a",
+    inkSoft:  "#334155",
+    muted:    "#64748b",
+    line:     "#e2e8f0",
+    soft:     "#f8fafc",
+    softAlt:  "#f1f5f9",
+    green:    "#059669",
+    greenBg:  "#d1fae5",
+    amber:    "#d97706",
+    amberBg:  "#fef3c7",
+    danger:   "#dc2626",
+    dangerBg: "#fee2e2",
   };
 }
 
-function logoHtml(tenant) {
-  if (tenant?.logoSignedUrl) {
-    return `<img class="logoImg" src="${esc(tenant.logoSignedUrl)}" alt="Logo" />`;
-  }
-
-  if (tenant?.logoUrl) {
-    return `<img class="logoImg" src="${esc(tenant.logoUrl)}" alt="Logo" />`;
-  }
-
-  const letter = cleanString(tenant?.name || "S").charAt(0).toUpperCase() || "S";
-  return `<div class="logoFallback">${esc(letter)}</div>`;
+// ─── Logo HTML ────────────────────────────────────────────────────────────────
+function logoHtml(tenant, theme) {
+  if (tenant?.logoSignedUrl) return `<img class="logo" src="${esc(tenant.logoSignedUrl)}" alt="Logo" />`;
+  if (tenant?.logoUrl)       return `<img class="logo" src="${esc(tenant.logoUrl)}" alt="Logo" />`;
+  const letter = cleanStr(tenant?.name || "S").charAt(0).toUpperCase() || "S";
+  return `<div class="logoFallback" style="background:${theme.primary}">${esc(letter)}</div>`;
 }
 
-function commonStyles(theme = resolveBrandTheme()) {
+// ─── Status badge ─────────────────────────────────────────────────────────────
+function badgeHtml(status, theme) {
+  if (!status) return "";
+  const s = String(status).toUpperCase();
+  let bg, color, border;
+  if (["PAID","COMPLETED","ACTIVE","DELIVERED","SENT","CONVERTED"].includes(s)) {
+    bg = "#d1fae5"; color = "#065f46"; border = "#6ee7b7";
+  } else if (["PARTIAL","PARTIALLY PAID","DRAFT","PENDING","PROFORMA","INVOICE"].includes(s)) {
+    bg = "#fef3c7"; color = "#92400e"; border = "#fcd34d";
+  } else if (["OVERDUE","EXPIRED","CANCELLED","RETURNED"].includes(s)) {
+    bg = "#fee2e2"; color = "#991b1b"; border = "#fca5a5";
+  } else if (s === "WARRANTY" || s === "DELIVERY") {
+    bg = theme.primarySoft; color = theme.primary; border = theme.primaryBorder;
+  } else {
+    bg = theme.primarySoft; color = theme.primary; border = theme.primaryBorder;
+  }
+  return `<span class="badge" style="background:${bg};color:${color};border-color:${border}">${esc(status)}</span>`;
+}
+
+// ─── Global styles ────────────────────────────────────────────────────────────
+function buildStyles(theme) {
   return `
 <style>
-:root{
-  --ink:${theme.ink};
-  --ink-soft:${theme.inkSoft};
-  --muted:${theme.muted};
-  --line:${theme.line};
-  --line-strong:${theme.lineStrong};
-  --soft:${theme.soft};
-  --soft-alt:${theme.softAlt};
-  --page-bg:${theme.pageBg};
-
-  --brand:${theme.primary};
-  --brand-deep:${theme.primaryDeep};
-  --brand-soft:${theme.primarySoft};
-  --brand-muted:${theme.primaryMuted};
-  --brand-border:${theme.primaryBorder};
-  --accent:${theme.accent};
-  --accent-soft:${theme.accentSoft};
-  --accent-strong:${theme.accentStrong};
-
-  --hero-glow:${theme.heroGlow};
-  --page-shadow:${theme.shadow};
-}
-
-*{ box-sizing:border-box; }
-
-html,body{
-  margin:0;
-  padding:0;
-  background:#EEF2F7;
-  color:var(--ink);
-  font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}
-
-body{
-  -webkit-print-color-adjust:exact;
-  print-color-adjust:exact;
-}
-
-.pageWrap{
-  padding:24px;
-}
-
-.actions{
-  width:210mm;
-  margin:0 auto 14px auto;
-  display:flex;
-  justify-content:flex-end;
-  gap:10px;
-}
-
-.btn{
-  border:1px solid var(--line);
-  background:#fff;
-  color:var(--ink);
-  padding:10px 14px;
-  border-radius:14px;
-  font-size:12px;
-  font-weight:700;
-  cursor:pointer;
-}
-
-.btn.primary{
-  background:var(--brand);
-  border-color:var(--brand);
-  color:#fff;
-}
-
-.page{
-  width:210mm;
-  min-height:297mm;
-  margin:0 auto;
-  background:var(--page-bg);
-  position:relative;
-  overflow:hidden;
-  box-shadow:var(--page-shadow);
-}
-
-.pageInner{
-  position:relative;
-  min-height:297mm;
-}
-
-.hero{
-  position:relative;
-  min-height:86mm;
-  padding:18mm 18mm 10mm 18mm;
-  background:
-    radial-gradient(90mm 35mm at 86% 0%, rgba(255,255,255,.18) 0%, rgba(255,255,255,0) 62%),
-    linear-gradient(135deg, var(--brand-deep) 0%, var(--brand) 100%);
-  color:#fff;
-  overflow:hidden;
-}
-
-.heroGlow{
-  position:absolute;
-  right:-12mm;
-  top:-14mm;
-  width:72mm;
-  height:72mm;
-  border-radius:50%;
-  background:var(--hero-glow);
-  filter:blur(14px);
-}
-
-.heroCurveShadowA{
-  position:absolute;
-  left:-14%;
-  right:-8%;
-  bottom:-44mm;
-  height:74mm;
-  background:rgba(15,23,42,.07);
-  filter:blur(8px);
-  border-radius:50%;
-}
-
-.heroCurveA{
-  position:absolute;
-  left:-14%;
-  right:-8%;
-  bottom:-40mm;
-  height:70mm;
-  background:rgba(255,255,255,.98);
-  border-radius:50%;
-  box-shadow:0 -8px 18px rgba(15,23,42,.06);
-}
-
-.heroCurveB{
-  position:absolute;
-  left:18%;
-  right:-25%;
-  bottom:-52mm;
-  height:86mm;
-  background:var(--accent-soft);
-  border-radius:50%;
-  opacity:.92;
-}
-
-.heroRow{
-  position:relative;
-  z-index:3;
-  display:flex;
-  align-items:flex-start;
-  justify-content:space-between;
-  gap:18px;
-}
-
-.docTitleBlock{
-  flex:1 1 auto;
-  min-width:0;
-}
-
-.docTitle{
-  margin:0;
-  font-size:30px;
-  line-height:1;
-  font-weight:950;
-  letter-spacing:2.8px;
-  text-transform:uppercase;
-}
-
-.docSubtitle{
-  margin-top:8px;
-  font-size:12px;
-  line-height:1.5;
-  max-width:78mm;
-  color:rgba(255,255,255,.88);
-}
-
-.brand{
-  display:flex;
-  gap:12px;
-  align-items:center;
-  min-width:0;
-  justify-content:flex-end;
-}
-
-.logoImg{
-  width:54px;
-  height:54px;
-  border-radius:16px;
-  object-fit:cover;
-  background:#fff;
-  border:1px solid rgba(255,255,255,.42);
-}
-
-.logoFallback{
-  width:54px;
-  height:54px;
-  border-radius:16px;
-  background:rgba(255,255,255,.18);
-  border:1px solid rgba(255,255,255,.35);
-  color:#fff;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  font-weight:900;
-  font-size:18px;
-  letter-spacing:.4px;
-}
-
-.brandText{
-  min-width:0;
-  text-align:right;
-}
-
-.brandName{
-  margin:0;
-  font-size:17px;
-  font-weight:850;
-  letter-spacing:.3px;
-}
-
-.brandMeta{
-  margin-top:4px;
-  font-size:11.5px;
-  line-height:1.5;
-  opacity:.92;
-}
-
-.brandMeta div{
-  white-space:nowrap;
-}
-
-.content{
-  position:relative;
-  z-index:3;
-  padding:4mm 18mm 0 18mm;
-}
-
-.metaTopGrid{
-  display:grid;
-  grid-template-columns:1fr 72mm;
-  gap:16px;
-  margin-top:-2mm;
-}
-
-.partyCard,
-.infoCard,
-.tableShell,
-.noteCard,
-.totalCard,
-.signatureCard{
-  border:1px solid var(--line);
-  background:#fff;
-  border-radius:18px;
-}
-
-.partyCard,
-.infoCard,
-.noteCard,
-.totalCard,
-.signatureCard{
-  padding:14px;
-}
-
-.sectionLabel{
-  margin:0 0 10px 0;
-  font-size:11px;
-  font-weight:850;
-  text-transform:uppercase;
-  letter-spacing:1px;
-  color:var(--muted);
-}
-
-.partyName{
-  font-size:24px;
-  font-weight:900;
-  line-height:1.15;
-  margin:0;
-  color:var(--ink);
-}
-
-.partyMeta{
-  margin-top:8px;
-  display:grid;
-  gap:6px;
-}
-
-.metaRow{
-  display:flex;
-  justify-content:space-between;
-  gap:12px;
-  padding:7px 0;
-  border-bottom:1px dashed #E7EDF5;
-  font-size:12.5px;
-}
-
-.metaRow:last-child{
-  border-bottom:none;
-}
-
-.metaKey{
-  color:var(--muted);
-}
-
-.metaValue{
-  color:var(--ink);
-  font-weight:700;
-  text-align:right;
-}
-
-.infoCard{
-  background:linear-gradient(180deg, #fff 0%, var(--soft) 100%);
-}
-
-.tableSection{
-  padding:14px 18mm 0 18mm;
-  position:relative;
-  z-index:3;
-}
-
-.tableShell{
-  overflow:hidden;
-}
-
-table{
-  width:100%;
-  border-collapse:collapse;
-}
-
-thead th{
-  padding:12px 14px;
-  font-size:12px;
-  text-align:left;
-  font-weight:850;
-  letter-spacing:.4px;
-  color:#1E293B;
-  background:linear-gradient(180deg, var(--soft-alt) 0%, var(--accent) 100%);
-  border-bottom:1px solid var(--line-strong);
-}
-
-tbody td{
-  padding:14px;
-  border-bottom:1px solid #EDF2F7;
-  font-size:12.5px;
-  vertical-align:top;
-  color:var(--ink);
-}
-
-tbody tr:last-child td{
-  border-bottom:none;
-}
-
-.tdNo{
-  width:48px;
-  text-align:center;
-  color:var(--muted);
-}
-
-.tdQty{
-  width:80px;
-  text-align:right;
-  font-weight:800;
-}
-
-.tdMoney{
-  width:132px;
-  text-align:right;
-  font-weight:800;
-}
-
-.itemName{
-  font-weight:800;
-  color:var(--ink);
-}
-
-.itemMeta{
-  margin-top:4px;
-  font-size:11px;
-  color:var(--muted);
-  line-height:1.5;
-}
-
-.bottomGrid{
-  margin:16px 18mm 0 18mm;
-  display:grid;
-  grid-template-columns:1.18fr .82fr;
-  gap:16px;
-  align-items:start;
-  position:relative;
-  z-index:3;
-}
-
-.noteTitle{
-  font-size:11px;
-  font-weight:850;
-  text-transform:uppercase;
-  letter-spacing:1px;
-  color:var(--muted);
-  margin:0 0 10px 0;
-}
-
-.noteText{
-  font-size:12.5px;
-  color:var(--ink-soft);
-  line-height:1.72;
-  white-space:pre-wrap;
-}
-
-.summaryRows{
-  display:grid;
-  gap:6px;
-}
-
-.totalsRow{
-  display:flex;
-  justify-content:space-between;
-  gap:12px;
-  font-size:12.5px;
-  padding:7px 0;
-}
-
-.totalsLabel{
-  color:var(--muted);
-}
-
-.totalsValue{
-  color:var(--ink);
-  font-weight:800;
-}
-
-.totalsDivider{
-  height:1px;
-  background:var(--line);
-  margin:8px 0 10px 0;
-}
-
-.totalsGrand{
-  border-radius:16px;
-  padding:14px 14px;
-  background:linear-gradient(135deg, var(--brand-deep) 0%, var(--brand) 100%);
-  color:#fff;
-  display:flex;
-  justify-content:space-between;
-  gap:12px;
-  font-size:16px;
-  font-weight:950;
-  letter-spacing:.2px;
-  box-shadow:0 10px 26px rgba(15,23,42,.12);
-}
-
-.signatureArea{
-  padding:16px 18mm 0 18mm;
-  position:relative;
-  z-index:3;
-}
-
-.signatureRow{
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:16px;
-}
-
-.signatureLabel{
-  font-size:11px;
-  font-weight:850;
-  text-transform:uppercase;
-  letter-spacing:1px;
-  color:var(--muted);
-}
-
-.signatureLine{
-  height:36px;
-  border-bottom:1px solid #CBD5E1;
-  margin:14px 0 10px 0;
-}
-
-.signatureMeta{
-  display:flex;
-  justify-content:space-between;
-  gap:12px;
-  font-size:12px;
-  color:var(--muted);
-}
-
-.statusBadge{
-  display:inline-flex;
-  align-items:center;
-  justify-content:center;
-  padding:6px 10px;
-  border-radius:999px;
-  border:1px solid var(--brand-border);
-  background:var(--brand-soft);
-  color:var(--brand);
-  font-size:11px;
-  font-weight:850;
-  letter-spacing:.5px;
-  text-transform:uppercase;
-}
-
-.footerBand{
-  position:absolute;
-  left:0;
-  right:0;
-  bottom:0;
-  height:70mm;
-  pointer-events:none;
-}
-
-.footerCurveShadow{
-  position:absolute;
-  left:-12%;
-  right:-12%;
-  bottom:8mm;
-  height:56mm;
-  background:rgba(15,23,42,.06);
-  filter:blur(10px);
-  border-radius:50%;
-}
-
-.footerCurveA{
-  position:absolute;
-  left:-12%;
-  right:-12%;
-  bottom:10mm;
-  height:52mm;
-  background:rgba(255,255,255,.98);
-  border-radius:50%;
-}
-
-.footerCurveB{
-  position:absolute;
-  left:30%;
-  right:-20%;
-  bottom:6mm;
-  height:60mm;
-  background:var(--accent-soft);
-  border-radius:50%;
-  opacity:.82;
-}
-
-.footerBrand{
-  position:absolute;
-  left:0;
-  right:0;
-  bottom:0;
-  height:42mm;
-  background:linear-gradient(135deg, var(--brand-deep) 0%, var(--brand) 100%);
-}
-
-.footerMeta{
-  position:absolute;
-  left:18mm;
-  right:18mm;
-  bottom:8mm;
-  z-index:4;
-  display:flex;
-  justify-content:space-between;
-  gap:16px;
-  color:#fff;
-  font-size:11px;
-  font-weight:700;
-}
-
-.footerMetaLeft,
-.footerMetaRight{
-  max-width:78mm;
-}
-
-.helperMuted{
-  color:var(--muted);
-}
-
-.emptyCell{
-  padding:18px 14px !important;
-  color:var(--muted);
-  text-align:center;
-}
-
-@media print{
-  html,body{
-    background:#fff !important;
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: #eef2f7;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: ${theme.ink};
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
   }
 
-  .actions{
-    display:none !important;
+  .wrap { padding: 28px 20px 40px; }
+
+  /* ── Print action bar ── */
+  .actions {
+    width: 210mm;
+    margin: 0 auto 14px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .actBtn {
+    height: 36px;
+    padding: 0 16px;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    border: 1px solid ${theme.line};
+    background: #fff;
+    color: ${theme.ink};
+  }
+  .actBtn.primary {
+    background: ${theme.primary};
+    border-color: ${theme.primary};
+    color: #fff;
   }
 
-  .pageWrap{
-    padding:0 !important;
+  /* ── A4 card ── */
+  .page {
+    width: 210mm;
+    /* No min-height — page grows with content, never forces a blank second page */
+    margin: 0 auto;
+    background: #fff;
+    border-radius: 20px;
+    box-shadow: 0 20px 60px rgba(15,23,42,0.14);
+    overflow: hidden;
+    position: relative;
+  }
+  .pageInner {
+    padding: 40px 44px 52px;
+    /* height is determined by content — no min-height */
   }
 
-  .page{
-    width:210mm !important;
-    min-height:297mm !important;
-    box-shadow:none !important;
-    margin:0 !important;
-  }
-}
-
-@media screen and (max-width:900px){
-  .pageWrap{
-    padding:12px;
+  /* ── Header ── */
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 24px;
+    padding-bottom: 24px;
+    border-bottom: 3px solid ${theme.primary};
+    margin-bottom: 28px;
   }
 
-  .actions,
-  .page{
-    width:100%;
+  /* Brand block (left) */
+  .brandBlock { display: flex; align-items: flex-start; gap: 14px; min-width: 0; }
+  .logo {
+    width: 52px; height: 52px; border-radius: 12px;
+    object-fit: cover; flex-shrink: 0;
+    border: 1px solid ${theme.line};
+  }
+  .logoFallback {
+    width: 52px; height: 52px; border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 20px; font-weight: 900; flex-shrink: 0;
+  }
+  .brandName {
+    font-size: 26px;
+    font-weight: 900;
+    letter-spacing: -0.5px;
+    color: ${theme.primary};
+    line-height: 1.1;
+  }
+  .brandSub {
+    margin-top: 3px;
+    font-size: 12px;
+    color: ${theme.muted};
+    line-height: 1.5;
+  }
+  .brandSub div { margin-top: 1px; }
+
+  /* Document type block (right) */
+  .docBlock { text-align: right; flex-shrink: 0; }
+  .docType {
+    font-size: 38px;
+    font-weight: 950;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: ${theme.ink};
+    line-height: 1;
+  }
+  .docNum {
+    margin-top: 8px;
+    font-size: 14px;
+    font-weight: 700;
+    color: ${theme.primary};
+  }
+  .docMeta {
+    margin-top: 4px;
+    font-size: 12px;
+    color: ${theme.muted};
+    line-height: 1.7;
+  }
+  .docMeta div { margin-top: 0; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    margin-top: 6px;
   }
 
-  .hero{
-    padding:18px 16px 42px 16px;
-    min-height:auto;
+  /* ── 3-column info strip ── */
+  .infoStrip {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0;
+    border: 1px solid ${theme.line};
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 28px;
+  }
+  .infoCol {
+    padding: 16px 18px;
+    border-right: 1px solid ${theme.line};
+  }
+  .infoCol:last-child { border-right: none; }
+  .infoLabel {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: ${theme.muted};
+    margin-bottom: 8px;
+  }
+  .infoName {
+    font-size: 15px;
+    font-weight: 800;
+    color: ${theme.ink};
+    margin-bottom: 4px;
+    line-height: 1.3;
+  }
+  .infoLine {
+    font-size: 12.5px;
+    color: ${theme.inkSoft};
+    line-height: 1.6;
   }
 
-  .heroRow{
-    flex-direction:column;
-    gap:16px;
+  /* ── Items table ── */
+  .tableWrap {
+    border: 1px solid ${theme.line};
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 24px;
+    flex: 1;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    background: ${theme.softAlt};
+    padding: 10px 14px;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: ${theme.inkSoft};
+    text-align: left;
+    border-bottom: 1px solid ${theme.line};
+  }
+  th.r, td.r { text-align: right; }
+  th.c, td.c { text-align: center; }
+  tbody td {
+    padding: 13px 14px;
+    font-size: 13px;
+    color: ${theme.ink};
+    border-bottom: 1px solid ${theme.line};
+    vertical-align: top;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:nth-child(even) { background: ${theme.soft}; }
+  .iNum  { color: ${theme.muted}; font-size: 12px; }
+  .iName { font-weight: 700; color: ${theme.ink}; }
+  .iMeta { margin-top: 3px; font-size: 11px; color: ${theme.muted}; line-height: 1.5; }
+  .iAmt  { font-weight: 800; }
+  .emptyRow td {
+    padding: 28px 14px;
+    text-align: center;
+    color: ${theme.muted};
+    font-size: 13px;
   }
 
-  .brand{
-    justify-content:flex-start;
+  /* ── Totals ── */
+  .totalsSection {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 28px;
+  }
+  .totalsBox { width: 280px; }
+  .totalsRow {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 7px 0;
+    font-size: 13px;
+    border-bottom: 1px solid ${theme.line};
+    gap: 12px;
+  }
+  .totalsRow:last-child { border-bottom: none; }
+  .totalsKey   { color: ${theme.muted}; }
+  .totalsVal   { font-weight: 800; color: ${theme.ink}; }
+  .totalsValGreen { font-weight: 800; color: ${theme.green}; }
+  .totalsBalance {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 11px 0 4px;
+    gap: 12px;
+    border-top: 2px solid ${theme.line};
+    margin-top: 4px;
+  }
+  .totalsBalanceKey {
+    font-size: 16px;
+    font-weight: 900;
+    color: ${theme.amber};
+    letter-spacing: -0.2px;
+  }
+  .totalsBalanceVal {
+    font-size: 20px;
+    font-weight: 900;
+    color: ${theme.amber};
+    letter-spacing: -0.5px;
   }
 
-  .brandText{
-    text-align:left;
+  /* ── Footer area ── */
+  .footerArea {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 24px;
+    margin-top: 28px;
+    padding-top: 24px;
+    border-top: 1px solid ${theme.line};
+  }
+  .termsBlock { max-width: 52%; }
+  .termsTitle {
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: ${theme.muted};
+    margin-bottom: 7px;
+  }
+  .termsText {
+    font-size: 12px;
+    color: ${theme.inkSoft};
+    line-height: 1.7;
+    white-space: pre-wrap;
+  }
+  .sigBlock { text-align: right; flex-shrink: 0; }
+  .sigLine {
+    width: 140px;
+    height: 1px;
+    background: ${theme.line};
+    margin: 36px 0 8px auto;
+  }
+  .sigLabel {
+    font-size: 11px;
+    color: ${theme.muted};
+    font-weight: 600;
+  }
+  .sigName {
+    font-size: 13px;
+    font-weight: 800;
+    color: ${theme.primary};
+    margin-top: 3px;
   }
 
-  .content{
-    padding:10px 16px 0 16px;
+  /* ── Signature cards (for docs that need two signatories) ── */
+  .sigRow {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-top: 24px;
+    padding-top: 24px;
+    border-top: 1px solid ${theme.line};
+  }
+  .sigCard {
+    border: 1px solid ${theme.line};
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+  .sigCardLabel {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: ${theme.muted};
+    margin-bottom: 32px;
+  }
+  .sigCardLine {
+    height: 1px;
+    background: ${theme.line};
+    margin-bottom: 8px;
+  }
+  .sigCardMeta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: ${theme.muted};
   }
 
-  .metaTopGrid,
-  .bottomGrid,
-  .signatureRow{
-    grid-template-columns:1fr;
+  /* ── Responsive ── */
+  @media screen and (max-width: 750px) {
+    .wrap { padding: 12px 8px 24px; }
+    .actions, .page { width: 100%; }
+    .pageInner { padding: 24px 20px 36px; }
+    .header { flex-direction: column; gap: 16px; }
+    .docBlock { text-align: left; }
+    .infoStrip { grid-template-columns: 1fr; }
+    .infoCol { border-right: none; border-bottom: 1px solid ${theme.line}; }
+    .infoCol:last-child { border-bottom: none; }
+    .totalsBox { width: 100%; }
+    .footerArea { flex-direction: column; }
+    .termsBlock { max-width: 100%; }
+    .sigBlock { text-align: left; }
+    .sigLine { margin-left: 0; }
+    .sigRow { grid-template-columns: 1fr; }
+    .docType { font-size: 26px; }
   }
 
-  .tableSection{
-    padding:14px 16px 0 16px;
+  @page {
+    size: A4 portrait;
+    margin: 12mm 14mm;
   }
-
-  .signatureArea{
-    padding:16px 16px 0 16px;
+  @media print {
+    html, body { background: #fff !important; }
+    .actions { display: none !important; }
+    .wrap { padding: 0 !important; }
+    .page {
+      width: 100% !important;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+      /* let content determine height — don't force blank pages */
+    }
+    .pageInner { padding: 0 !important; }
+    /* prevent orphaned rows at page breaks */
+    tbody tr { page-break-inside: avoid; }
+    .footerArea { page-break-inside: avoid; }
+    .sigRow { page-break-inside: avoid; }
+    .totalsSection { page-break-inside: avoid; }
   }
-
-  .footerMeta{
-    left:16px;
-    right:16px;
-    bottom:8px;
-    flex-direction:column;
-  }
-}
 </style>`;
 }
 
+// ─── Action bar ───────────────────────────────────────────────────────────────
 function renderActions(title) {
   return `
-    <div class="actions">
-      <button class="btn" onclick="window.history.back()">Back</button>
-      <button class="btn primary" onclick="window.print()">Print ${esc(title)}</button>
-    </div>
-  `;
+  <div class="actions">
+    <button class="actBtn" onclick="window.history.back()">Back</button>
+    <button class="actBtn primary" onclick="window.print()">Print ${esc(title)}</button>
+  </div>`;
 }
 
-function getDocumentNumber(document = {}) {
-  return cleanString(
-    document.number ||
-      document.invoiceNumber ||
-      document.receiptNumber ||
-      document.proformaNumber ||
-      document.deliveryNoteNumber ||
-      document.warrantyNumber ||
-      "—"
+// ─── Document number resolver ─────────────────────────────────────────────────
+function getDocNumber(document = {}) {
+  return cleanStr(
+    document.number || document.invoiceNumber || document.receiptNumber ||
+    document.proformaNumber || document.deliveryNoteNumber || document.warrantyNumber || "—"
   );
 }
 
-function renderTopSection(data) {
-  const { tenant, document, extra, title } = data;
+// ═══════════════════════════════════════════════════════════════════════════════
+// Section renderers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Header: brand (left) + document type (right) ─────────────────────────────
+function renderHeader({ tenant, document, title, extra, theme }) {
+  const num    = getDocNumber(document);
+  const status = extra?.status || extra?.badgeText || null;
 
   return `
-    <section class="hero">
-      <div class="heroGlow"></div>
-      <div class="heroCurveShadowA"></div>
-      <div class="heroCurveA"></div>
-      <div class="heroCurveB"></div>
-
-      <div class="heroRow">
-        <div class="docTitleBlock">
-          <h2 class="docTitle">${esc(title)}</h2>
-          <div class="docSubtitle">
-            ${esc(cleanString(extra.subtitle || "Professional business document generated by Storvex"))}
-          </div>
-        </div>
-
-        <div class="brand">
-          ${logoHtml(tenant)}
-
-          <div class="brandText">
-            <h1 class="brandName">${esc(cleanString(tenant.name || "Business"))}</h1>
-            <div class="brandMeta">
-              ${tenant.receiptHeader ? `<div>${esc(tenant.receiptHeader)}</div>` : ""}
-              ${
-                tenant.phone || tenant.email
-                  ? `<div>${[
-                      tenant.phone ? `Tel: ${esc(tenant.phone)}` : "",
-                      tenant.email ? `Email: ${esc(tenant.email)}` : "",
-                    ]
-                      .filter(Boolean)
-                      .join(" • ")}</div>`
-                  : ""
-              }
-            </div>
-          </div>
+  <div class="header">
+    <div class="brandBlock">
+      ${logoHtml(tenant, theme)}
+      <div>
+        <div class="brandName">${esc(cleanStr(tenant.name || "Business"))}</div>
+        <div class="brandSub">
+          ${tenant.receiptHeader ? `<div>${esc(tenant.receiptHeader)}</div>` : ""}
+          ${tenant.address        ? `<div>${esc(tenant.address)}</div>`       : ""}
+          ${(tenant.phone || tenant.email) ? `<div>${[
+              tenant.phone ? `Tel: ${esc(tenant.phone)}` : "",
+              tenant.email ? `Email: ${esc(tenant.email)}` : "",
+            ].filter(Boolean).join(" · ")}</div>` : ""}
+          ${tenant.tin ? `<div>TIN: ${esc(tenant.tin)}</div>` : ""}
         </div>
       </div>
-    </section>
+    </div>
 
-    <section class="content">
-      <div class="metaTopGrid">
-        <div class="partyCard">
-          <div class="sectionLabel">${esc(extra.customerTitle || "Document To")}</div>
-          <h3 class="partyName">${esc(cleanString(data.customer.name || "Walk-in Customer"))}</h3>
-
-          <div class="partyMeta">
-            <div class="metaRow">
-              <span class="metaKey">Phone</span>
-              <span class="metaValue">${esc(cleanString(data.customer.phone || "—"))}</span>
-            </div>
-
-            ${
-              data.customer.email
-                ? `<div class="metaRow">
-                    <span class="metaKey">Email</span>
-                    <span class="metaValue">${esc(cleanString(data.customer.email))}</span>
-                  </div>`
-                : ""
-            }
-
-            ${
-              data.customer.address
-                ? `<div class="metaRow">
-                    <span class="metaKey">Address</span>
-                    <span class="metaValue">${esc(cleanString(data.customer.address))}</span>
-                  </div>`
-                : ""
-            }
-          </div>
-        </div>
-
-        <div class="infoCard">
-          <div class="sectionLabel">Document Info</div>
-
-          <div class="metaRow">
-            <span class="metaKey">Number</span>
-            <span class="metaValue">${esc(getDocumentNumber(document))}</span>
-          </div>
-
-          <div class="metaRow">
-            <span class="metaKey">Date</span>
-            <span class="metaValue">${esc(fmtDate(document.date || document.createdAt))}</span>
-          </div>
-
-          ${
-            extra.status
-              ? `<div class="metaRow">
-                  <span class="metaKey">Status</span>
-                  <span class="metaValue"><span class="statusBadge">${esc(extra.status)}</span></span>
-                </div>`
-              : ""
-          }
-
-          ${
-            (extra.rightRows || []).length
-              ? extra.rightRows
-                  .map(
-                    ([k, v]) => `
-                      <div class="metaRow">
-                        <span class="metaKey">${esc(k)}</span>
-                        <span class="metaValue">${esc(v == null || v === "" ? "—" : String(v))}</span>
-                      </div>
-                    `
-                  )
-                  .join("")
-              : ""
-          }
-        </div>
+    <div class="docBlock">
+      <div class="docType">${esc(title)}</div>
+      <div class="docNum"># ${esc(num)}</div>
+      <div class="docMeta">
+        <div>Date: ${esc(fmtDate(document.date || document.createdAt))}</div>
+        ${extra?.dueDate ? `<div>Due: ${esc(fmtDate(extra.dueDate))}</div>` : ""}
       </div>
-    </section>
-  `;
+      ${status ? badgeHtml(status, theme) : ""}
+    </div>
+  </div>`;
 }
 
-function renderItemsTable(data) {
-  const { items, totals, showPrices } = data;
+// ─── 3-column info strip ──────────────────────────────────────────────────────
+function renderInfoStrip({ customer, extra, title }) {
+  const col1Label = extra?.customerTitle || "Billed To";
+  const col2Label = extra?.col2Label     || "Details";
+  const col3Label = extra?.col3Label     || "Issued By";
 
-  const headCols = showPrices
-    ? `
-      <th class="tdNo">SL.</th>
-      <th>Item Description</th>
-      <th class="tdMoney">Price</th>
-      <th class="tdQty">Qty.</th>
-      <th class="tdMoney">Total</th>
-    `
-    : `
-      <th class="tdNo">SL.</th>
-      <th>Item Description</th>
-      <th>Details</th>
-      <th class="tdQty">Qty.</th>
-    `;
+  // Build col2 lines from extra.col2Lines array or rightRows
+  const col2Lines = (extra?.col2Lines || extra?.rightRows || []);
+  const col3Lines = (extra?.col3Lines || []);
+
+  return `
+  <div class="infoStrip">
+    <div class="infoCol">
+      <div class="infoLabel">${esc(col1Label)}</div>
+      <div class="infoName">${esc(cleanStr(customer?.name || "Walk-in Customer"))}</div>
+      ${customer?.phone   ? `<div class="infoLine">${esc(customer.phone)}</div>` : ""}
+      ${customer?.email   ? `<div class="infoLine">${esc(customer.email)}</div>` : ""}
+      ${customer?.address ? `<div class="infoLine">${esc(customer.address)}</div>` : ""}
+      ${customer?.tin     ? `<div class="infoLine">TIN: ${esc(customer.tin)}</div>` : ""}
+    </div>
+
+    <div class="infoCol">
+      <div class="infoLabel">${esc(col2Label)}</div>
+      ${col2Lines.map(([k,v]) => v
+        ? `<div class="infoLine"><span style="color:#94a3b8">${esc(k)}: </span>${esc(String(v))}</div>`
+        : ""
+      ).join("")}
+    </div>
+
+    <div class="infoCol">
+      <div class="infoLabel">${esc(col3Label)}</div>
+      ${col3Lines.map(([k,v]) => v
+        ? `<div class="infoLine"><span style="color:#94a3b8">${esc(k)}: </span>${esc(String(v))}</div>`
+        : ""
+      ).join("")}
+    </div>
+  </div>`;
+}
+
+// ─── Items table ──────────────────────────────────────────────────────────────
+function renderTable({ items, totals, showPrices }) {
+  const head = showPrices
+    ? `<th class="c">#</th><th>Product</th><th>SKU</th><th class="c">Qty</th><th class="r">Unit Price</th><th class="r">Subtotal</th>`
+    : `<th class="c">#</th><th>Product</th><th>Details</th><th class="c">Qty</th>`;
 
   const rows = items.length
-    ? items
-        .map((it, idx) => {
-          if (showPrices) {
-            return `
-              <tr>
-                <td class="tdNo">${idx + 1}</td>
-                <td>
-                  <div class="itemName">${esc(it.productName || "—")}</div>
-                  ${
-                    it.serial || it.sku || it.barcode
-                      ? `<div class="itemMeta">
-                          ${[
-                            it.serial ? `Serial: ${esc(it.serial)}` : "",
-                            it.sku ? `SKU: ${esc(it.sku)}` : "",
-                            it.barcode ? `Barcode: ${esc(it.barcode)}` : "",
-                          ]
-                            .filter(Boolean)
-                            .join(" • ")}
-                        </div>`
-                      : ""
-                  }
-                </td>
-                <td class="tdMoney">${esc(money(it.unitPrice, totals.currency))}</td>
-                <td class="tdQty">${esc(String(it.quantity))}</td>
-                <td class="tdMoney">${esc(money(it.total, totals.currency))}</td>
-              </tr>
-            `;
-          }
-
-          return `
-            <tr>
-              <td class="tdNo">${idx + 1}</td>
-              <td>
-                <div class="itemName">${esc(it.productName || "—")}</div>
-                <div class="itemMeta">
-                  ${
-                    [
-                      it.serial ? `Serial: ${esc(it.serial)}` : "",
-                      it.sku ? `SKU: ${esc(it.sku)}` : "",
-                      it.barcode ? `Barcode: ${esc(it.barcode)}` : "",
-                    ]
-                      .filter(Boolean)
-                      .join(" • ") || "—"
-                  }
-                </div>
-              </td>
-              <td>${esc(cleanString(it.serial || it.sku || it.barcode || "—"))}</td>
-              <td class="tdQty">${esc(String(it.quantity))}</td>
-            </tr>
-          `;
-        })
-        .join("")
-    : `
+    ? items.map((it, i) => showPrices ? `
       <tr>
-        <td colspan="${showPrices ? 5 : 4}" class="emptyCell">No items</td>
-      </tr>
-    `;
+        <td class="c iNum">${i + 1}</td>
+        <td>
+          <div class="iName">${esc(it.productName || "—")}</div>
+          ${(it.serial||it.sku||it.barcode)
+            ? `<div class="iMeta">${[it.serial?`Serial: ${esc(it.serial)}`:"",it.sku?`SKU: ${esc(it.sku)}`:"",it.barcode?`Barcode: ${esc(it.barcode)}`:""].filter(Boolean).join(" · ")}</div>`
+            : ""}
+        </td>
+        <td class="iMeta">${esc(it.sku || it.barcode || "—")}</td>
+        <td class="c">${esc(String(it.quantity))}</td>
+        <td class="r">${esc(money(it.unitPrice, totals.currency).replace(/^RWF\s/, ""))}</td>
+        <td class="r iAmt">${esc(money(it.total, totals.currency).replace(/^RWF\s/, ""))}</td>
+      </tr>` : `
+      <tr>
+        <td class="c iNum">${i + 1}</td>
+        <td>
+          <div class="iName">${esc(it.productName || "—")}</div>
+          ${(it.serial||it.sku||it.barcode)
+            ? `<div class="iMeta">${[it.serial?`Serial: ${esc(it.serial)}`:"",it.sku?`SKU: ${esc(it.sku)}`:"",it.barcode?`Barcode: ${esc(it.barcode)}`:""].filter(Boolean).join(" · ")}</div>`
+            : ""}
+        </td>
+        <td class="iMeta">${esc(it.serial || it.sku || it.barcode || "—")}</td>
+        <td class="c">${esc(String(it.quantity))}</td>
+      </tr>`
+    ).join("")
+    : `<tr class="emptyRow"><td colspan="${showPrices ? 6 : 4}">No items</td></tr>`;
 
   return `
-    <section class="tableSection">
-      <div class="tableShell">
-        <table>
-          <thead>
-            <tr>${headCols}</tr>
-          </thead>
-          <tbody>
-            ${rows}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  `;
+  <div class="tableWrap">
+    <table>
+      <thead><tr>${head}</tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
 }
 
-function renderBottomSection(data) {
-  const { totals, extra, showPrices, showPaymentSummary, showSignature, title } = data;
+// ─── Totals (right-aligned, Amount Paid green, Balance Due amber) ─────────────
+function renderTotals({ totals, showPrices, showPaymentSummary, theme }) {
+  if (!showPrices) {
+    return `
+    <div class="totalsSection">
+      <div class="totalsBox">
+        <div class="totalsRow">
+          <span class="totalsKey">Items</span>
+          <span class="totalsVal">${esc(String(totals._itemCount || 0))}</span>
+        </div>
+        <div class="totalsBalance">
+          <span class="totalsBalanceKey">Total</span>
+          <span class="totalsBalanceVal">${esc(money(totals.total, totals.currency))}</span>
+        </div>
+      </div>
+    </div>`;
+  }
 
-  const noteText = cleanString(
-    extra.notes ||
-      extra.terms ||
-      "Thank you for your business.\nKeep this document for your records."
+  const paid    = Number(totals.amountPaid || 0);
+  const balance = Number(totals.balanceDue  || 0);
+
+  return `
+  <div class="totalsSection">
+    <div class="totalsBox">
+      <div class="totalsRow">
+        <span class="totalsKey">Subtotal</span>
+        <span class="totalsVal">${esc(money(totals.subtotal, totals.currency))}</span>
+      </div>
+      ${showPaymentSummary && paid > 0 ? `
+      <div class="totalsRow">
+        <span class="totalsKey">Amount Paid</span>
+        <span class="totalsValGreen">${esc(money(paid, totals.currency))}</span>
+      </div>` : ""}
+      ${showPaymentSummary && balance > 0 ? `
+      <div class="totalsBalance">
+        <span class="totalsBalanceKey">Balance Due</span>
+        <span class="totalsBalanceVal">${esc(money(balance, totals.currency))}</span>
+      </div>` : `
+      <div class="totalsBalance">
+        <span class="totalsBalanceKey">Total</span>
+        <span class="totalsBalanceVal">${esc(money(totals.total, totals.currency))}</span>
+      </div>`}
+    </div>
+  </div>`;
+}
+
+// ─── Footer: Terms left / Authorized Signature right ─────────────────────────
+function renderFooter({ tenant, extra, theme }) {
+  const terms = cleanStr(
+    extra?.notes || extra?.terms || tenant?.receiptFooter ||
+    "Thank you for your business.\nKeep this document for your records."
   );
 
-  const totalsHtml = showPrices
-    ? `
-      <div class="totalCard">
-        <div class="sectionLabel">Summary</div>
-
-        <div class="summaryRows">
-          <div class="totalsRow">
-            <span class="totalsLabel">Sub Total</span>
-            <span class="totalsValue">${esc(money(totals.subtotal, totals.currency))}</span>
-          </div>
-
-          ${
-            showPaymentSummary
-              ? `
-                <div class="totalsRow">
-                  <span class="totalsLabel">Paid</span>
-                  <span class="totalsValue">${esc(money(totals.amountPaid, totals.currency))}</span>
-                </div>
-                <div class="totalsRow">
-                  <span class="totalsLabel">Balance</span>
-                  <span class="totalsValue">${esc(money(totals.balanceDue, totals.currency))}</span>
-                </div>
-              `
-              : ""
-          }
-        </div>
-
-        <div class="totalsDivider"></div>
-
-        <div class="totalsGrand">
-          <span>Total</span>
-          <span>${esc(money(totals.total, totals.currency))}</span>
-        </div>
-      </div>
-    `
-    : `
-      <div class="totalCard">
-        <div class="sectionLabel">Summary</div>
-
-        <div class="summaryRows">
-          <div class="totalsRow">
-            <span class="totalsLabel">Items</span>
-            <span class="totalsValue">${esc(String(data.items.length))}</span>
-          </div>
-          <div class="totalsRow">
-            <span class="totalsLabel">Document type</span>
-            <span class="totalsValue">${esc(title)}</span>
-          </div>
-          <div class="totalsRow">
-            <span class="totalsLabel">Prepared on</span>
-            <span class="totalsValue">${esc(fmtDateLong(data.document.date || data.document.createdAt))}</span>
-          </div>
-        </div>
-      </div>
-    `;
-
-  const signatureHtml = showSignature
-    ? `
-      <section class="signatureArea">
-        <div class="signatureRow">
-          <div class="signatureCard">
-            <div class="signatureLabel">Prepared By</div>
-            <div class="signatureLine"></div>
-            <div class="signatureMeta">
-              <span>${esc(cleanString(extra.preparedBy || extra.cashier || "Staff"))}</span>
-              <span>${esc(fmtDate(data.document.date || data.document.createdAt))}</span>
-            </div>
-          </div>
-
-          <div class="signatureCard">
-            <div class="signatureLabel">Authorised Sign</div>
-            <div class="signatureLine"></div>
-            <div class="signatureMeta">
-              <span>${esc(cleanString(extra.approvedBy || "Authorised Signature"))}</span>
-              <span>${esc(fmtDate(data.document.date || data.document.createdAt))}</span>
-            </div>
-          </div>
-        </div>
-      </section>
-    `
-    : "";
-
   return `
-    <section class="bottomGrid">
-      <div class="noteCard">
-        <div class="noteTitle">Terms & Conditions</div>
-        <div class="noteText">${esc(noteText)}</div>
-      </div>
-
-      ${totalsHtml}
-    </section>
-
-    ${signatureHtml}
-
-    <div class="footerBand">
-      <div class="footerCurveShadow"></div>
-      <div class="footerCurveA"></div>
-      <div class="footerCurveB"></div>
-      <div class="footerBrand"></div>
-
-      <div class="footerMeta">
-        <div class="footerMetaLeft">
-          ${esc(cleanString(data.tenant.receiptFooter || ""))}
-        </div>
-        <div class="footerMetaRight">
-          ${esc(cleanString(data.tenant.name || "Business"))}
-        </div>
-      </div>
+  <div class="footerArea">
+    <div class="termsBlock">
+      <div class="termsTitle">Terms &amp; Conditions</div>
+      <div class="termsText">${esc(terms)}</div>
     </div>
-  `;
+    <div class="sigBlock">
+      <div class="sigLine"></div>
+      <div class="sigLabel">Authorized Signature</div>
+      <div class="sigName">${esc(cleanStr(tenant?.name || "Business"))}</div>
+    </div>
+  </div>`;
 }
 
+// ─── Two-signatory row (for proforma, delivery note, warranty) ────────────────
+function renderSigRow({ extra }) {
+  const left  = cleanStr(extra?.preparedBy  || extra?.cashier      || extra?.deliveredBy || extra?.issuedBy || "Staff");
+  const right = cleanStr(extra?.approvedBy  || extra?.receivedBy   || "Authorised Signature");
+  return `
+  <div class="sigRow">
+    <div class="sigCard">
+      <div class="sigCardLabel">Prepared By</div>
+      <div class="sigCardLine"></div>
+      <div class="sigCardMeta"><span>${esc(left)}</span></div>
+    </div>
+    <div class="sigCard">
+      <div class="sigCardLabel">Authorised Sign</div>
+      <div class="sigCardLine"></div>
+      <div class="sigCardMeta"><span>${esc(right)}</span></div>
+    </div>
+  </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Core page builder
+// ═══════════════════════════════════════════════════════════════════════════════
 function buildPage({
   title,
-  tenant,
-  document,
-  customer,
-  items,
-  totals,
-  extra,
+  tenant     = {},
+  document   = {},
+  customer   = {},
+  items      = [],
+  totals     = {},
+  extra      = {},
   badgeText,
-  showPrices = true,
+  showPrices         = true,
   showPaymentSummary = true,
-  showSignature = true,
-  theme,
+  showSignature      = false,
+  theme: themeOverride,
 }) {
-  const normalizedItems = normalizeItems(items);
-  const normalizedTotals = computeTotals(
-    normalizedItems,
-    totals,
-    extra?.currency || "RWF"
-  );
+  const normalizedItems  = normalizeItems(items);
+  const normalizedTotals = computeTotals(normalizedItems, totals, extra?.currency || "RWF");
+  normalizedTotals._itemCount = normalizedItems.length;
 
-  const resolvedTheme = resolveBrandTheme(tenant, theme || {});
+  const theme = resolveBrandTheme(tenant, themeOverride || {});
 
-  const data = {
-    tenant: tenant || {},
-    customer: customer || {},
-    document: document || {},
-    extra: {
-      ...(extra || {}),
-      status: badgeText || extra?.status || null,
-    },
-    items: normalizedItems,
-    totals: normalizedTotals,
-    showPrices,
-    showPaymentSummary,
-    showSignature,
-    title,
+  const effectiveExtra = {
+    ...extra,
+    status: badgeText || extra?.status || null,
   };
 
   return `<!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>${esc(title)} ${esc(document?.number || "")}</title>
-  ${commonStyles(resolvedTheme)}
+  <title>${esc(title)} ${esc(getDocNumber(document))}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" />
+  ${buildStyles(theme)}
 </head>
 <body>
-  <div class="pageWrap">
-    ${renderActions(title)}
-    <div class="page">
-      <div class="pageInner">
-        ${renderTopSection(data)}
-        ${renderItemsTable(data)}
-        ${renderBottomSection(data)}
-      </div>
+<div class="wrap">
+  ${renderActions(title)}
+  <div class="page">
+    <div class="pageInner">
+      ${renderHeader({ tenant, document, title, extra: effectiveExtra, theme })}
+      ${renderInfoStrip({ customer, extra: effectiveExtra, title })}
+      ${renderTable({ items: normalizedItems, totals: normalizedTotals, showPrices })}
+      ${renderTotals({ totals: normalizedTotals, showPrices, showPaymentSummary, theme })}
+      ${showSignature ? renderSigRow({ extra: effectiveExtra }) : ""}
+      ${renderFooter({ tenant, extra: effectiveExtra, theme })}
     </div>
   </div>
+</div>
 </body>
 </html>`;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Document-specific renderers
+// ═══════════════════════════════════════════════════════════════════════════════
+
 function renderReceiptHtml(payload) {
+  const saleType = cleanStr(payload.extra?.saleType || "CASH");
+  const status   = cleanStr(payload.extra?.status   || "PAID");
+  const cashier  = cleanStr(payload.extra?.cashier  || "—");
+  const paid     = Number(payload.totals?.amountPaid  || 0);
+  const balance  = Number(payload.totals?.balanceDue  || 0);
+
   return buildPage({
-    title: "Receipt",
-    tenant: payload.tenant,
+    title:    "Receipt",
+    tenant:   payload.tenant,
     document: payload.document,
     customer: payload.customer,
-    items: payload.items,
-    totals: payload.totals,
-    badgeText: payload.extra?.saleType || payload.extra?.status || "PAID",
-    showPrices: true,
+    items:    payload.items,
+    totals:   payload.totals,
+    badgeText: status,
+    showPrices:         true,
     showPaymentSummary: true,
-    showSignature: false,
-    theme:
-      payload.theme || {
-        primaryColor: payload.tenant?.documentPrimaryColor,
-        accentColor: payload.tenant?.documentAccentColor,
-      },
+    showSignature:      false,
+    theme:    payload.theme || { primaryColor: payload.tenant?.documentPrimaryColor },
     extra: {
-      currency: payload.totals?.currency,
-      subtitle: "Payment confirmation and sales record",
-      notes:
-        payload.extra?.notes ||
-        payload.tenant?.receiptFooter ||
-        "Keep this receipt for support and warranty.",
-      rightRows: [
-        ["Cashier", payload.extra?.cashier || "—"],
-        ["Sale Type", payload.extra?.saleType || "—"],
-        ["Paid Status", payload.extra?.status || "—"],
+      currency:     payload.totals?.currency,
+      col2Label:    "Payment",
+      col2Lines: [
+        ["Type",    saleType],
+        ["Paid",    money(paid,    payload.totals?.currency || "RWF")],
+        ["Balance", money(balance, payload.totals?.currency || "RWF")],
       ],
+      col3Label: "Issued By",
+      col3Lines: [
+        ["Cashier", cashier],
+        ["Branch",  cleanStr(payload.extra?.branch || payload.tenant?.district || "—")],
+      ],
+      notes: payload.extra?.notes || payload.tenant?.receiptFooter || "Keep this receipt for your records.",
     },
   });
 }
 
 function renderInvoiceHtml(payload) {
+  const status  = cleanStr(payload.extra?.status   || "INVOICE");
+  const cashier = cleanStr(payload.extra?.cashier  || "—");
+  const paid    = Number(payload.totals?.amountPaid || 0);
+  const balance = Number(payload.totals?.balanceDue || 0);
+  const saleRef = cleanStr(payload.extra?.saleRef  || "—");
+
   return buildPage({
-    title: "Invoice",
-    tenant: payload.tenant,
+    title:    "Invoice",
+    tenant:   payload.tenant,
     document: payload.document,
     customer: payload.customer,
-    items: payload.items,
-    totals: payload.totals,
-    badgeText: payload.extra?.status || "INVOICE",
-    showPrices: true,
+    items:    payload.items,
+    totals:   payload.totals,
+    badgeText: status,
+    showPrices:         true,
     showPaymentSummary: true,
-    showSignature: true,
-    theme:
-      payload.theme || {
-        primaryColor: payload.tenant?.documentPrimaryColor,
-        accentColor: payload.tenant?.documentAccentColor,
-      },
+    showSignature:      true,
+    theme:    payload.theme || { primaryColor: payload.tenant?.documentPrimaryColor },
     extra: {
-      currency: payload.totals?.currency,
-      subtitle: "Formal billing document",
-      notes:
-        payload.extra?.invoiceTerms ||
-        payload.tenant?.invoiceTerms ||
-        payload.extra?.notes ||
-        "Invoice terms apply.",
-      rightRows: [
-        ["Due Date", payload.extra?.dueDate ? fmtDate(payload.extra.dueDate) : "—"],
-        ["Cashier", payload.extra?.cashier || "—"],
-        ["Sale Ref", payload.extra?.saleRef || "—"],
+      currency:  payload.totals?.currency,
+      dueDate:   payload.extra?.dueDate,
+      col2Label: "Payment",
+      col2Lines: [
+        ["Sale Type", cleanStr(payload.extra?.saleType || "CREDIT")],
+        ["Paid",      money(paid,    payload.totals?.currency || "RWF")],
+        ["Balance",   money(balance, payload.totals?.currency || "RWF")],
       ],
+      col3Label: "Issued By",
+      col3Lines: [
+        ["Cashier", cashier],
+        ["Ref",     saleRef],
+        ["Branch",  cleanStr(payload.extra?.branch || payload.tenant?.district || "—")],
+      ],
+      notes:      payload.extra?.invoiceTerms || payload.tenant?.invoiceTerms || payload.extra?.notes ||
+                  "Invoice terms apply. Payment is due by the date stated above.",
+      preparedBy: cashier,
+      approvedBy: payload.tenant?.name || "Authorized Signature",
     },
   });
 }
 
 function renderProformaHtml(payload) {
+  const preparedBy = cleanStr(payload.extra?.preparedBy || payload.extra?.cashier || "—");
+  const validUntil = payload.extra?.validUntil ? fmtDate(payload.extra.validUntil) : "—";
+  const reference  = cleanStr(payload.extra?.reference || "—");
+
   return buildPage({
-    title: "Proforma",
-    tenant: payload.tenant,
+    title:    "Proforma",
+    tenant:   payload.tenant,
     document: payload.document,
     customer: payload.customer,
-    items: payload.items,
-    totals: payload.totals,
+    items:    payload.items,
+    totals:   payload.totals,
     badgeText: "PROFORMA",
-    showPrices: true,
+    showPrices:         true,
     showPaymentSummary: false,
-    showSignature: true,
-    theme:
-      payload.theme || {
-        primaryColor: payload.tenant?.documentPrimaryColor,
-        accentColor: payload.tenant?.documentAccentColor,
-      },
+    showSignature:      true,
+    theme:    payload.theme || { primaryColor: payload.tenant?.documentPrimaryColor },
     extra: {
-      currency: payload.totals?.currency,
-      subtitle: "Quotation-style preliminary document",
-      notes:
-        payload.extra?.notes ||
-        payload.tenant?.proformaTerms ||
-        "This proforma is not a final receipt and does not confirm payment.",
-      rightRows: [
-        ["Prepared By", payload.extra?.preparedBy || "—"],
-        ["Validity", payload.extra?.validUntil ? fmtDate(payload.extra.validUntil) : "—"],
-        ["Reference", payload.extra?.reference || "—"],
+      currency:  payload.totals?.currency,
+      col2Label: "Quotation Details",
+      col2Lines: [
+        ["Validity",   validUntil],
+        ["Reference",  reference],
       ],
+      col3Label: "Prepared By",
+      col3Lines: [
+        ["Staff",  preparedBy],
+        ["Branch", cleanStr(payload.extra?.branch || payload.tenant?.district || "—")],
+      ],
+      notes:      payload.extra?.notes || payload.tenant?.proformaTerms ||
+                  "This proforma is not a final invoice and does not confirm payment.",
+      preparedBy,
+      approvedBy: "Authorised Signature",
     },
   });
 }
 
 function renderDeliveryNoteHtml(payload) {
+  const deliveredBy       = cleanStr(payload.extra?.deliveredBy       || "—");
+  const receivedBy        = cleanStr(payload.extra?.receivedBy        || "—");
+  const receivedByPhone   = cleanStr(payload.extra?.receivedByPhone   || "—");
+  const badgeText         = cleanStr(payload.extra?.badgeText         || "DELIVERY");
+
   return buildPage({
-    title: "Delivery Note",
-    tenant: payload.tenant,
+    title:    "Delivery Note",
+    tenant:   payload.tenant,
     document: payload.document,
     customer: payload.customer,
-    items: payload.items,
-    totals: payload.totals,
-    badgeText: payload.extra?.badgeText || "DELIVERY",
-    showPrices: false,
+    items:    payload.items,
+    totals:   payload.totals,
+    badgeText,
+    showPrices:         false,
     showPaymentSummary: false,
-    showSignature: true,
-    theme:
-      payload.theme || {
-        primaryColor: payload.tenant?.documentPrimaryColor,
-        accentColor: payload.tenant?.documentAccentColor,
-      },
+    showSignature:      true,
+    theme:    payload.theme || { primaryColor: payload.tenant?.documentPrimaryColor },
     extra: {
-      subtitle: "Goods handover confirmation",
-      notes:
-        payload.extra?.notes ||
-        payload.tenant?.deliveryNoteTerms ||
-        "Please confirm that all delivered items were received in good condition.",
-      preparedBy: payload.extra?.deliveredBy || "—",
-      approvedBy: payload.extra?.receivedBy || "—",
-      rightRows: [
-        ["Delivered By", payload.extra?.deliveredBy || "—"],
-        ["Received By", payload.extra?.receivedBy || "—"],
-        ["Receiver Phone", payload.extra?.receivedByPhone || "—"],
+      customerTitle: "Delivered To",
+      col2Label:     "Delivery Info",
+      col2Lines: [
+        ["Delivered By", deliveredBy],
+        ["Received By",  receivedBy],
+        ["Receiver Phone", receivedByPhone],
       ],
+      col3Label: "Branch",
+      col3Lines: [
+        ["Branch", cleanStr(payload.extra?.branch || payload.tenant?.district || "—")],
+        ["Date",   fmtDate(payload.document?.date || payload.document?.createdAt)],
+      ],
+      notes:      payload.extra?.notes || payload.tenant?.deliveryNoteTerms ||
+                  "Please confirm that all delivered items were received in good condition.",
+      preparedBy: deliveredBy,
+      approvedBy: receivedBy || "Receiver Signature",
     },
   });
 }
 
 function renderWarrantyHtml(payload) {
+  const issuedBy  = cleanStr(payload.extra?.issuedBy  || payload.extra?.cashier || "—");
+  const startDate = payload.extra?.startDate ? fmtDate(payload.extra.startDate) : "—";
+  const endDate   = payload.extra?.endDate   ? fmtDate(payload.extra.endDate)   : "—";
+
   return buildPage({
-    title: "Warranty Certificate",
-    tenant: payload.tenant,
+    title:    "Warranty",
+    tenant:   payload.tenant,
     document: payload.document,
     customer: payload.customer,
-    items: payload.items,
-    totals: payload.totals,
+    items:    payload.items,
+    totals:   payload.totals,
     badgeText: "WARRANTY",
-    showPrices: false,
+    showPrices:         false,
     showPaymentSummary: false,
-    showSignature: true,
-    theme:
-      payload.theme || {
-        primaryColor: payload.tenant?.documentPrimaryColor,
-        accentColor: payload.tenant?.documentAccentColor,
-      },
+    showSignature:      true,
+    theme:    payload.theme || { primaryColor: payload.tenant?.documentPrimaryColor },
     extra: {
-      subtitle: "After-sales warranty coverage document",
-      notes:
-        payload.extra?.warrantyTerms ||
-        payload.tenant?.warrantyTerms ||
-        payload.extra?.notes ||
-        "Warranty applies under the store warranty terms.",
-      preparedBy: payload.extra?.issuedBy || "—",
-      approvedBy: payload.customer?.name || "—",
-      rightRows: [
-        ["Start Date", payload.extra?.startDate ? fmtDate(payload.extra.startDate) : "—"],
-        ["End Date", payload.extra?.endDate ? fmtDate(payload.extra.endDate) : "—"],
-        ["Issued By", payload.extra?.issuedBy || "—"],
+      customerTitle: "Issued To",
+      col2Label:     "Coverage Period",
+      col2Lines: [
+        ["Start Date", startDate],
+        ["End Date",   endDate],
       ],
+      col3Label: "Issued By",
+      col3Lines: [
+        ["Staff",  issuedBy],
+        ["Branch", cleanStr(payload.extra?.branch || payload.tenant?.district || "—")],
+      ],
+      notes:      payload.extra?.warrantyTerms || payload.tenant?.warrantyTerms || payload.extra?.notes ||
+                  "Warranty is void if the product is physically damaged or tampered with.",
+      preparedBy: issuedBy,
+      approvedBy: payload.customer?.name || "Customer Signature",
     },
   });
 }
 
+// ─── Exports ──────────────────────────────────────────────────────────────────
 module.exports = {
+  // Utilities (kept for backward compatibility)
   esc,
-  cleanString,
+  cleanString:       cleanStr,
   normalizeHexColor,
   hexToRgb,
   rgba,
@@ -1436,8 +1033,10 @@ module.exports = {
   computeTotals,
   resolveBrandTheme,
   logoHtml,
-  commonStyles,
+  commonStyles:      (theme) => buildStyles(resolveBrandTheme({}, { primaryColor: theme?.primary })),
   buildPage,
+
+  // Document renderers
   renderReceiptHtml,
   renderInvoiceHtml,
   renderProformaHtml,

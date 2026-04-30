@@ -27,6 +27,25 @@ function getUserId(req) {
   return req.user?.userId || req.user?.id || null;
 }
 
+function cleanString(x) {
+  const s = x == null ? "" : String(x).trim();
+  return s || null;
+}
+
+function getActiveBranchId(req) {
+  return (
+    cleanString(req.user?.activeBranchId) ||
+    cleanString(req.user?.branchId) ||
+    cleanString(req.branchAccess?.activeBranchId) ||
+    cleanString(req.branch?.id) ||
+    null
+  );
+}
+
+function canViewAllBranches(req) {
+  return Boolean(req.user?.canViewAllBranches);
+}
+
 function getDbPermissions(req) {
   return Array.isArray(req.dbPermissions) ? req.dbPermissions : [];
 }
@@ -44,11 +63,6 @@ function toInt(x) {
 function toMoney(x) {
   const n = typeof x === "string" ? Number(x.trim()) : Number(x);
   return Number.isFinite(n) ? n : NaN;
-}
-
-function cleanString(x) {
-  const s = x == null ? "" : String(x).trim();
-  return s || null;
 }
 
 function cleanBool(x) {
@@ -142,7 +156,7 @@ function productSelect() {
   };
 }
 
-async function writeAuditLog(tx, { tenantId, userId, entity, entityId, action, metadata }) {
+async function writeAuditLog(tx, { tenantId, userId, branchId, entity, entityId, action, metadata }) {
   try {
     if (!Object.values(INVENTORY_AUDIT_ACTIONS).includes(action)) {
       return;
@@ -152,6 +166,7 @@ async function writeAuditLog(tx, { tenantId, userId, entity, entityId, action, m
       data: {
         tenantId,
         userId: userId || null,
+        branchId: branchId || null,
         entity,
         entityId: entityId || null,
         action,
@@ -306,7 +321,6 @@ function buildProductWhere(req) {
   const q = cleanString(req.query.q);
   const activeParam = cleanBool(req.query.active);
   const isActive = activeParam == null ? true : activeParam;
-  const outOfStock = cleanBool(req.query.outOfStock) === true;
   const category = cleanString(req.query.category);
   const subcategory = cleanString(req.query.subcategory);
   const brand = cleanString(req.query.brand);
@@ -330,8 +344,6 @@ function buildProductWhere(req) {
   if (subcategory) where.subcategory = { equals: subcategory, mode: "insensitive" };
   if (brand) where.brand = { equals: brand, mode: "insensitive" };
 
-  if (outOfStock) where.stockQty = 0;
-
   return where;
 }
 
@@ -341,6 +353,18 @@ function buildProductOrderBy(sort) {
   if (sort === "stock_low") orderBy = [{ stockQty: "asc" }, { createdAt: "desc" }];
   if (sort === "stock_high") orderBy = [{ stockQty: "desc" }, { createdAt: "desc" }];
   return orderBy;
+}
+
+function sortByEffectiveStock(products, sort) {
+  if (sort !== "stock_low" && sort !== "stock_high") return products;
+
+  return [...products].sort((a, b) => {
+    const aq = Number(a.effectiveStockQty || 0);
+    const bq = Number(b.effectiveStockQty || 0);
+
+    if (sort === "stock_low") return aq - bq || String(a.name || "").localeCompare(String(b.name || ""));
+    return bq - aq || String(a.name || "").localeCompare(String(b.name || ""));
+  });
 }
 
 function categoryText(p) {
@@ -411,14 +435,305 @@ function buildStockAdjustmentNote({ type, lossReason, note }) {
   const cleanNote = cleanString(note);
 
   if (type !== "LOSS") return cleanNote;
-
   if (!lossReason) return cleanNote;
-
-  if (cleanNote) {
-    return `Reason: ${lossReason}\n${cleanNote}`;
-  }
+  if (cleanNote) return `Reason: ${lossReason}\n${cleanNote}`;
 
   return `Reason: ${lossReason}`;
+}
+
+function resolveInventoryScope(req) {
+  const requestedBranchId =
+    cleanString(req.query?.branchId) ||
+    cleanString(req.headers["x-branch-id"]) ||
+    null;
+
+  const allBranchesRequested =
+    String(req.query?.allBranches || "")
+      .trim()
+      .toLowerCase() === "true";
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (allBranchesRequested) {
+    if (!canViewAllBranches(req)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "ALL_BRANCHES",
+      branchId: null,
+      allowedBranchIds,
+    };
+  }
+
+  if (requestedBranchId) {
+    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "SINGLE_BRANCH",
+      branchId: requestedBranchId,
+      allowedBranchIds,
+    };
+  }
+
+  return {
+    mode: "SINGLE_BRANCH",
+    branchId: getActiveBranchId(req),
+    allowedBranchIds,
+  };
+}
+
+async function ensureWritableBranchAccessOrThrow(req) {
+  const tenantId = getTenantId(req);
+  const branchId = getActiveBranchId(req);
+
+  if (!tenantId || !branchId) {
+    const e = new Error("BRANCH_REQUIRED");
+    e.code = "BRANCH_REQUIRED";
+    throw e;
+  }
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(branchId)) {
+    const e = new Error("BRANCH_ACCESS_DENIED");
+    e.code = "BRANCH_ACCESS_DENIED";
+    throw e;
+  }
+
+  if (req.user?.canOperateInActiveBranch === false) {
+    const e = new Error("BRANCH_OPERATION_DENIED");
+    e.code = "BRANCH_OPERATION_DENIED";
+    throw e;
+  }
+
+  const branch = await prisma.branch.findFirst({
+    where: {
+      id: branchId,
+      tenantId,
+      status: {
+        in: ["ACTIVE", "CLOSED"],
+      },
+    },
+    select: {
+      id: true,
+      tenantId: true,
+      name: true,
+      code: true,
+      status: true,
+      isMain: true,
+    },
+  });
+
+  if (!branch) {
+    const e = new Error("BRANCH_NOT_FOUND");
+    e.code = "BRANCH_NOT_FOUND";
+    throw e;
+  }
+
+  if (branch.status !== "ACTIVE") {
+    const e = new Error("BRANCH_NOT_ACTIVE");
+    e.code = "BRANCH_NOT_ACTIVE";
+    throw e;
+  }
+
+  return branch;
+}
+
+async function getBranchInventoryMap(tenantId, branchId, productIds) {
+  if (!branchId || !Array.isArray(productIds) || productIds.length === 0) {
+    return new Map();
+  }
+
+  if (!prisma.branchInventory || typeof prisma.branchInventory.findMany !== "function") {
+    return new Map();
+  }
+
+  const rows = await prisma.branchInventory.findMany({
+    where: {
+      tenantId,
+      branchId,
+      productId: { in: productIds },
+    },
+    select: {
+      productId: true,
+      qtyOnHand: true,
+      qtyReserved: true,
+      branchId: true,
+    },
+  });
+
+  return new Map(
+    rows.map((row) => [
+      row.productId,
+      {
+        branchId: row.branchId,
+        qtyOnHand: Number(row.qtyOnHand || 0),
+        qtyReserved: Number(row.qtyReserved || 0),
+      },
+    ]),
+  );
+}
+
+function attachBranchStock(products, branchMap, branchId) {
+  return products.map((p) => {
+    const branchRow = branchMap.get(p.id) || null;
+
+    /*
+      Inventory truth:
+      - in a single branch view, missing BranchInventory means this branch has 0 sellable stock.
+      - in all-branches view, Product.stockQty is the synced tenant-wide total.
+    */
+    const branchQty = branchId ? Number(branchRow?.qtyOnHand || 0) : null;
+    const reservedQty = branchId ? Number(branchRow?.qtyReserved || 0) : null;
+    const effectiveQty = branchId ? branchQty : Number(p.stockQty || 0);
+
+    return {
+      ...p,
+      branchId: branchId || null,
+      branchStockQty: branchQty,
+      branchReservedQty: reservedQty,
+      effectiveStockQty: effectiveQty,
+    };
+  });
+}
+
+function filterProductsByScopeStock(products, { lowStock, outOfStock, threshold }) {
+  return products.filter((p) => {
+    const qty = Number(p.effectiveStockQty || 0);
+
+    if (outOfStock) return qty === 0;
+    if (!lowStock) return true;
+
+    const thresholdToUse = stockThresholdForProduct(p, threshold);
+    return qty > 0 && qty <= thresholdToUse;
+  });
+}
+
+async function createOrSetBranchInventoryIfPossible(tx, { tenantId, branchId, productId, qtyOnHand }) {
+  if (!branchId || !tx.branchInventory || typeof tx.branchInventory.findFirst !== "function") {
+    return null;
+  }
+
+  const existing = await tx.branchInventory.findFirst({
+    where: { tenantId, branchId, productId },
+    select: { id: true },
+  });
+
+  if (existing) {
+    return tx.branchInventory.update({
+      where: { id: existing.id },
+      data: {
+        qtyOnHand,
+        updatedAt: new Date(),
+      },
+    });
+  }
+
+  return tx.branchInventory.create({
+    data: {
+      tenantId,
+      branchId,
+      productId,
+      qtyOnHand,
+      qtyReserved: 0,
+    },
+  });
+}
+
+async function getOrCreateBranchInventoryTx(tx, { tenantId, branchId, productId }) {
+  if (!branchId || !tx.branchInventory || typeof tx.branchInventory.findFirst !== "function") {
+    return null;
+  }
+
+  const existing = await tx.branchInventory.findFirst({
+    where: { tenantId, branchId, productId },
+    select: {
+      id: true,
+      qtyOnHand: true,
+      qtyReserved: true,
+    },
+  });
+
+  if (existing) return existing;
+
+  return tx.branchInventory.create({
+    data: {
+      tenantId,
+      branchId,
+      productId,
+      qtyOnHand: 0,
+      qtyReserved: 0,
+    },
+    select: {
+      id: true,
+      qtyOnHand: true,
+      qtyReserved: true,
+    },
+  });
+}
+
+async function syncProductTotalStockFromBranchesTx(tx, { tenantId, productId }) {
+  if (!tx.branchInventory || typeof tx.branchInventory.aggregate !== "function") {
+    return null;
+  }
+
+  const aggregate = await tx.branchInventory.aggregate({
+    where: {
+      tenantId,
+      productId,
+    },
+    _sum: {
+      qtyOnHand: true,
+    },
+  });
+
+  const totalQty = Number(aggregate?._sum?.qtyOnHand || 0);
+
+  await tx.product.update({
+    where: { id: productId },
+    data: {
+      stockQty: totalQty,
+    },
+  });
+
+  return totalQty;
+}
+
+function handleBranchError(res, err) {
+  const code = err?.code;
+  const msg = String(err?.message || "");
+
+  if (code === "BRANCH_REQUIRED" || msg === "BRANCH_REQUIRED") {
+    return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
+  }
+  if (code === "BRANCH_ACCESS_DENIED" || msg === "BRANCH_ACCESS_DENIED") {
+    return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
+  }
+  if (code === "BRANCH_OPERATION_DENIED" || msg === "BRANCH_OPERATION_DENIED") {
+    return res.status(403).json({
+      message: "You cannot operate in this branch",
+      code: "BRANCH_OPERATION_DENIED",
+    });
+  }
+  if (code === "BRANCH_NOT_FOUND" || msg === "BRANCH_NOT_FOUND") {
+    return res.status(404).json({ message: "Branch not found", code: "BRANCH_NOT_FOUND" });
+  }
+  if (code === "BRANCH_NOT_ACTIVE" || msg === "BRANCH_NOT_ACTIVE") {
+    return res.status(409).json({ message: "Selected branch is not active", code: "BRANCH_NOT_ACTIVE" });
+  }
+
+  return null;
 }
 
 async function getProducts(req, res) {
@@ -437,10 +752,11 @@ async function getProducts(req, res) {
       ? thresholdRaw
       : 5;
 
-  const where = buildProductWhere(req);
-  const orderBy = buildProductOrderBy(sort);
-
   try {
+    const scope = resolveInventoryScope(req);
+    const where = buildProductWhere(req);
+    const orderBy = buildProductOrderBy(sort);
+
     const products = await prisma.product.findMany({
       where,
       orderBy,
@@ -449,12 +765,22 @@ async function getProducts(req, res) {
       select: productSelect(),
     });
 
-    const filtered = products.filter((p) => {
-      if (outOfStock) return Number(p.stockQty || 0) === 0;
-      if (!lowStock) return true;
+    const branchMap = await getBranchInventoryMap(
+      tenantId,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+      products.map((p) => p.id),
+    );
 
-      const thresholdToUse = stockThresholdForProduct(p, threshold);
-      return Number(p.stockQty || 0) > 0 && Number(p.stockQty || 0) <= thresholdToUse;
+    const enriched = attachBranchStock(
+      products,
+      branchMap,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+    );
+
+    const filtered = filterProductsByScopeStock(sortByEffectiveStock(enriched, sort), {
+      lowStock,
+      outOfStock,
+      threshold,
     });
 
     const nextCursor = products.length === limit ? products[products.length - 1].id : null;
@@ -463,8 +789,11 @@ async function getProducts(req, res) {
       products: filtered,
       count: filtered.length,
       nextCursor,
+      branchScope: scope,
     });
   } catch (err) {
+    if (handleBranchError(res, err)) return;
+
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch products" });
   }
@@ -481,6 +810,8 @@ async function searchProducts(req, res) {
   if (!q) return res.json({ products: [], count: 0 });
 
   try {
+    const scope = resolveInventoryScope(req);
+
     const products = await prisma.product.findMany({
       where: {
         tenantId,
@@ -514,8 +845,22 @@ async function searchProducts(req, res) {
       take: limit,
     });
 
-    return res.json({ products, count: products.length });
+    const branchMap = await getBranchInventoryMap(
+      tenantId,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+      products.map((p) => p.id),
+    );
+
+    const enriched = attachBranchStock(
+      products,
+      branchMap,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+    );
+
+    return res.json({ products: enriched, count: enriched.length, branchScope: scope });
   } catch (err) {
+    if (handleBranchError(res, err)) return;
+
     console.error(err);
     return res.status(500).json({ message: "Failed to search products" });
   }
@@ -528,6 +873,8 @@ async function getProductById(req, res) {
   const id = req.params.id;
 
   try {
+    const scope = resolveInventoryScope(req);
+
     const product = await prisma.product.findFirst({
       where: { id, tenantId },
       select: productSelect(),
@@ -535,8 +882,22 @@ async function getProductById(req, res) {
 
     if (!product) return res.status(404).json({ message: "Product not found" });
 
-    return res.json(product);
+    const branchMap = await getBranchInventoryMap(
+      tenantId,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+      [product.id],
+    );
+
+    const [enriched] = attachBranchStock(
+      [product],
+      branchMap,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+    );
+
+    return res.json({ ...enriched, branchScope: scope });
   } catch (err) {
+    if (handleBranchError(res, err)) return;
+
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch product" });
   }
@@ -548,6 +909,7 @@ async function createProduct(req, res) {
   if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
   try {
+    const activeBranch = await ensureWritableBranchAccessOrThrow(req);
     const data = normalizeProductInput(req.body || {}, { isCreate: true });
 
     await ensureUniqueProductFields({
@@ -558,51 +920,77 @@ async function createProduct(req, res) {
       sku: data.sku,
     });
 
-    const created = await prisma.product.create({
-      data: {
-        tenantId,
-        name: data.name,
-        sku: data.sku,
-        serial: data.serial,
-        barcode: data.barcode,
-        category: data.category,
-        subcategory: data.subcategory,
-        subcategoryOther: data.subcategoryOther,
-        brand: data.brand,
-        minStockLevel: data.minStockLevel,
-        costPrice: data.costPrice,
-        sellPrice: data.sellPrice,
-        stockQty: data.stockQty,
-        isActive: true,
-      },
-      select: productSelect(),
-    });
+    const created = await prisma.$transaction(async (tx) => {
+      const product = await tx.product.create({
+        data: {
+          tenantId,
+          name: data.name,
+          sku: data.sku,
+          serial: data.serial,
+          barcode: data.barcode,
+          category: data.category,
+          subcategory: data.subcategory,
+          subcategoryOther: data.subcategoryOther,
+          brand: data.brand,
+          minStockLevel: data.minStockLevel,
+          costPrice: data.costPrice,
+          sellPrice: data.sellPrice,
+          stockQty: data.stockQty,
+          isActive: true,
+        },
+        select: productSelect(),
+      });
 
-    try {
-      await writeAuditLog(prisma, {
+      await createOrSetBranchInventoryIfPossible(tx, {
+        tenantId,
+        branchId: activeBranch.id,
+        productId: product.id,
+        qtyOnHand: data.stockQty,
+      });
+
+      const syncedTotal = await syncProductTotalStockFromBranchesTx(tx, {
+        tenantId,
+        productId: product.id,
+      });
+
+      await writeAuditLog(tx, {
         tenantId,
         userId,
+        branchId: activeBranch.id,
         entity: "PRODUCT",
-        entityId: created.id,
+        entityId: product.id,
         action: INVENTORY_AUDIT_ACTIONS.PRODUCT_CREATED,
         metadata: {
-          name: created.name,
-          sku: created.sku,
-          barcode: created.barcode,
-          stockQty: created.stockQty,
-          costPrice: created.costPrice,
-          sellPrice: created.sellPrice,
+          branchId: activeBranch.id,
+          branchCode: activeBranch.code,
+          name: product.name,
+          sku: product.sku,
+          barcode: product.barcode,
+          branchStockQty: data.stockQty,
+          stockQty: syncedTotal ?? product.stockQty,
+          costPrice: product.costPrice,
+          sellPrice: product.sellPrice,
         },
       });
-    } catch (auditErr) {
-      console.error("createProduct audit log failed:", auditErr);
-    }
 
-    return res.status(201).json(created);
+      return tx.product.findFirst({
+        where: { id: product.id, tenantId },
+        select: productSelect(),
+      });
+    });
+
+    const branchMap = await getBranchInventoryMap(tenantId, activeBranch.id, [created.id]);
+    const [enriched] = attachBranchStock([created], branchMap, activeBranch.id);
+
+    return res.status(201).json({
+      ...enriched,
+      branchScope: { mode: "SINGLE_BRANCH", branchId: activeBranch.id },
+    });
   } catch (err) {
     const code = err?.code;
     const msg = String(err?.message || "");
 
+    if (handleBranchError(res, err)) return;
     if (code === "NAME_REQUIRED" || msg === "NAME_REQUIRED") {
       return res.status(400).json({ message: "name is required" });
     }
@@ -665,20 +1053,24 @@ async function updateProduct(req, res) {
       sku: data.sku,
     });
 
-    const next = await prisma.product.update({
-      where: { id },
-      data,
-      select: productSelect(),
-    });
+    const activeBranchId = getActiveBranchId(req);
 
-    try {
-      await writeAuditLog(prisma, {
+    const next = await prisma.$transaction(async (tx) => {
+      const updated = await tx.product.update({
+        where: { id },
+        data,
+        select: productSelect(),
+      });
+
+      await writeAuditLog(tx, {
         tenantId,
         userId,
+        branchId: activeBranchId,
         entity: "PRODUCT",
-        entityId: next.id,
+        entityId: updated.id,
         action: INVENTORY_AUDIT_ACTIONS.PRODUCT_UPDATED,
         metadata: {
+          branchId: activeBranchId,
           before: {
             name: existing.name,
             sku: existing.sku,
@@ -693,29 +1085,42 @@ async function updateProduct(req, res) {
             sellPrice: existing.sellPrice,
           },
           after: {
-            name: next.name,
-            sku: next.sku,
-            serial: next.serial,
-            barcode: next.barcode,
-            category: next.category,
-            subcategory: next.subcategory,
-            subcategoryOther: next.subcategoryOther,
-            brand: next.brand,
-            minStockLevel: next.minStockLevel,
-            costPrice: next.costPrice,
-            sellPrice: next.sellPrice,
+            name: updated.name,
+            sku: updated.sku,
+            serial: updated.serial,
+            barcode: updated.barcode,
+            category: updated.category,
+            subcategory: updated.subcategory,
+            subcategoryOther: updated.subcategoryOther,
+            brand: updated.brand,
+            minStockLevel: updated.minStockLevel,
+            costPrice: updated.costPrice,
+            sellPrice: updated.sellPrice,
           },
         },
       });
-    } catch (auditErr) {
-      console.error("updateProduct audit log failed:", auditErr);
-    }
 
-    return res.json(next);
+      return updated;
+    });
+
+    const scope = resolveInventoryScope(req);
+    const branchMap = await getBranchInventoryMap(
+      tenantId,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+      [next.id],
+    );
+    const [enriched] = attachBranchStock(
+      [next],
+      branchMap,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+    );
+
+    return res.json({ ...enriched, branchScope: scope });
   } catch (err) {
     const code = err?.code;
     const msg = String(err?.message || "");
 
+    if (handleBranchError(res, err)) return;
     if (code === "PRODUCT_NOT_FOUND" || msg === "PRODUCT_NOT_FOUND") {
       return res.status(404).json({ message: "Product not found" });
     }
@@ -757,6 +1162,7 @@ async function deleteProduct(req, res) {
   if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
   const id = req.params.id;
+  const activeBranchId = getActiveBranchId(req);
 
   try {
     const result = await prisma.$transaction(async (tx) => {
@@ -783,10 +1189,11 @@ async function deleteProduct(req, res) {
       await writeAuditLog(tx, {
         tenantId,
         userId,
+        branchId: activeBranchId,
         entity: "PRODUCT",
         entityId: id,
         action: INVENTORY_AUDIT_ACTIONS.PRODUCT_DEACTIVATED,
-        metadata: { name: existing.name },
+        metadata: { branchId: activeBranchId, name: existing.name },
       });
 
       return { alreadyInactive: false };
@@ -816,6 +1223,7 @@ async function activateProduct(req, res) {
   if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
   const id = req.params.id;
+  const activeBranchId = getActiveBranchId(req);
 
   try {
     const result = await prisma.$transaction(async (tx) => {
@@ -842,10 +1250,11 @@ async function activateProduct(req, res) {
       await writeAuditLog(tx, {
         tenantId,
         userId,
+        branchId: activeBranchId,
         entity: "PRODUCT",
         entityId: id,
         action: INVENTORY_AUDIT_ACTIONS.PRODUCT_ACTIVATED,
-        metadata: { name: existing.name },
+        metadata: { branchId: activeBranchId, name: existing.name },
       });
 
       return { alreadyActive: false };
@@ -874,6 +1283,7 @@ async function adjustStock(req, res) {
     const tenantId = req.user?.tenantId;
     const userId = getUserId(req);
     const userRole = String(req.user?.role || "").toUpperCase();
+    const activeBranch = await ensureWritableBranchAccessOrThrow(req);
 
     if (!tenantId) {
       return res.status(401).json({ message: "Unauthorized" });
@@ -889,9 +1299,9 @@ async function adjustStock(req, res) {
     }
 
     if (!type) {
-      return res
-        .status(400)
-        .json({ message: "Invalid type. Use RESTOCK, LOSS, or CORRECTION." });
+      return res.status(400).json({
+        message: "Invalid type. Use RESTOCK, LOSS, or CORRECTION.",
+      });
     }
 
     if (type === "LOSS" && !lossReason) {
@@ -962,81 +1372,134 @@ async function adjustStock(req, res) {
       }
     }
 
-    const result = await prisma.$transaction(async (tx) => {
-      const product = await tx.product.findFirst({
-        where: { id: productId, tenantId },
-        select: {
-          id: true,
-          name: true,
-          stockQty: true,
-          sku: true,
-          barcode: true,
-          serial: true,
-        },
-      });
+    const result = await prisma.$transaction(
+      async (tx) => {
+        const product = await tx.product.findFirst({
+          where: { id: productId, tenantId },
+          select: {
+            id: true,
+            name: true,
+            stockQty: true,
+            sku: true,
+            barcode: true,
+            serial: true,
+          },
+        });
 
-      if (!product) {
-        throw new Error("PRODUCT_NOT_FOUND");
-      }
+        if (!product) {
+          throw new Error("PRODUCT_NOT_FOUND");
+        }
 
-      const beforeQty = Number(product.stockQty || 0);
+        const branchInventory = await getOrCreateBranchInventoryTx(tx, {
+          tenantId,
+          branchId: activeBranch.id,
+          productId: product.id,
+        });
 
-      let delta = 0;
-      let afterQty = beforeQty;
+        if (!branchInventory) {
+          throw new Error("BRANCH_INVENTORY_UNAVAILABLE");
+        }
 
-      if (type === "RESTOCK") {
-        delta = quantity;
-        afterQty = beforeQty + quantity;
-      } else if (type === "LOSS") {
-        delta = -quantity;
-        afterQty = beforeQty - quantity;
-      } else {
-        delta = newStockQty - beforeQty;
-        afterQty = newStockQty;
-      }
+        const beforeQtyBranch = Number(branchInventory.qtyOnHand || 0);
 
-      if (afterQty < 0) {
-        throw new Error("NEGATIVE_STOCK");
-      }
+        let delta = 0;
+        let afterQty = beforeQtyBranch;
 
-      await tx.product.update({
-        where: { id: product.id },
-        data: { stockQty: afterQty },
-      });
+        if (type === "RESTOCK") {
+          delta = quantity;
+          afterQty = beforeQtyBranch + quantity;
+        } else if (type === "LOSS") {
+          delta = -quantity;
+          afterQty = beforeQtyBranch - quantity;
+        } else {
+          delta = newStockQty - beforeQtyBranch;
+          afterQty = newStockQty;
+        }
 
-      const adj = await tx.stockAdjustment.create({
-        data: {
+        if (afterQty < 0) {
+          throw new Error("NEGATIVE_STOCK");
+        }
+
+        await tx.branchInventory.update({
+          where: { id: branchInventory.id },
+          data: {
+            qtyOnHand: afterQty,
+            updatedAt: new Date(),
+          },
+        });
+
+        const globalAfterQty = await syncProductTotalStockFromBranchesTx(tx, {
           tenantId,
           productId: product.id,
-          type,
-          delta,
-          beforeQty,
-          afterQty,
-          note: note || null,
-          createdById: userId || null,
-        },
-        select: {
-          id: true,
-          type: true,
-          delta: true,
-          beforeQty: true,
-          afterQty: true,
-          note: true,
-          createdAt: true,
-        },
-      });
+        });
 
-      return {
-        productId: product.id,
-        productName: product.name,
-        beforeQty,
-        afterQty,
-        delta,
-        type,
-        adjustmentId: adj.id,
-        lossReason: type === "LOSS" ? lossReason : null,
-      };
-    });
+        const adj = await tx.stockAdjustment.create({
+          data: {
+            tenantId,
+            branchId: activeBranch.id,
+            productId: product.id,
+            type,
+            delta,
+            beforeQty: beforeQtyBranch,
+            afterQty,
+            note: note || null,
+            createdById: userId || null,
+          },
+          select: {
+            id: true,
+            branchId: true,
+            type: true,
+            delta: true,
+            beforeQty: true,
+            afterQty: true,
+            note: true,
+            createdAt: true,
+          },
+        });
+
+        await writeAuditLog(tx, {
+          tenantId,
+          userId,
+          branchId: activeBranch.id,
+          entity: "PRODUCT",
+          entityId: product.id,
+          action: INVENTORY_AUDIT_ACTIONS.PRODUCT_UPDATED,
+          metadata: {
+            event: "STOCK_ADJUSTED",
+            adjustmentId: adj.id,
+            branchId: activeBranch.id,
+            branchCode: activeBranch.code,
+            productId: product.id,
+            productName: product.name,
+            type,
+            delta,
+            beforeQty: beforeQtyBranch,
+            afterQty,
+            globalAfterQty,
+            lossReason: type === "LOSS" ? lossReason : null,
+            note: note || null,
+          },
+        });
+
+        return {
+          productId: product.id,
+          productName: product.name,
+          branchId: activeBranch.id,
+          branchCode: activeBranch.code,
+          beforeQty: beforeQtyBranch,
+          afterQty,
+          delta,
+          type,
+          adjustmentId: adj.id,
+          lossReason: type === "LOSS" ? lossReason : null,
+          globalAfterQty,
+        };
+      },
+      {
+        maxWait: 10000,
+        timeout: 20000,
+      },
+    );
 
     return res.status(201).json({
       message: "Stock updated",
@@ -1045,12 +1508,28 @@ async function adjustStock(req, res) {
   } catch (err) {
     const msg = String(err?.message || "");
 
+    if (handleBranchError(res, err)) return;
+
     if (msg === "PRODUCT_NOT_FOUND") {
       return res.status(404).json({ message: "Product not found" });
     }
 
     if (msg === "NEGATIVE_STOCK") {
       return res.status(400).json({ message: "Stock cannot go below 0" });
+    }
+
+    if (msg === "BRANCH_INVENTORY_UNAVAILABLE") {
+      return res.status(500).json({
+        message: "Branch inventory is not available",
+        code: "BRANCH_INVENTORY_UNAVAILABLE",
+      });
+    }
+
+    if (err?.code === "P2028") {
+      return res.status(503).json({
+        message: "Stock update transaction timed out. Please retry.",
+        code: "STOCK_TRANSACTION_TIMEOUT",
+      });
     }
 
     console.error("adjustStock error:", err);
@@ -1063,27 +1542,42 @@ async function listStockAdjustments(req, res) {
     const tenantId = req.user?.tenantId;
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
+    const scope = resolveInventoryScope(req);
     const productId = String(req.params.id || "");
     if (!productId) return res.status(400).json({ message: "Missing product id" });
 
     const rows = await prisma.stockAdjustment.findMany({
-      where: { tenantId, productId },
+      where: {
+        tenantId,
+        productId,
+        ...(scope.mode === "SINGLE_BRANCH" && scope.branchId ? { branchId: scope.branchId } : {}),
+      },
       orderBy: { createdAt: "desc" },
       take: 50,
       select: {
         id: true,
+        branchId: true,
         type: true,
         delta: true,
         beforeQty: true,
         afterQty: true,
         note: true,
         createdAt: true,
+        branch: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+          },
+        },
         createdBy: { select: { name: true } },
       },
     });
 
-    return res.json({ adjustments: rows });
+    return res.json({ adjustments: rows, branchScope: scope });
   } catch (err) {
+    if (handleBranchError(res, err)) return;
+
     console.error("listStockAdjustments error:", err);
     return res.status(500).json({ message: "Failed to load stock history" });
   }
@@ -1094,6 +1588,7 @@ async function listAllStockAdjustments(req, res) {
     const tenantId = req.user?.tenantId;
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
+    const scope = resolveInventoryScope(req);
     const q = cleanString(req.query.q);
     const type = normalizeAdjustmentType(req.query.type);
 
@@ -1112,6 +1607,7 @@ async function listAllStockAdjustments(req, res) {
     const where = {
       tenantId,
       createdAt: { gte: start, lte: end },
+      ...(scope.mode === "SINGLE_BRANCH" && scope.branchId ? { branchId: scope.branchId } : {}),
     };
 
     if (type) where.type = type;
@@ -1133,6 +1629,7 @@ async function listAllStockAdjustments(req, res) {
       take: limit,
       select: {
         id: true,
+        branchId: true,
         type: true,
         delta: true,
         beforeQty: true,
@@ -1148,6 +1645,13 @@ async function listAllStockAdjustments(req, res) {
             minStockLevel: true,
           },
         },
+        branch: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+          },
+        },
         createdBy: { select: { name: true } },
       },
     });
@@ -1156,8 +1660,11 @@ async function listAllStockAdjustments(req, res) {
       range: { from: start.toISOString(), to: end.toISOString() },
       count: rows.length,
       adjustments: rows,
+      branchScope: scope,
     });
   } catch (err) {
+    if (handleBranchError(res, err)) return;
+
     console.error("listAllStockAdjustments error:", err);
     return res.status(500).json({ message: "Failed to load stock adjustments" });
   }
@@ -1167,6 +1674,8 @@ async function getInventorySummary(req, res) {
   try {
     const tenantId = req.user?.tenantId;
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
+    const scope = resolveInventoryScope(req);
 
     const products = await prisma.product.findMany({
       where: { tenantId, isActive: true },
@@ -1179,6 +1688,18 @@ async function getInventorySummary(req, res) {
       },
     });
 
+    const branchMap = await getBranchInventoryMap(
+      tenantId,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+      products.map((p) => p.id),
+    );
+
+    const enriched = attachBranchStock(
+      products,
+      branchMap,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+    );
+
     let totalActiveProducts = 0;
     let totalStockUnits = 0;
     let outOfStockCount = 0;
@@ -1186,10 +1707,10 @@ async function getInventorySummary(req, res) {
     let stockCostValue = 0;
     let stockSellValue = 0;
 
-    for (const p of products) {
+    for (const p of enriched) {
       totalActiveProducts += 1;
 
-      const qty = Number(p.stockQty || 0);
+      const qty = Number(p.effectiveStockQty || 0);
       const cost = Number(p.costPrice || 0);
       const sell = Number(p.sellPrice || 0);
       const minStockLevel = Number.isFinite(Number(p.minStockLevel))
@@ -1208,6 +1729,7 @@ async function getInventorySummary(req, res) {
     }
 
     return res.json({
+      branchScope: scope,
       summary: {
         totalActiveProducts,
         totalStockUnits,
@@ -1218,6 +1740,8 @@ async function getInventorySummary(req, res) {
       },
     });
   } catch (err) {
+    if (handleBranchError(res, err)) return;
+
     console.error("getInventorySummary error:", err);
     return res.status(500).json({ message: "Failed to load inventory summary" });
   }
@@ -1225,9 +1749,10 @@ async function getInventorySummary(req, res) {
 
 async function reorderPdf(req, res) {
   try {
-    const tenantId = req.user?.tenantId;
+    const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
+    const scope = resolveInventoryScope(req);
     const thresholdRaw = toInt(req.query.threshold);
     const threshold =
       Number.isFinite(thresholdRaw) && thresholdRaw >= 0 && thresholdRaw <= 9999
@@ -1258,14 +1783,31 @@ async function reorderPdf(req, res) {
       take: 1000,
     });
 
-    const outOfStock = allActiveProducts.filter((p) => Number(p.stockQty || 0) === 0);
+    const branchMap = await getBranchInventoryMap(
+      tenantId,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+      allActiveProducts.map((p) => p.id),
+    );
 
-    const lowStock = allActiveProducts.filter((p) => {
-      const qty = Number(p.stockQty || 0);
+    const enriched = attachBranchStock(
+      allActiveProducts,
+      branchMap,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+    );
+
+    const outOfStock = enriched.filter((p) => Number(p.effectiveStockQty || 0) === 0);
+
+    const lowStock = enriched.filter((p) => {
+      const qty = Number(p.effectiveStockQty || 0);
       if (qty <= 0) return false;
       const thresholdToUse = stockThresholdForProduct(p, threshold);
       return qty <= thresholdToUse;
     });
+
+    const scopeLine =
+      scope.mode === "SINGLE_BRANCH" && scope.branchId
+        ? `Branch scope: ${scope.branchId}`
+        : "Branch scope: All branches";
 
     const storeLine = [tenant?.name, tenant?.phone, tenant?.email].filter(Boolean).join(" • ");
     const filename = `storvex-reorder-${isoDate(new Date())}.pdf`;
@@ -1322,11 +1864,12 @@ async function reorderPdf(req, res) {
     }
 
     function drawMiniStats() {
-      ensureSpace(80);
+      ensureSpace(94);
 
       doc.font("Helvetica").fontSize(10).fillColor("#334155");
       doc.text(`Generated: ${new Date().toISOString()}`);
       doc.text(`Default low stock level: ${threshold}`);
+      doc.text(scopeLine);
       doc.moveDown(0.8);
 
       const gap = 12;
@@ -1422,7 +1965,7 @@ async function reorderPdf(req, res) {
         doc.text(categoryText(r), x + colName + 8, y + 6, { width: colCat - 16 });
 
         doc.fillColor("#0f172a");
-        doc.text(String(r.stockQty ?? 0), x + colName + colCat, y + 6, { width: colStock - 8, align: "center" });
+        doc.text(String(r.effectiveStockQty ?? 0), x + colName + colCat, y + 6, { width: colStock - 8, align: "center" });
         doc.text(thresholdText(r), x + colName + colCat + colStock, y + 6, { width: colMin - 8, align: "center" });
 
         doc.text(formatRwf(r.sellPrice), x + colName + colCat + colStock + colMin, y + 6, {
@@ -1455,6 +1998,8 @@ async function reorderPdf(req, res) {
 
     doc.end();
   } catch (err) {
+    if (handleBranchError(res, err)) return;
+
     console.error("reorderPdf error:", err);
     return res.status(500).json({ message: "Failed to export reorder PDF" });
   }
@@ -1465,6 +2010,7 @@ async function exportInventoryExcel(req, res) {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
+    const scope = resolveInventoryScope(req);
     const sort = normalizeSort(req.query.sort);
     const lowStock = cleanBool(req.query.lowStock) === true;
     const outOfStock = cleanBool(req.query.outOfStock) === true;
@@ -1486,12 +2032,22 @@ async function exportInventoryExcel(req, res) {
       select: productSelect(),
     });
 
-    const filtered = products.filter((p) => {
-      if (outOfStock) return Number(p.stockQty || 0) === 0;
-      if (!lowStock) return true;
+    const branchMap = await getBranchInventoryMap(
+      tenantId,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+      products.map((p) => p.id),
+    );
 
-      const thresholdToUse = stockThresholdForProduct(p, threshold);
-      return Number(p.stockQty || 0) > 0 && Number(p.stockQty || 0) <= thresholdToUse;
+    const enriched = attachBranchStock(
+      products,
+      branchMap,
+      scope.mode === "SINGLE_BRANCH" ? scope.branchId : null,
+    );
+
+    const filtered = filterProductsByScopeStock(sortByEffectiveStock(enriched, sort), {
+      lowStock,
+      outOfStock,
+      threshold,
     });
 
     const workbook = new ExcelJS.Workbook();
@@ -1513,6 +2069,7 @@ async function exportInventoryExcel(req, res) {
       "Buy Price",
       "Sell Price",
       "Stock Qty",
+      "Branch Stock Qty",
       "Min Stock Level",
       "Stock Status",
       "Active",
@@ -1520,7 +2077,7 @@ async function exportInventoryExcel(req, res) {
     ]);
 
     for (const p of filtered) {
-      const qty = Number(p.stockQty || 0);
+      const qty = Number(p.effectiveStockQty || 0);
       const thresholdToUse = stockThresholdForProduct(p, threshold);
 
       let stockStatus = "Healthy";
@@ -1537,6 +2094,7 @@ async function exportInventoryExcel(req, res) {
         Number(p.costPrice || 0),
         Number(p.sellPrice || 0),
         qty,
+        p.branchStockQty == null ? "" : Number(p.branchStockQty || 0),
         thresholdToUse,
         stockStatus,
         p.isActive ? "Yes" : "No",
@@ -1557,12 +2115,13 @@ async function exportInventoryExcel(req, res) {
       "",
       "",
       "",
+      "",
       `Generated ${new Date().toLocaleString()}`,
     ]);
-    ws.mergeCells("A1:L1");
+    ws.mergeCells("A1:M1");
     ws.getCell("A1").font = { bold: true, size: 14 };
     ws.getCell("A1").alignment = { vertical: "middle" };
-    ws.getCell("M1").font = { italic: true, size: 10 };
+    ws.getCell("N1").font = { italic: true, size: 10 };
     ws.getRow(1).height = 22;
 
     ws.getColumn(7).numFmt = '#,##0 "RWF"';
@@ -1575,13 +2134,15 @@ async function exportInventoryExcel(req, res) {
 
     res.setHeader(
       "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     );
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
 
     await workbook.xlsx.write(res);
     return res.end();
   } catch (err) {
+    if (handleBranchError(res, err)) return;
+
     console.error("exportInventoryExcel error:", err);
     return res.status(500).json({ message: "Failed to export inventory Excel" });
   }
@@ -1591,6 +2152,8 @@ async function exportStockAdjustmentsExcel(req, res) {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
+    const scope = resolveInventoryScope(req);
 
     const tenant = await prisma.tenant.findUnique({
       where: { id: tenantId },
@@ -1611,6 +2174,7 @@ async function exportStockAdjustmentsExcel(req, res) {
     const where = {
       tenantId,
       createdAt: { gte: start, lte: end },
+      ...(scope.mode === "SINGLE_BRANCH" && scope.branchId ? { branchId: scope.branchId } : {}),
     };
 
     if (type) where.type = type;
@@ -1632,6 +2196,7 @@ async function exportStockAdjustmentsExcel(req, res) {
       take: 10000,
       select: {
         id: true,
+        branchId: true,
         type: true,
         delta: true,
         beforeQty: true,
@@ -1645,6 +2210,12 @@ async function exportStockAdjustmentsExcel(req, res) {
             sku: true,
             barcode: true,
             category: true,
+          },
+        },
+        branch: {
+          select: {
+            name: true,
+            code: true,
           },
         },
         createdBy: { select: { name: true } },
@@ -1661,6 +2232,7 @@ async function exportStockAdjustmentsExcel(req, res) {
 
     makeWorkbookHeaderRow(ws, [
       "Date",
+      "Branch",
       "Product",
       "SKU",
       "Barcode",
@@ -1676,6 +2248,7 @@ async function exportStockAdjustmentsExcel(req, res) {
     for (const row of rows) {
       ws.addRow([
         row.createdAt ? new Date(row.createdAt).toLocaleString() : "",
+        row.branch?.code || row.branch?.name || "",
         row.product?.name || "",
         row.product?.sku || "",
         row.product?.barcode || "",
@@ -1700,12 +2273,13 @@ async function exportStockAdjustmentsExcel(req, res) {
       "",
       "",
       "",
+      "",
       `Generated ${new Date().toLocaleString()}`,
     ]);
-    ws.mergeCells("A1:J1");
+    ws.mergeCells("A1:K1");
     ws.getCell("A1").font = { bold: true, size: 14 };
     ws.getCell("A1").alignment = { vertical: "middle" };
-    ws.getCell("K1").font = { italic: true, size: 10 };
+    ws.getCell("L1").font = { italic: true, size: 10 };
     ws.getRow(1).height = 22;
 
     styleDataRows(ws);
@@ -1715,13 +2289,15 @@ async function exportStockAdjustmentsExcel(req, res) {
 
     res.setHeader(
       "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     );
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
 
     await workbook.xlsx.write(res);
     return res.end();
   } catch (err) {
+    if (handleBranchError(res, err)) return;
+
     console.error("exportStockAdjustmentsExcel error:", err);
     return res.status(500).json({ message: "Failed to export stock history Excel" });
   }

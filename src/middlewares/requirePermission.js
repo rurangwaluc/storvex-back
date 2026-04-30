@@ -5,10 +5,14 @@ module.exports = function requirePermission(permissionOrList) {
   const required = Array.isArray(permissionOrList) ? permissionOrList : [permissionOrList];
 
   return function (req, res, next) {
-    const role = req.user?.role;
-    if (!role) return res.status(401).json({ message: "Unauthorized" });
+    const role = String(req.user?.role || "").trim().toUpperCase();
 
-    const ok = required.some((p) => roleHas(role, p));
+    if (!role) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const ok = required.some((permission) => roleHas(role, permission));
+
     if (!ok) {
       return res.status(403).json({
         message: "Forbidden",

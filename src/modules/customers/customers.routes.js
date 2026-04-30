@@ -5,11 +5,12 @@ const customersController = require("./customers.controller");
 
 const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
-const requireRole = require("../../middlewares/requireRole");
 const {
   requireActiveSubscription,
   requireWritableSubscription,
 } = require("../../middlewares/requireActiveSubscription");
+const requireDbPermission = require("../../middlewares/requireDbPermission");
+const { PERMISSIONS } = require("../auth/permissions");
 
 const readBase = [authenticate, requireTenant, requireActiveSubscription];
 const writeBase = [
@@ -23,7 +24,7 @@ const writeBase = [
 router.post(
   "/",
   ...writeBase,
-  requireRole("OWNER", "MANAGER", "CASHIER", "SELLER"),
+  requireDbPermission(PERMISSIONS.CUSTOMERS_CREATE),
   customersController.createCustomer
 );
 
@@ -31,7 +32,7 @@ router.post(
 router.get(
   "/",
   ...readBase,
-  requireRole("OWNER", "MANAGER", "CASHIER", "SELLER", "TECHNICIAN"),
+  requireDbPermission(PERMISSIONS.CUSTOMERS_VIEW),
   customersController.getCustomers
 );
 
@@ -39,14 +40,14 @@ router.get(
 router.get(
   "/ledger/summary/outstanding",
   ...readBase,
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  requireDbPermission(PERMISSIONS.POS_VIEW_CREDIT),
   customersController.getCreditSummary
 );
 
 router.get(
   "/:id/ledger",
   ...readBase,
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  requireDbPermission(PERMISSIONS.POS_VIEW_CREDIT),
   customersController.getCustomerLedger
 );
 
@@ -54,7 +55,7 @@ router.get(
 router.get(
   "/:id",
   ...readBase,
-  requireRole("OWNER", "MANAGER", "CASHIER", "SELLER", "TECHNICIAN"),
+  requireDbPermission(PERMISSIONS.CUSTOMERS_VIEW),
   customersController.getCustomerById
 );
 
@@ -62,7 +63,7 @@ router.get(
 router.put(
   "/:id",
   ...writeBase,
-  requireRole("OWNER", "MANAGER", "CASHIER", "SELLER"),
+  requireDbPermission(PERMISSIONS.CUSTOMERS_EDIT),
   customersController.updateCustomer
 );
 
@@ -70,7 +71,7 @@ router.put(
 router.delete(
   "/:id",
   ...writeBase,
-  requireRole("OWNER", "MANAGER"),
+  requireDbPermission(PERMISSIONS.CUSTOMERS_EDIT),
   customersController.deactivateCustomer
 );
 
@@ -78,7 +79,7 @@ router.delete(
 router.put(
   "/:id/reactivate",
   ...writeBase,
-  requireRole("OWNER", "MANAGER"),
+  requireDbPermission(PERMISSIONS.CUSTOMERS_EDIT),
   customersController.reactivateCustomer
 );
 

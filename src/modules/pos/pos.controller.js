@@ -41,15 +41,35 @@ function normalizeSaleType(value) {
 }
 
 function normalizePaymentMethod(value) {
-  const v = String(value || "CASH").toUpperCase();
-  if (v === "CASH" || v === "MOMO" || v === "BANK" || v === "OTHER") return v;
-  return "CASH";
+  const v = String(value || "CASH").trim().toUpperCase();
+
+  if (v === "CASH") return "CASH";
+  if (v === "MOMO" || v === "MOBILE_MONEY" || v === "MTN_MOMO" || v === "AIRTEL_MONEY") {
+    return "MOMO";
+  }
+  if (v === "CARD" || v === "VISA" || v === "MASTERCARD") return "CARD";
+  if (v === "BANK" || v === "BANK_TRANSFER" || v === "TRANSFER") return "BANK";
+  if (v === "OTHER") return "OTHER";
+
+  return null;
 }
 
 function normalizeRefundMethod(value) {
-  const v = String(value || "CASH").toUpperCase();
-  if (v === "CASH" || v === "MOMO" || v === "BANK" || v === "OTHER") return v;
-  return "CASH";
+  const v = String(value || "CASH").trim().toUpperCase();
+
+  if (v === "CASH") return "CASH";
+  if (v === "MOMO" || v === "MOBILE_MONEY" || v === "MTN_MOMO" || v === "AIRTEL_MONEY") {
+    return "MOMO";
+  }
+  if (v === "CARD" || v === "VISA" || v === "MASTERCARD") return "CARD";
+  if (v === "BANK" || v === "BANK_TRANSFER" || v === "TRANSFER") return "BANK";
+  if (v === "OTHER") return "OTHER";
+
+  return null;
+}
+
+function paymentMethodTouchesCashDrawer(method) {
+  return String(method || "").toUpperCase() === "CASH";
 }
 
 function computeSaleStatus({ saleType, total, amountPaid, dueDate }) {
@@ -80,8 +100,8 @@ function addMonthsUtc(date, months) {
       d.getUTCHours(),
       d.getUTCMinutes(),
       d.getUTCSeconds(),
-      d.getUTCMilliseconds()
-    )
+      d.getUTCMilliseconds(),
+    ),
   );
 }
 
@@ -131,7 +151,7 @@ const SUPPORTED_AUDIT_ENTITIES = new Set([
   "PAYMENT",
 ]);
 
-async function writeAuditLog(db, { tenantId, userId, entity, action, entityId, metadata }) {
+async function writeAuditLog(db, { tenantId, userId, branchId, entity, action, entityId, metadata }) {
   try {
     if (!SUPPORTED_AUDIT_ACTIONS.has(String(action || ""))) {
       console.warn("writeAuditLog skipped: unsupported AuditAction", action);
@@ -147,6 +167,7 @@ async function writeAuditLog(db, { tenantId, userId, entity, action, entityId, m
       data: {
         tenantId,
         userId: userId || null,
+        branchId: branchId || null,
         entity,
         action,
         entityId: entityId || null,
@@ -162,12 +183,216 @@ function saleDraftWhereFalse() {
   return typeof prisma.sale.fields?.isDraft !== "undefined" ? { isDraft: false } : {};
 }
 
-// -----------------------------
-// customer resolution
-// Supports:
-// - customerId
-// - customer: { name, phone, email, address, tinNumber, idNumber, notes }
-// -----------------------------
+function cleanString(value) {
+  const s = String(value || "").trim();
+  return s || null;
+}
+
+function getActiveBranchId(req) {
+  return (
+    cleanString(req.user?.activeBranchId) ||
+    cleanString(req.user?.branchId) ||
+    cleanString(req.branchAccess?.activeBranchId) ||
+    cleanString(req.branch?.id) ||
+    null
+  );
+}
+
+function canViewAllBranches(req) {
+  return Boolean(req.user?.canViewAllBranches);
+}
+
+function resolveReadBranchScope(req) {
+  const requestedBranchId =
+    cleanString(req.query?.branchId) ||
+    cleanString(req.headers["x-branch-id"]) ||
+    null;
+
+  const allBranchesRequested =
+    String(req.query?.allBranches || "")
+      .trim()
+      .toLowerCase() === "true";
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (allBranchesRequested) {
+    if (!canViewAllBranches(req)) {
+      const err = new Error("BRANCH_ACCESS_DENIED");
+      err.status = 403;
+      throw err;
+    }
+
+    return {
+      mode: "ALL_BRANCHES",
+      branchId: null,
+      allowedBranchIds,
+    };
+  }
+
+  if (requestedBranchId) {
+    if (!canViewAllBranches(req) && !allowedBranchIds.includes(requestedBranchId)) {
+      const err = new Error("BRANCH_ACCESS_DENIED");
+      err.status = 403;
+      throw err;
+    }
+
+    return {
+      mode: "SINGLE_BRANCH",
+      branchId: requestedBranchId,
+      allowedBranchIds,
+    };
+  }
+
+  return {
+    mode: "SINGLE_BRANCH",
+    branchId: getActiveBranchId(req),
+    allowedBranchIds,
+  };
+}
+
+function applyBranchScope(where, scope, key = "branchId") {
+  const next = { ...(where || {}) };
+  if (scope?.mode === "SINGLE_BRANCH" && scope?.branchId) {
+    next[key] = scope.branchId;
+  }
+  return next;
+}
+
+async function ensureWritableBranchAccessOrThrow(req) {
+  const tenantId = req.user?.tenantId;
+  const branchId = getActiveBranchId(req);
+
+  if (!tenantId || !branchId) {
+    const err = new Error("BRANCH_REQUIRED");
+    err.status = 400;
+    throw err;
+  }
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(branchId)) {
+    const err = new Error("BRANCH_ACCESS_DENIED");
+    err.status = 403;
+    throw err;
+  }
+
+  if (req.user?.canOperateInActiveBranch === false) {
+    const err = new Error("BRANCH_OPERATION_DENIED");
+    err.status = 403;
+    throw err;
+  }
+
+  const branch = await prisma.branch.findFirst({
+    where: {
+      id: branchId,
+      tenantId,
+      status: {
+        in: ["ACTIVE", "CLOSED"],
+      },
+    },
+    select: {
+      id: true,
+      tenantId: true,
+      name: true,
+      code: true,
+      status: true,
+      isMain: true,
+    },
+  });
+
+  if (!branch) {
+    const err = new Error("BRANCH_NOT_FOUND");
+    err.status = 404;
+    throw err;
+  }
+
+  if (branch.status !== "ACTIVE") {
+    const err = new Error("BRANCH_NOT_ACTIVE");
+    err.status = 409;
+    throw err;
+  }
+
+  return branch;
+}
+
+async function tryDecrementBranchInventoryTx(tx, { tenantId, branchId, productId, qty }) {
+  if (!branchId || !tx.branchInventory || typeof tx.branchInventory.findFirst !== "function") {
+    return { usedBranchInventory: false };
+  }
+
+  const existing = await tx.branchInventory.findFirst({
+    where: {
+      tenantId,
+      branchId,
+      productId,
+    },
+    select: {
+      id: true,
+      qtyOnHand: true,
+    },
+  });
+
+  if (!existing) {
+    return { usedBranchInventory: false };
+  }
+
+  const updated = await tx.branchInventory.updateMany({
+    where: {
+      tenantId,
+      branchId,
+      productId,
+      qtyOnHand: { gte: qty },
+    },
+    data: {
+      qtyOnHand: { decrement: qty },
+    },
+  });
+
+  if (!updated || updated.count !== 1) {
+    throw new Error(`INSUFFICIENT_BRANCH_STOCK:${productId}`);
+  }
+
+  return { usedBranchInventory: true };
+}
+
+async function tryIncrementBranchInventoryTx(tx, { tenantId, branchId, productId, qty }) {
+  if (!branchId || !tx.branchInventory || typeof tx.branchInventory.findFirst !== "function") {
+    return { usedBranchInventory: false };
+  }
+
+  const existing = await tx.branchInventory.findFirst({
+    where: {
+      tenantId,
+      branchId,
+      productId,
+    },
+    select: {
+      id: true,
+    },
+  });
+
+  if (!existing) {
+    return { usedBranchInventory: false };
+  }
+
+  await tx.branchInventory.updateMany({
+    where: {
+      tenantId,
+      branchId,
+      productId,
+    },
+    data: {
+      qtyOnHand: { increment: qty },
+    },
+  });
+
+  return { usedBranchInventory: true };
+}
+
 async function resolveOrCreateCustomerTx(tx, tenantId, { customerId, customer }) {
   if (customerId) {
     const existing = await tx.customer.findFirst({
@@ -292,31 +517,36 @@ async function resolveCustomerId(tx, tenantId, payload) {
   return null;
 }
 
-async function getOpenCashSessionId(tx, tenantId) {
+async function getOpenCashSessionId(tx, tenantId, branchId) {
+  if (!tenantId || !branchId) return null;
+
   const rows = await tx.$queryRaw`
     select id
     from public.cash_sessions
-    where tenant_id = ${String(tenantId)}::uuid
+    where tenant_id::text = ${String(tenantId)}::text
+      and branch_id::text = ${String(branchId)}::text
       and closed_at is null
     order by opened_at desc
     limit 1
   `;
+
   return rows?.[0]?.id || null;
 }
 
 async function insertCashMovementIfPossible(
   tx,
-  { tenantId, userId, sessionId, type, reason, amount, note }
+  { tenantId, branchId, userId, sessionId, type, reason, amount, note },
 ) {
   const amountBigInt = BigInt(Math.round(Number(amount || 0)));
-  if (!sessionId) return null;
+  if (!sessionId || !branchId) return null;
 
   const rows = await tx.$queryRaw`
     insert into public.cash_movements
-      (tenant_id, session_id, type, reason, amount, note, created_by)
+      (tenant_id, branch_id, session_id, type, reason, amount, note, created_by)
     values
       (
         ${String(tenantId)}::uuid,
+        ${String(branchId)}::text,
         ${String(sessionId)}::uuid,
         ${String(type)}::cash_movement_type,
         ${String(reason)}::cash_movement_reason,
@@ -324,22 +554,39 @@ async function insertCashMovementIfPossible(
         ${note},
         ${String(userId)}::uuid
       )
-    returning id, type, reason, amount, note, created_at, created_by
+    returning id, tenant_id, branch_id, session_id, type, reason, amount, note, created_at, created_by
   `;
 
   return rows?.[0] || null;
 }
 
-async function getTenantCashDrawerPolicy(tenantId) {
-  const rows = await prisma.$queryRaw`
+async function getTenantCashDrawerPolicy(db, tenantId) {
+  const rows = await db.$queryRaw`
     select cash_drawer_block_cash_sales
     from public."Tenant"
-    where id = ${String(tenantId)}::text
+    where id::text = ${String(tenantId)}::text
     limit 1
   `;
 
   const blockCashSales = rows?.[0]?.cash_drawer_block_cash_sales;
   return blockCashSales == null ? true : Boolean(blockCashSales);
+}
+
+function toCashMovementDto(movement) {
+  if (!movement) return null;
+
+  return {
+    id: movement.id,
+    tenantId: movement.tenant_id,
+    branchId: movement.branch_id,
+    sessionId: movement.session_id,
+    type: movement.type,
+    reason: movement.reason,
+    amount: String(movement.amount ?? 0),
+    note: movement.note,
+    createdAt: movement.created_at,
+    createdBy: movement.created_by,
+  };
 }
 
 // -----------------------------
@@ -348,6 +595,7 @@ async function getTenantCashDrawerPolicy(tenantId) {
 async function quickPicks(req, res) {
   try {
     const { tenantId } = req.user;
+    const scope = resolveReadBranchScope(req);
 
     const periodDaysRaw = toInt(req.query.periodDays, 7);
     const limitRaw = toInt(req.query.limit, 10);
@@ -365,12 +613,15 @@ async function quickPicks(req, res) {
     const grouped = await prisma.saleItem.groupBy({
       by: ["productId"],
       where: {
-        sale: {
-          tenantId,
-          createdAt: { gte: since },
-          isCancelled: false,
-          ...saleDraftWhereFalse(),
-        },
+        sale: applyBranchScope(
+          {
+            tenantId,
+            createdAt: { gte: since },
+            isCancelled: false,
+            ...saleDraftWhereFalse(),
+          },
+          scope,
+        ),
       },
       _sum: { quantity: true },
       orderBy: { _sum: { quantity: "desc" } },
@@ -434,10 +685,15 @@ async function quickPicks(req, res) {
     return res.json({
       periodDays,
       limit,
+      branchScope: scope,
       bestSellers,
       latest,
     });
   } catch (err) {
+    if (String(err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("quickPicks error:", err);
     return res.status(500).json({ message: "Failed to load quick picks" });
   }
@@ -449,6 +705,8 @@ async function quickPicks(req, res) {
 async function createSale(req, res) {
   try {
     const { tenantId, userId } = req.user;
+    const activeBranch = await ensureWritableBranchAccessOrThrow(req);
+    const branchId = activeBranch.id;
 
     const {
       items,
@@ -460,6 +718,8 @@ async function createSale(req, res) {
       amountPaid,
       dueDate,
       paymentMethod,
+      method,
+      paymentReference,
     } = req.body || {};
 
     if (!items || !Array.isArray(items) || items.length === 0) {
@@ -477,7 +737,14 @@ async function createSale(req, res) {
     }
 
     const finalSaleType = normalizeSaleType(saleType);
-    const initialPaymentMethod = normalizePaymentMethod(paymentMethod || "CASH");
+    const selectedPaymentMethod = normalizePaymentMethod(paymentMethod || method || "CASH");
+
+    if (!selectedPaymentMethod) {
+      return res.status(400).json({
+        message: "paymentMethod must be one of CASH, MOMO, CARD, BANK, OTHER",
+        code: "INVALID_PAYMENT_METHOD",
+      });
+    }
 
     const parsedDueDate = dueDate ? new Date(dueDate) : null;
     if (dueDate && Number.isNaN(parsedDueDate.getTime())) {
@@ -490,16 +757,20 @@ async function createSale(req, res) {
 
     const paidRequested = Math.max(0, toNumber(amountPaid, 0));
 
-    if (finalSaleType === "CASH") {
-      const shouldBlock = await getTenantCashDrawerPolicy(tenantId);
-      if (shouldBlock) {
-        const openSessionId = await getOpenCashSessionId(prisma, tenantId);
-        if (!openSessionId) {
-          return res.status(409).json({
-            message: "Cash drawer is closed. Open drawer to make CASH sales.",
-            code: "CASH_DRAWER_CLOSED",
-          });
-        }
+    const shouldBlock = await getTenantCashDrawerPolicy(prisma, tenantId);
+    const cashTouchesDrawer =
+      finalSaleType === "CASH"
+        ? paymentMethodTouchesCashDrawer(selectedPaymentMethod)
+        : paymentMethodTouchesCashDrawer(selectedPaymentMethod) && paidRequested > 0;
+
+    if (shouldBlock && cashTouchesDrawer) {
+      const openSessionId = await getOpenCashSessionId(prisma, tenantId, branchId);
+      if (!openSessionId) {
+        return res.status(409).json({
+          message: "Cash drawer is closed for the active branch. Open this branch drawer before recording cash.",
+          code: "CASH_DRAWER_CLOSED",
+          branchId,
+        });
       }
     }
 
@@ -528,6 +799,13 @@ async function createSale(req, res) {
         for (const item of items) {
           const pid = String(item.productId);
           const qty = toInt(item.quantity);
+
+          await tryDecrementBranchInventoryTx(tx, {
+            tenantId,
+            branchId,
+            productId: pid,
+            qty,
+          });
 
           const updated = await tx.product.updateMany({
             where: { id: pid, tenantId, isActive: true, stockQty: { gte: qty } },
@@ -579,6 +857,7 @@ async function createSale(req, res) {
         const sale = await tx.sale.create({
           data: {
             tenantId,
+            branchId,
             cashierId: userId,
             customerId: resolvedCustomerId,
             total,
@@ -595,6 +874,7 @@ async function createSale(req, res) {
           select: {
             id: true,
             tenantId: true,
+            branchId: true,
             cashierId: true,
             customerId: true,
             total: true,
@@ -624,46 +904,88 @@ async function createSale(req, res) {
           createdItems.push(it);
         }
 
-        const openSessionId = await getOpenCashSessionId(tx, tenantId);
+        const openSessionId = await getOpenCashSessionId(tx, tenantId, branchId);
 
         let cashMovement = null;
         let payment = null;
         let depositMovement = null;
 
         if (finalSaleType === "CASH") {
-          cashMovement = await insertCashMovementIfPossible(tx, {
-            tenantId,
-            userId,
-            sessionId: openSessionId,
-            type: "IN",
-            reason: "OTHER",
-            amount: total,
-            note: `Cash sale ${sale.id}`,
-          });
-        }
+          const paymentNoteParts = [`Paid sale`, sale.id, selectedPaymentMethod];
+          const ref = normalizeText(paymentReference);
 
-        if (finalSaleType === "CREDIT" && initialPaid > 0) {
+          if (ref) paymentNoteParts.push(ref);
+
           payment = await tx.salePayment.create({
             data: {
               saleId: sale.id,
               tenantId,
+              branchId,
               receivedById: userId,
-              amount: initialPaid,
-              method: initialPaymentMethod,
-              note: `Initial payment ${sale.id} ${Date.now()}`,
+              amount: total,
+              method: selectedPaymentMethod,
+              note: `${paymentNoteParts.join(" • ")} • ${Date.now()}`,
             },
-            select: { id: true, amount: true, method: true, createdAt: true, note: true },
+            select: {
+              id: true,
+              amount: true,
+              method: true,
+              createdAt: true,
+              note: true,
+              branchId: true,
+            },
           });
 
-          if (initialPaymentMethod === "CASH") {
+          if (paymentMethodTouchesCashDrawer(selectedPaymentMethod)) {
+            cashMovement = await insertCashMovementIfPossible(tx, {
+              tenantId,
+              branchId,
+              userId,
+              sessionId: openSessionId,
+              type: "IN",
+              reason: "OTHER",
+              amount: total,
+              note: `Cash sale ${sale.id} (${branchId})`,
+            });
+          }
+        }
+
+        if (finalSaleType === "CREDIT" && initialPaid > 0) {
+          const paymentNoteParts = [`Initial payment`, sale.id, selectedPaymentMethod];
+          const ref = normalizeText(paymentReference);
+
+          if (ref) paymentNoteParts.push(ref);
+
+          payment = await tx.salePayment.create({
+            data: {
+              saleId: sale.id,
+              tenantId,
+              branchId,
+              receivedById: userId,
+              amount: initialPaid,
+              method: selectedPaymentMethod,
+              note: `${paymentNoteParts.join(" • ")} • ${Date.now()}`,
+            },
+            select: {
+              id: true,
+              amount: true,
+              method: true,
+              createdAt: true,
+              note: true,
+              branchId: true,
+            },
+          });
+
+          if (paymentMethodTouchesCashDrawer(selectedPaymentMethod)) {
             depositMovement = await insertCashMovementIfPossible(tx, {
               tenantId,
+              branchId,
               userId,
               sessionId: openSessionId,
               type: "IN",
               reason: "DEPOSIT",
               amount: initialPaid,
-              note: `Credit deposit ${sale.id}`,
+              note: `Credit deposit ${sale.id} (${branchId})`,
             });
           }
         }
@@ -675,7 +997,9 @@ async function createSale(req, res) {
           cashMovement,
           depositMovement,
           auditMeta: {
+            branchId,
             saleType: finalSaleType,
+            paymentMethod: selectedPaymentMethod,
             total,
             amountPaid: initialPaid,
             balanceDue,
@@ -688,12 +1012,13 @@ async function createSale(req, res) {
       {
         maxWait: 10000,
         timeout: 20000,
-      }
+      },
     );
 
     await writeAuditLog(prisma, {
       tenantId,
       userId,
+      branchId,
       entity: "SALE",
       action: "ADD_PAYMENT",
       entityId: result.sale.id,
@@ -708,32 +1033,30 @@ async function createSale(req, res) {
       sale: result.sale,
       items: result.items,
       payment: result.payment,
-      cashMovement: result.cashMovement
-        ? {
-            id: result.cashMovement.id,
-            type: result.cashMovement.type,
-            reason: result.cashMovement.reason,
-            amount: String(result.cashMovement.amount),
-            note: result.cashMovement.note,
-            createdAt: result.cashMovement.created_at,
-            createdBy: result.cashMovement.created_by,
-          }
-        : null,
-      depositMovement: result.depositMovement
-        ? {
-            id: result.depositMovement.id,
-            type: result.depositMovement.type,
-            reason: result.depositMovement.reason,
-            amount: String(result.depositMovement.amount),
-            note: result.depositMovement.note,
-            createdAt: result.depositMovement.created_at,
-            createdBy: result.depositMovement.created_by,
-          }
-        : null,
+      cashMovement: toCashMovementDto(result.cashMovement),
+      depositMovement: toCashMovementDto(result.depositMovement),
     });
   } catch (err) {
     const msg = String(err?.message || "");
 
+    if (msg === "BRANCH_REQUIRED") {
+      return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
+    }
+    if (msg === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
+    }
+    if (msg === "BRANCH_OPERATION_DENIED") {
+      return res.status(403).json({
+        message: "You cannot operate in this branch",
+        code: "BRANCH_OPERATION_DENIED",
+      });
+    }
+    if (msg === "BRANCH_NOT_FOUND") {
+      return res.status(404).json({ message: "Branch not found" });
+    }
+    if (msg === "BRANCH_NOT_ACTIVE") {
+      return res.status(409).json({ message: "Selected branch is not active" });
+    }
     if (msg === "INVALID_CUSTOMER_FIELDS") {
       return res.status(400).json({
         message: "customer.name and customer.phone are required when creating a customer from sale",
@@ -744,6 +1067,9 @@ async function createSale(req, res) {
     }
     if (msg.startsWith("PRODUCT_NOT_FOUND:")) {
       return res.status(404).json({ message: "Product not found" });
+    }
+    if (msg.startsWith("INSUFFICIENT_BRANCH_STOCK:")) {
+      return res.status(400).json({ message: "Insufficient branch stock for one of the selected products" });
     }
     if (msg.startsWith("INSUFFICIENT_STOCK:")) {
       return res.status(400).json({
@@ -765,6 +1091,7 @@ async function createSale(req, res) {
 async function createSaleWarranty(req, res) {
   try {
     const { tenantId, userId } = req.user;
+    const branchScope = resolveReadBranchScope(req);
     const saleId = String(req.params.id || "").trim();
 
     const { policy, durationMonths, durationDays, startsAt, units } = req.body || {};
@@ -803,10 +1130,14 @@ async function createSaleWarranty(req, res) {
     const result = await prisma.$transaction(
       async (tx) => {
         const sale = await tx.sale.findFirst({
-          where: { id: saleId, tenantId, ...saleDraftWhereFalse() },
+          where: applyBranchScope(
+            { id: saleId, tenantId, ...saleDraftWhereFalse() },
+            branchScope,
+          ),
           select: {
             id: true,
             tenantId: true,
+            branchId: true,
             createdAt: true,
             items: {
               select: {
@@ -854,7 +1185,7 @@ async function createSaleWarranty(req, res) {
         const endsAt = computeWarrantyEndDate(
           parsedStartsAt,
           parsedDurationMonths,
-          parsedDurationDays
+          parsedDurationDays,
         );
 
         const doc = await reserveWarrantyDocumentNumberTx(tx, {
@@ -866,6 +1197,7 @@ async function createSaleWarranty(req, res) {
           data: {
             saleId: sale.id,
             tenantId,
+            branchId: sale.branchId || null,
             createdById: userId,
             policy: normalizeText(policy),
             durationMonths: parsedDurationMonths || null,
@@ -878,6 +1210,7 @@ async function createSaleWarranty(req, res) {
             id: true,
             saleId: true,
             tenantId: true,
+            branchId: true,
             policy: true,
             durationMonths: true,
             durationDays: true,
@@ -927,6 +1260,7 @@ async function createSaleWarranty(req, res) {
         }
 
         return {
+          saleBranchId: sale.branchId || null,
           warranty: {
             ...warranty,
             units: createdUnits,
@@ -936,12 +1270,13 @@ async function createSaleWarranty(req, res) {
       {
         maxWait: 10000,
         timeout: 20000,
-      }
+      },
     );
 
     await writeAuditLog(prisma, {
       tenantId,
       userId,
+      branchId: result.saleBranchId,
       entity: "SALE",
       action: "ADD_PAYMENT",
       entityId: saleId,
@@ -960,6 +1295,10 @@ async function createSaleWarranty(req, res) {
   } catch (err) {
     const msg = String(err?.message || "");
     const code = err?.code;
+
+    if (msg === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
 
     if (code === "SALE_NOT_FOUND" || msg === "SALE_NOT_FOUND") {
       return res.status(404).json({ message: "Sale not found" });
@@ -984,22 +1323,34 @@ async function createSaleWarranty(req, res) {
 async function addSalePayment(req, res) {
   try {
     const { tenantId, userId } = req.user;
+    const branchScope = resolveReadBranchScope(req);
     const saleId = String(req.params.id || "");
-    const { amount, method, note } = req.body || {};
+    const { amount, method, paymentMethod, paymentReference, note } = req.body || {};
 
     const payAmount = toNumber(amount, NaN);
     if (!Number.isFinite(payAmount) || payAmount <= 0) {
       return res.status(400).json({ message: "amount must be a positive number" });
     }
 
-    const payMethod = normalizePaymentMethod(method);
+    const payMethod = normalizePaymentMethod(method || paymentMethod || "CASH");
+
+    if (!payMethod) {
+      return res.status(400).json({
+        message: "method must be one of CASH, MOMO, CARD, BANK, OTHER",
+        code: "INVALID_PAYMENT_METHOD",
+      });
+    }
 
     const result = await prisma.$transaction(
       async (tx) => {
         const sale = await tx.sale.findFirst({
-          where: { id: saleId, tenantId, ...saleDraftWhereFalse() },
+          where: applyBranchScope(
+            { id: saleId, tenantId, ...saleDraftWhereFalse() },
+            branchScope,
+          ),
           select: {
             id: true,
+            branchId: true,
             total: true,
             amountPaid: true,
             balanceDue: true,
@@ -1024,20 +1375,35 @@ async function addSalePayment(req, res) {
         });
 
         const base = String(note || "").trim();
-        const safeNote = base
-          ? `${base} • ${sale.id} • ${Date.now()}`
-          : `Payment • ${sale.id} • ${Date.now()}`;
+        const ref = normalizeText(paymentReference);
+        const safeNote = [
+          base || "Payment",
+          sale.id,
+          payMethod,
+          ref,
+          Date.now(),
+        ]
+          .filter(Boolean)
+          .join(" • ");
 
         const payment = await tx.salePayment.create({
           data: {
             saleId: sale.id,
             tenantId,
+            branchId: sale.branchId || null,
             receivedById: userId,
             amount: payAmount,
             method: payMethod,
             note: safeNote,
           },
-          select: { id: true, amount: true, method: true, createdAt: true, note: true },
+          select: {
+            id: true,
+            amount: true,
+            method: true,
+            createdAt: true,
+            note: true,
+            branchId: true,
+          },
         });
 
         const updatedSale = await tx.sale.update({
@@ -1049,6 +1415,7 @@ async function addSalePayment(req, res) {
           },
           select: {
             id: true,
+            branchId: true,
             total: true,
             amountPaid: true,
             balanceDue: true,
@@ -1059,16 +1426,23 @@ async function addSalePayment(req, res) {
 
         let movement = null;
 
-        if (payMethod === "CASH") {
-          const openSessionId = await getOpenCashSessionId(tx, tenantId);
+        if (paymentMethodTouchesCashDrawer(payMethod)) {
+          const openSessionId = await getOpenCashSessionId(tx, tenantId, sale.branchId);
+          const shouldBlock = await getTenantCashDrawerPolicy(tx, tenantId);
+
+          if (shouldBlock && !openSessionId) {
+            throw new Error("CASH_DRAWER_CLOSED_FOR_BRANCH");
+          }
+
           movement = await insertCashMovementIfPossible(tx, {
             tenantId,
+            branchId: sale.branchId || null,
             userId,
             sessionId: openSessionId,
             type: "IN",
             reason: "DEPOSIT",
             amount: payAmount,
-            note: `Credit payment for sale ${sale.id}`,
+            note: `Credit payment for sale ${sale.id} (${sale.branchId || "no-branch"})`,
           });
         }
 
@@ -1077,6 +1451,7 @@ async function addSalePayment(req, res) {
           sale: updatedSale,
           movement,
           auditMeta: {
+            branchId: sale.branchId || null,
             amount: payAmount,
             method: payMethod,
             note: safeNote,
@@ -1088,12 +1463,13 @@ async function addSalePayment(req, res) {
       {
         maxWait: 10000,
         timeout: 20000,
-      }
+      },
     );
 
     await writeAuditLog(prisma, {
       tenantId,
       userId,
+      branchId: result.auditMeta.branchId,
       entity: "SALE",
       action: "ADD_PAYMENT",
       entityId: saleId,
@@ -1104,21 +1480,14 @@ async function addSalePayment(req, res) {
       message: "Payment recorded",
       sale: result.sale,
       payment: result.payment,
-      cashMovement: result.movement
-        ? {
-            id: result.movement.id,
-            type: result.movement.type,
-            reason: result.movement.reason,
-            amount: String(result.movement.amount),
-            note: result.movement.note,
-            createdAt: result.movement.created_at,
-            createdBy: result.movement.created_by,
-          }
-        : null,
+      cashMovement: toCashMovementDto(result.movement),
     });
   } catch (err) {
     const msg = String(err?.message || "");
 
+    if (msg === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
     if (msg === "SALE_NOT_FOUND") {
       return res.status(404).json({ message: "Sale not found" });
     }
@@ -1130,6 +1499,12 @@ async function addSalePayment(req, res) {
     }
     if (msg === "PAYMENT_TOO_BIG") {
       return res.status(400).json({ message: "Payment exceeds remaining balance" });
+    }
+    if (msg === "CASH_DRAWER_CLOSED_FOR_BRANCH") {
+      return res.status(409).json({
+        message: "Cash drawer is closed for this sale branch",
+        code: "CASH_DRAWER_CLOSED",
+      });
     }
 
     console.error("addSalePayment error:", err);
@@ -1143,12 +1518,15 @@ async function addSalePayment(req, res) {
 async function listSales(req, res) {
   try {
     const { tenantId } = req.user;
+    const scope = resolveReadBranchScope(req);
 
     const sales = await prisma.sale.findMany({
-      where: { tenantId, ...saleDraftWhereFalse() },
+      where: applyBranchScope({ tenantId, ...saleDraftWhereFalse() }, scope),
       orderBy: { createdAt: "desc" },
       select: {
         id: true,
+        tenantId: true,
+        branchId: true,
         total: true,
         saleType: true,
         status: true,
@@ -1162,6 +1540,26 @@ async function listSales(req, res) {
         createdAt: true,
         ...(typeof prisma.sale.fields?.isDraft !== "undefined" ? { isDraft: true } : {}),
         cashier: { select: { name: true } },
+        branch: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+            status: true,
+            isMain: true,
+          },
+        },
+        payments: {
+          orderBy: [{ createdAt: "asc" }],
+          select: {
+            id: true,
+            amount: true,
+            method: true,
+            note: true,
+            createdAt: true,
+            branchId: true,
+          },
+        },
         customer: {
           select: {
             id: true,
@@ -1181,11 +1579,84 @@ async function listSales(req, res) {
       },
     });
 
-    return res.json({ sales });
+    return res.json({ sales, branchScope: scope });
   } catch (err) {
+    if (String(err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("listSales error:", err);
     return res.status(500).json({ message: "Failed to fetch sales" });
   }
+}
+
+
+async function getReceiptStoreProfile(tenantId, branch) {
+  if (!tenantId) return null;
+
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantId },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      phone: true,
+      shopType: true,
+      district: true,
+      sector: true,
+      address: true,
+      countryCode: true,
+      currencyCode: true,
+      timezone: true,
+      logoUrl: true,
+      logoKey: true,
+      receiptHeader: true,
+      receiptFooter: true,
+    },
+  });
+
+  if (!tenant) return null;
+
+  const branchCode = branch?.code || null;
+  const branchName = branch?.name || null;
+
+  const locationParts = [
+    tenant.sector,
+    tenant.district,
+    tenant.address,
+  ].filter(Boolean);
+
+  return {
+    id: tenant.id,
+
+    // Business identity from Store settings
+    name: tenant.name || "Store",
+    email: tenant.email || null,
+    phone: tenant.phone || null,
+    shopType: tenant.shopType || null,
+    district: tenant.district || null,
+    sector: tenant.sector || null,
+    address: tenant.address || null,
+    countryCode: tenant.countryCode || "RW",
+    currencyCode: tenant.currencyCode || "RWF",
+    timezone: tenant.timezone || "Africa/Kigali",
+
+    // This is the real uploaded business logo from SettingsGeneral.jsx
+    logoUrl: tenant.logoUrl || null,
+    logoKey: tenant.logoKey || null,
+
+    // Receipt copy from Store settings
+    receiptHeader: tenant.receiptHeader || null,
+    receiptFooter: tenant.receiptFooter || null,
+
+    // Branch identity for the receipt UI
+    branchId: branch?.id || null,
+    branchCode,
+    branchName,
+    branchStatus: branch?.status || null,
+    branchIsMain: Boolean(branch?.isMain),
+    branchLocation: locationParts.join(" • ") || null,
+  };
 }
 
 // -----------------------------
@@ -1195,6 +1666,7 @@ async function listSales(req, res) {
 async function getSaleReceipt(req, res) {
   try {
     const tenantId = req.user?.tenantId;
+    const scope = resolveReadBranchScope(req);
     const saleId = String(req.params.id || "").trim();
 
     if (!tenantId) {
@@ -1206,13 +1678,17 @@ async function getSaleReceipt(req, res) {
     }
 
     const sale = await prisma.sale.findFirst({
-      where: {
-        id: saleId,
-        tenantId,
-      },
+      where: applyBranchScope(
+        {
+          id: saleId,
+          tenantId,
+        },
+        scope,
+      ),
       select: {
         id: true,
         tenantId: true,
+        branchId: true,
         cashierId: true,
         customerId: true,
 
@@ -1236,6 +1712,16 @@ async function getSaleReceipt(req, res) {
         refundedTotal: true,
         receiptNumber: true,
         invoiceNumber: true,
+
+        branch: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+            status: true,
+            isMain: true,
+          },
+        },
 
         cashier: {
           select: {
@@ -1286,6 +1772,7 @@ async function getSaleReceipt(req, res) {
             id: true,
             saleId: true,
             tenantId: true,
+            branchId: true,
             receivedById: true,
             amount: true,
             method: true,
@@ -1300,6 +1787,7 @@ async function getSaleReceipt(req, res) {
             id: true,
             saleId: true,
             tenantId: true,
+            branchId: true,
             createdById: true,
             total: true,
             method: true,
@@ -1315,6 +1803,7 @@ async function getSaleReceipt(req, res) {
             id: true,
             saleId: true,
             tenantId: true,
+            branchId: true,
             createdById: true,
             policy: true,
             durationMonths: true,
@@ -1348,8 +1837,25 @@ async function getSaleReceipt(req, res) {
       return res.status(404).json({ message: "Sale not found" });
     }
 
-    return res.json({ sale });
+    const store = await getReceiptStoreProfile(tenantId, sale.branch);
+
+    return res.json({
+      sale,
+
+      // Top-level store object for frontend receipt UI.
+      // This is where PosReceipt.jsx reads store.logoUrl.
+      store,
+
+      // Keep branch top-level too, so receipt/document pages do not need to dig into sale.branch.
+      branch: sale.branch || null,
+
+      branchScope: scope,
+    });
   } catch (err) {
+    if (String(err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("getSaleReceipt error:", err);
     return res.status(500).json({ message: "Failed to load sale" });
   }
@@ -1361,18 +1867,23 @@ async function getSaleReceipt(req, res) {
 async function listOutstandingCredit(req, res) {
   try {
     const { tenantId } = req.user;
+    const scope = resolveReadBranchScope(req);
 
     const sales = await prisma.sale.findMany({
-      where: {
-        tenantId,
-        saleType: "CREDIT",
-        balanceDue: { gt: 0 },
-        isCancelled: false,
-        ...saleDraftWhereFalse(),
-      },
+      where: applyBranchScope(
+        {
+          tenantId,
+          saleType: "CREDIT",
+          balanceDue: { gt: 0 },
+          isCancelled: false,
+          ...saleDraftWhereFalse(),
+        },
+        scope,
+      ),
       orderBy: [{ dueDate: "asc" }, { createdAt: "desc" }],
       select: {
         id: true,
+        branchId: true,
         total: true,
         amountPaid: true,
         balanceDue: true,
@@ -1381,6 +1892,15 @@ async function listOutstandingCredit(req, res) {
         receiptNumber: true,
         invoiceNumber: true,
         createdAt: true,
+        branch: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+            status: true,
+            isMain: true,
+          },
+        },
         customer: {
           select: {
             id: true,
@@ -1399,8 +1919,12 @@ async function listOutstandingCredit(req, res) {
       },
     });
 
-    return res.json({ sales });
+    return res.json({ sales, branchScope: scope });
   } catch (err) {
+    if (String(err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("listOutstandingCredit error:", err);
     return res.status(500).json({ message: "Failed to fetch outstanding credit" });
   }
@@ -1412,20 +1936,25 @@ async function listOutstandingCredit(req, res) {
 async function listOverdueCredit(req, res) {
   try {
     const { tenantId } = req.user;
+    const scope = resolveReadBranchScope(req);
 
     const now = new Date();
     const sales = await prisma.sale.findMany({
-      where: {
-        tenantId,
-        saleType: "CREDIT",
-        balanceDue: { gt: 0 },
-        dueDate: { lt: now },
-        isCancelled: false,
-        ...saleDraftWhereFalse(),
-      },
+      where: applyBranchScope(
+        {
+          tenantId,
+          saleType: "CREDIT",
+          balanceDue: { gt: 0 },
+          dueDate: { lt: now },
+          isCancelled: false,
+          ...saleDraftWhereFalse(),
+        },
+        scope,
+      ),
       orderBy: [{ dueDate: "asc" }, { createdAt: "desc" }],
       select: {
         id: true,
+        branchId: true,
         total: true,
         amountPaid: true,
         balanceDue: true,
@@ -1434,6 +1963,15 @@ async function listOverdueCredit(req, res) {
         receiptNumber: true,
         invoiceNumber: true,
         createdAt: true,
+        branch: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+            status: true,
+            isMain: true,
+          },
+        },
         customer: {
           select: {
             id: true,
@@ -1452,8 +1990,12 @@ async function listOverdueCredit(req, res) {
       },
     });
 
-    return res.json({ sales });
+    return res.json({ sales, branchScope: scope });
   } catch (err) {
+    if (String(err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("listOverdueCredit error:", err);
     return res.status(500).json({ message: "Failed to fetch overdue credit" });
   }
@@ -1465,6 +2007,7 @@ async function listOverdueCredit(req, res) {
 async function cancelSale(req, res) {
   try {
     const { tenantId, userId } = req.user;
+    const scope = resolveReadBranchScope(req);
     const saleId = String(req.params.id || "").trim();
     const { note } = req.body || {};
 
@@ -1473,10 +2016,14 @@ async function cancelSale(req, res) {
     const result = await prisma.$transaction(
       async (tx) => {
         const sale = await tx.sale.findFirst({
-          where: { id: saleId, tenantId, ...saleDraftWhereFalse() },
+          where: applyBranchScope(
+            { id: saleId, tenantId, ...saleDraftWhereFalse() },
+            scope,
+          ),
           select: {
             id: true,
             tenantId: true,
+            branchId: true,
             saleType: true,
             total: true,
             amountPaid: true,
@@ -1489,7 +2036,7 @@ async function cancelSale(req, res) {
               },
             },
             refunds: { select: { id: true }, take: 1 },
-            payments: { select: { id: true }, take: 1 },
+            payments: { select: { id: true, method: true }, take: 5 },
           },
         });
 
@@ -1521,6 +2068,13 @@ async function cancelSale(req, res) {
         }
 
         for (const it of sale.items) {
+          await tryIncrementBranchInventoryTx(tx, {
+            tenantId,
+            branchId: sale.branchId || null,
+            productId: it.productId,
+            qty: it.quantity,
+          });
+
           const updated = await tx.product.updateMany({
             where: { id: it.productId, tenantId, isActive: true },
             data: { stockQty: { increment: it.quantity } },
@@ -1545,6 +2099,7 @@ async function cancelSale(req, res) {
           },
           select: {
             id: true,
+            branchId: true,
             saleType: true,
             total: true,
             isCancelled: true,
@@ -1555,16 +2110,27 @@ async function cancelSale(req, res) {
         });
 
         let movement = null;
-        if (sale.saleType === "CASH") {
-          const openSessionId = await getOpenCashSessionId(tx, tenantId);
+        const cashWasReceived = (sale.payments || []).some((payment) =>
+          paymentMethodTouchesCashDrawer(payment.method),
+        );
+
+        if (sale.saleType === "CASH" && cashWasReceived) {
+          const openSessionId = await getOpenCashSessionId(tx, tenantId, sale.branchId);
+          const shouldBlock = await getTenantCashDrawerPolicy(tx, tenantId);
+
+          if (shouldBlock && !openSessionId) {
+            throw new Error("CASH_DRAWER_CLOSED_FOR_BRANCH");
+          }
+
           movement = await insertCashMovementIfPossible(tx, {
             tenantId,
+            branchId: sale.branchId || null,
             userId,
             sessionId: openSessionId,
             type: "OUT",
             reason: "WITHDRAWAL",
             amount: sale.total,
-            note: `Cancel sale ${sale.id}`,
+            note: `Cancel sale ${sale.id} (${sale.branchId || "no-branch"})`,
           });
         }
 
@@ -1572,6 +2138,7 @@ async function cancelSale(req, res) {
           sale: updatedSale,
           movement,
           auditMeta: {
+            branchId: sale.branchId || null,
             note: cleanNote,
             saleType: sale.saleType,
             total: Number(sale.total || 0),
@@ -1581,12 +2148,13 @@ async function cancelSale(req, res) {
       {
         maxWait: 10000,
         timeout: 20000,
-      }
+      },
     );
 
     await writeAuditLog(prisma, {
       tenantId,
       userId,
+      branchId: result.auditMeta.branchId,
       entity: "SALE",
       action: "ADD_PAYMENT",
       entityId: saleId,
@@ -1599,22 +2167,15 @@ async function cancelSale(req, res) {
     return res.json({
       message: "Sale cancelled",
       sale: result.sale,
-      cashMovement: result.movement
-        ? {
-            id: result.movement.id,
-            type: result.movement.type,
-            reason: result.movement.reason,
-            amount: String(result.movement.amount),
-            note: result.movement.note,
-            createdAt: result.movement.created_at,
-            createdBy: result.movement.created_by,
-          }
-        : null,
+      cashMovement: toCashMovementDto(result.movement),
     });
   } catch (err) {
     const msg = String(err?.message || "");
     const code = err?.code;
 
+    if (msg === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
     if (code === "SALE_NOT_FOUND" || msg === "SALE_NOT_FOUND") {
       return res.status(404).json({ message: "Sale not found" });
     }
@@ -1635,6 +2196,13 @@ async function cancelSale(req, res) {
       return res.status(400).json({ message: "A product on this sale no longer exists" });
     }
 
+    if (msg === "CASH_DRAWER_CLOSED_FOR_BRANCH") {
+      return res.status(409).json({
+        message: "Cash drawer is closed for this sale branch",
+        code: "CASH_DRAWER_CLOSED",
+      });
+    }
+
     console.error("cancelSale error:", err);
     return res.status(500).json({ message: "Failed to cancel sale" });
   }
@@ -1646,8 +2214,9 @@ async function cancelSale(req, res) {
 async function createSaleRefund(req, res) {
   try {
     const { tenantId, userId } = req.user;
+    const scope = resolveReadBranchScope(req);
     const saleId = String(req.params.id || "").trim();
-    const { items, method, note, reason } = req.body || {};
+    const { items, method, paymentMethod, note, reason } = req.body || {};
 
     if (!saleId) return res.status(400).json({ message: "Missing sale id" });
 
@@ -1665,17 +2234,29 @@ async function createSaleRefund(req, res) {
       }
     }
 
-    const refundMethod = normalizeRefundMethod(method);
+    const refundMethod = normalizeRefundMethod(method || paymentMethod || "CASH");
+
+    if (!refundMethod) {
+      return res.status(400).json({
+        message: "method must be one of CASH, MOMO, CARD, BANK, OTHER",
+        code: "INVALID_REFUND_METHOD",
+      });
+    }
+
     const cleanReason = normalizeText(reason);
     const cleanNote = normalizeText(note);
 
     const result = await prisma.$transaction(
       async (tx) => {
         const sale = await tx.sale.findFirst({
-          where: { id: saleId, tenantId, ...saleDraftWhereFalse() },
+          where: applyBranchScope(
+            { id: saleId, tenantId, ...saleDraftWhereFalse() },
+            scope,
+          ),
           select: {
             id: true,
             tenantId: true,
+            branchId: true,
             saleType: true,
             total: true,
             amountPaid: true,
@@ -1767,6 +2348,7 @@ async function createSaleRefund(req, res) {
           data: {
             saleId: sale.id,
             tenantId,
+            branchId: sale.branchId || null,
             createdById: userId,
             total: refundTotal,
             method: refundMethod,
@@ -1775,6 +2357,7 @@ async function createSaleRefund(req, res) {
           },
           select: {
             id: true,
+            branchId: true,
             total: true,
             method: true,
             note: true,
@@ -1794,6 +2377,13 @@ async function createSaleRefund(req, res) {
             select: { id: true },
           });
 
+          await tryIncrementBranchInventoryTx(tx, {
+            tenantId,
+            branchId: sale.branchId || null,
+            productId: row.productId,
+            qty: row.quantity,
+          });
+
           await tx.product.updateMany({
             where: { id: row.productId, tenantId, isActive: true },
             data: { stockQty: { increment: row.quantity } },
@@ -1807,6 +2397,7 @@ async function createSaleRefund(req, res) {
           },
           select: {
             id: true,
+            branchId: true,
             total: true,
             amountPaid: true,
             refundedTotal: true,
@@ -1816,16 +2407,23 @@ async function createSaleRefund(req, res) {
         });
 
         let movement = null;
-        if (refundMethod === "CASH") {
-          const openSessionId = await getOpenCashSessionId(tx, tenantId);
+        if (paymentMethodTouchesCashDrawer(refundMethod)) {
+          const openSessionId = await getOpenCashSessionId(tx, tenantId, sale.branchId);
+          const shouldBlock = await getTenantCashDrawerPolicy(tx, tenantId);
+
+          if (shouldBlock && !openSessionId) {
+            throw new Error("CASH_DRAWER_CLOSED_FOR_BRANCH");
+          }
+
           movement = await insertCashMovementIfPossible(tx, {
             tenantId,
+            branchId: sale.branchId || null,
             userId,
             sessionId: openSessionId,
             type: "OUT",
             reason: "WITHDRAWAL",
             amount: refundTotal,
-            note: `Refund ${refund.id} for sale ${sale.id}`,
+            note: `Refund ${refund.id} for sale ${sale.id} (${sale.branchId || "no-branch"})`,
           });
         }
 
@@ -1834,6 +2432,7 @@ async function createSaleRefund(req, res) {
           sale: updatedSale,
           movement,
           auditMeta: {
+            branchId: sale.branchId || null,
             refundId: refund.id,
             total: refundTotal,
             method: refundMethod,
@@ -1845,12 +2444,13 @@ async function createSaleRefund(req, res) {
       {
         maxWait: 10000,
         timeout: 20000,
-      }
+      },
     );
 
     await writeAuditLog(prisma, {
       tenantId,
       userId,
+      branchId: result.auditMeta.branchId,
       entity: "SALE",
       action: "ADD_PAYMENT",
       entityId: saleId,
@@ -1864,22 +2464,15 @@ async function createSaleRefund(req, res) {
       message: "Refund created",
       refund: result.refund,
       sale: result.sale,
-      cashMovement: result.movement
-        ? {
-            id: result.movement.id,
-            type: result.movement.type,
-            reason: result.movement.reason,
-            amount: String(result.movement.amount),
-            note: result.movement.note,
-            createdAt: result.movement.created_at,
-            createdBy: result.movement.created_by,
-          }
-        : null,
+      cashMovement: toCashMovementDto(result.movement),
     });
   } catch (err) {
     const msg = String(err?.message || "");
     const code = err?.code;
 
+    if (msg === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
     if (code === "SALE_NOT_FOUND" || msg === "SALE_NOT_FOUND") {
       return res.status(404).json({ message: "Sale not found" });
     }
@@ -1898,6 +2491,13 @@ async function createSaleRefund(req, res) {
 
     if (code === "REFUND_EXCEEDS_PAID" || msg === "REFUND_EXCEEDS_PAID") {
       return res.status(400).json({ message: "Refund total exceeds the amount paid so far" });
+    }
+
+    if (msg === "CASH_DRAWER_CLOSED_FOR_BRANCH") {
+      return res.status(409).json({
+        message: "Cash drawer is closed for this sale branch",
+        code: "CASH_DRAWER_CLOSED",
+      });
     }
 
     console.error("createSaleRefund error:", err);

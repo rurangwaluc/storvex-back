@@ -10,6 +10,7 @@ const {
   requireWritableSubscription,
 } = require("../../middlewares/requireActiveSubscription");
 const requireDbPermission = require("../../middlewares/requireDbPermission");
+const { PERMISSIONS } = require("../auth/permissions");
 
 const readBase = [
   authenticate,
@@ -28,7 +29,7 @@ const writeBase = [
 router.get(
   "/products/search",
   ...readBase,
-  requireDbPermission("product.view"),
+  requireDbPermission(PERMISSIONS.INVENTORY_VIEW),
   inventoryController.searchProducts
 );
 
@@ -36,7 +37,7 @@ router.get(
 router.get(
   "/summary",
   ...readBase,
-  requireDbPermission("stock.view"),
+  requireDbPermission(PERMISSIONS.INVENTORY_VIEW),
   inventoryController.getInventorySummary
 );
 
@@ -44,7 +45,7 @@ router.get(
 router.get(
   "/products",
   ...readBase,
-  requireDbPermission("product.view"),
+  requireDbPermission(PERMISSIONS.INVENTORY_VIEW),
   inventoryController.getProducts
 );
 
@@ -52,7 +53,7 @@ router.get(
 router.get(
   "/export.xlsx",
   ...readBase,
-  requireDbPermission("product.view"),
+  requireDbPermission(PERMISSIONS.INVENTORY_VIEW),
   inventoryController.exportInventoryExcel
 );
 
@@ -60,7 +61,7 @@ router.get(
 router.get(
   "/stock-adjustments",
   ...readBase,
-  requireDbPermission("stock.history.view"),
+  requireDbPermission(PERMISSIONS.INVENTORY_HISTORY_VIEW),
   inventoryController.listAllStockAdjustments
 );
 
@@ -68,7 +69,7 @@ router.get(
 router.get(
   "/stock-adjustments/export.xlsx",
   ...readBase,
-  requireDbPermission("stock.history.view"),
+  requireDbPermission(PERMISSIONS.INVENTORY_HISTORY_VIEW),
   inventoryController.exportStockAdjustmentsExcel
 );
 
@@ -76,7 +77,7 @@ router.get(
 router.get(
   "/products/:id",
   ...readBase,
-  requireDbPermission("product.view"),
+  requireDbPermission(PERMISSIONS.INVENTORY_VIEW),
   inventoryController.getProductById
 );
 
@@ -84,7 +85,7 @@ router.get(
 router.post(
   "/products",
   ...writeBase,
-  requireDbPermission("product.create"),
+  requireDbPermission(PERMISSIONS.INVENTORY_CREATE),
   inventoryController.createProduct
 );
 
@@ -92,7 +93,7 @@ router.post(
 router.put(
   "/products/:id",
   ...writeBase,
-  requireDbPermission("product.update"),
+  requireDbPermission(PERMISSIONS.INVENTORY_EDIT),
   inventoryController.updateProduct
 );
 
@@ -100,7 +101,7 @@ router.put(
 router.delete(
   "/products/:id",
   ...writeBase,
-  requireDbPermission("product.deactivate"),
+  requireDbPermission(PERMISSIONS.INVENTORY_EDIT),
   inventoryController.deleteProduct
 );
 
@@ -108,7 +109,7 @@ router.delete(
 router.patch(
   "/products/:id/activate",
   ...writeBase,
-  requireDbPermission("product.activate"),
+  requireDbPermission(PERMISSIONS.INVENTORY_EDIT),
   inventoryController.activateProduct
 );
 
@@ -116,7 +117,7 @@ router.patch(
 router.post(
   "/products/:id/stock-adjustments",
   ...writeBase,
-  requireDbPermission("stock.adjust"),
+  requireDbPermission(PERMISSIONS.INVENTORY_ADJUST),
   inventoryController.adjustStock
 );
 
@@ -124,7 +125,7 @@ router.post(
 router.get(
   "/products/:id/stock-adjustments",
   ...readBase,
-  requireDbPermission("stock.history.view"),
+  requireDbPermission(PERMISSIONS.INVENTORY_HISTORY_VIEW),
   inventoryController.listStockAdjustments
 );
 
@@ -132,7 +133,7 @@ router.get(
 router.get(
   "/reorder.pdf",
   ...readBase,
-  requireDbPermission("stock.reorder.export"),
+  requireDbPermission(PERMISSIONS.INVENTORY_REORDER_VIEW),
   inventoryController.reorderPdf
 );
 

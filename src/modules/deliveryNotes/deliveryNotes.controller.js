@@ -8,6 +8,18 @@ function getTenantId(req) {
   return req.user?.tenantId || null;
 }
 
+function getUserId(req) {
+  return req.user?.userId || req.user?.id || null;
+}
+
+function getActiveBranchId(req) {
+  return req.user?.branchId || req.branch?.id || null;
+}
+
+function canViewAllBranches(req) {
+  return Boolean(req.user?.canViewAllBranches);
+}
+
 function cleanString(x) {
   const s = x == null ? "" : String(x).trim();
   return s || null;
@@ -29,9 +41,124 @@ function normalizeDeliveryItems(inputItems = []) {
     .filter((item) => item.productName && item.quantity > 0);
 }
 
+function resolveDeliveryNoteBranchScope(req) {
+  const requestedBranchId =
+    cleanString(req.query?.branchId) ||
+    cleanString(req.headers["x-branch-id"]) ||
+    null;
+
+  const allBranchesRequested =
+    String(req.query?.allBranches || "")
+      .trim()
+      .toLowerCase() === "true";
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (allBranchesRequested) {
+    if (!canViewAllBranches(req)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "ALL_BRANCHES",
+      branchId: null,
+      allowedBranchIds,
+    };
+  }
+
+  if (requestedBranchId) {
+    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "SINGLE_BRANCH",
+      branchId: requestedBranchId,
+      allowedBranchIds,
+    };
+  }
+
+  return {
+    mode: "SINGLE_BRANCH",
+    branchId: getActiveBranchId(req),
+    allowedBranchIds,
+  };
+}
+
+function applyDeliveryBranchScope(where, scope) {
+  const next = { ...(where || {}) };
+
+  if (scope?.mode === "SINGLE_BRANCH" && scope?.branchId && typeof prisma.deliveryNote.fields?.branchId !== "undefined") {
+    next.branchId = scope.branchId;
+  }
+
+  return next;
+}
+
+async function ensureWritableBranchAccessOrThrow(req) {
+  const tenantId = getTenantId(req);
+  const branchId = getActiveBranchId(req);
+
+  if (!tenantId || !branchId) {
+    const e = new Error("BRANCH_REQUIRED");
+    e.code = "BRANCH_REQUIRED";
+    throw e;
+  }
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(branchId)) {
+    const e = new Error("BRANCH_ACCESS_DENIED");
+    e.code = "BRANCH_ACCESS_DENIED";
+    throw e;
+  }
+
+  const branch = await prisma.branch.findFirst({
+    where: {
+      id: branchId,
+      tenantId,
+      status: {
+        in: ["ACTIVE", "CLOSED"],
+      },
+    },
+    select: {
+      id: true,
+      tenantId: true,
+      name: true,
+      code: true,
+      status: true,
+      isMain: true,
+    },
+  });
+
+  if (!branch) {
+    const e = new Error("BRANCH_NOT_FOUND");
+    e.code = "BRANCH_NOT_FOUND";
+    throw e;
+  }
+
+  if (branch.status !== "ACTIVE") {
+    const e = new Error("BRANCH_NOT_ACTIVE");
+    e.code = "BRANCH_NOT_ACTIVE";
+    throw e;
+  }
+
+  return branch;
+}
+
 function mapDeliveryNoteListRow(row) {
   return {
     id: row.id,
+    branchId: row.branchId || null,
+    branch: row.branch || null,
     number: String(row.number),
     date: row.date,
     customerName: row.customerName,
@@ -44,12 +171,25 @@ function mapDeliveryNoteListRow(row) {
   };
 }
 
-async function findDeliveryNoteById(tenantId, id) {
+async function findDeliveryNoteById(tenantId, id, scope = null) {
   if (!tenantId || !id) return null;
 
   return prisma.deliveryNote.findFirst({
-    where: { id, tenantId },
+    where: applyDeliveryBranchScope({ id, tenantId }, scope),
     include: {
+      ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
+        ? {
+            branch: {
+              select: {
+                id: true,
+                name: true,
+                code: true,
+                status: true,
+                isMain: true,
+              },
+            },
+          }
+        : {}),
       items: {
         orderBy: [{ createdAt: "asc" }],
       },
@@ -64,9 +204,12 @@ async function listDeliveryNotes(req, res) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const scope = resolveDeliveryNoteBranchScope(req);
     const q = cleanString(req.query.q);
 
-    const where = { tenantId };
+    let where = { tenantId };
+    where = applyDeliveryBranchScope(where, scope);
+
     if (q) {
       const maybeNumber = Number(q);
       where.OR = [
@@ -84,6 +227,20 @@ async function listDeliveryNotes(req, res) {
       take: 200,
       select: {
         id: true,
+        ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined" ? { branchId: true } : {}),
+        ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
+          ? {
+              branch: {
+                select: {
+                  id: true,
+                  name: true,
+                  code: true,
+                  status: true,
+                  isMain: true,
+                },
+              },
+            }
+          : {}),
         number: true,
         date: true,
         customerName: true,
@@ -100,8 +257,13 @@ async function listDeliveryNotes(req, res) {
     return res.json({
       deliveryNotes: rows.map(mapDeliveryNoteListRow),
       count: rows.length,
+      branchScope: scope,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("listDeliveryNotes error:", err);
     return res.status(500).json({ message: "Failed to load delivery notes" });
   }
@@ -110,11 +272,13 @@ async function listDeliveryNotes(req, res) {
 async function createDeliveryNote(req, res) {
   try {
     const tenantId = getTenantId(req);
-    const userId = req.user?.userId || null;
+    const userId = getUserId(req);
 
     if (!tenantId) {
       return res.status(401).json({ message: "Unauthorized" });
     }
+
+    const activeBranch = await ensureWritableBranchAccessOrThrow(req);
 
     const customerName = cleanString(req.body.customerName);
     const customerPhone = cleanString(req.body.customerPhone);
@@ -144,24 +308,43 @@ async function createDeliveryNote(req, res) {
 
     const number = Number(counter.nextNumber) - 1;
 
-    const note = await prisma.deliveryNote.create({
-      data: {
-        tenantId,
-        number,
-        saleId,
-        customerName,
-        customerPhone,
-        customerAddress,
-        deliveredBy,
-        receivedBy,
-        receivedByPhone,
-        notes,
-        createdById: userId,
-        items: {
-          create: items,
-        },
+    const createData = {
+      tenantId,
+      number,
+      saleId,
+      customerName,
+      customerPhone,
+      customerAddress,
+      deliveredBy,
+      receivedBy,
+      receivedByPhone,
+      notes,
+      createdById: userId,
+      items: {
+        create: items,
       },
+    };
+
+    if (typeof prisma.deliveryNote.fields?.branchId !== "undefined") {
+      createData.branchId = activeBranch.id;
+    }
+
+    const note = await prisma.deliveryNote.create({
+      data: createData,
       include: {
+        ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
+          ? {
+              branch: {
+                select: {
+                  id: true,
+                  name: true,
+                  code: true,
+                  status: true,
+                  isMain: true,
+                },
+              },
+            }
+          : {}),
         items: {
           orderBy: [{ createdAt: "asc" }],
         },
@@ -172,6 +355,22 @@ async function createDeliveryNote(req, res) {
       deliveryNote: note,
     });
   } catch (err) {
+    const code = err?.code;
+    const msg = String(err?.message || "");
+
+    if (code === "BRANCH_REQUIRED" || msg === "BRANCH_REQUIRED") {
+      return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
+    }
+    if (code === "BRANCH_ACCESS_DENIED" || msg === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
+    }
+    if (code === "BRANCH_NOT_FOUND" || msg === "BRANCH_NOT_FOUND") {
+      return res.status(404).json({ message: "Branch not found" });
+    }
+    if (code === "BRANCH_NOT_ACTIVE" || msg === "BRANCH_NOT_ACTIVE") {
+      return res.status(409).json({ message: "Selected branch is not active" });
+    }
+
     console.error("createDeliveryNote error:", err);
     return res.status(500).json({ message: "Failed to create delivery note" });
   }
@@ -184,19 +383,24 @@ async function getDeliveryNote(req, res) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const scope = resolveDeliveryNoteBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) {
       return res.status(400).json({ message: "Delivery note id is required" });
     }
 
-    const note = await findDeliveryNoteById(tenantId, id);
+    const note = await findDeliveryNoteById(tenantId, id, scope);
 
     if (!note) {
       return res.status(404).json({ message: "Delivery note not found" });
     }
 
-    return res.json({ deliveryNote: note });
+    return res.json({ deliveryNote: note, branchScope: scope });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("getDeliveryNote error:", err);
     return res.status(500).json({ message: "Failed to load delivery note" });
   }
@@ -209,13 +413,14 @@ async function updateDeliveryNote(req, res) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const scope = resolveDeliveryNoteBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) {
       return res.status(400).json({ message: "Delivery note id is required" });
     }
 
     const existing = await prisma.deliveryNote.findFirst({
-      where: { id, tenantId },
+      where: applyDeliveryBranchScope({ id, tenantId }, scope),
       select: {
         id: true,
       },
@@ -284,6 +489,19 @@ async function updateDeliveryNote(req, res) {
       return tx.deliveryNote.findUnique({
         where: { id: existing.id },
         include: {
+          ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
+            ? {
+                branch: {
+                  select: {
+                    id: true,
+                    name: true,
+                    code: true,
+                    status: true,
+                    isMain: true,
+                  },
+                },
+              }
+            : {}),
           items: {
             orderBy: [{ createdAt: "asc" }],
           },
@@ -296,6 +514,10 @@ async function updateDeliveryNote(req, res) {
       deliveryNote: result,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("updateDeliveryNote error:", err);
     return res.status(500).json({ message: "Failed to update delivery note" });
   }
@@ -308,13 +530,14 @@ async function deleteDeliveryNote(req, res) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const scope = resolveDeliveryNoteBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) {
       return res.status(400).json({ message: "Delivery note id is required" });
     }
 
     const existing = await prisma.deliveryNote.findFirst({
-      where: { id, tenantId },
+      where: applyDeliveryBranchScope({ id, tenantId }, scope),
       select: { id: true },
     });
 
@@ -331,6 +554,10 @@ async function deleteDeliveryNote(req, res) {
       id: existing.id,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("deleteDeliveryNote error:", err);
     return res.status(500).json({ message: "Failed to delete delivery note" });
   }
@@ -343,11 +570,25 @@ async function printDeliveryNoteHtml(req, res) {
       return res.status(401).send("Unauthorized");
     }
 
+    const scope = resolveDeliveryNoteBranchScope(req);
     const id = String(req.params.id || "").trim();
 
     const note = await prisma.deliveryNote.findFirst({
-      where: { id, tenantId },
+      where: applyDeliveryBranchScope({ id, tenantId }, scope),
       include: {
+        ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
+          ? {
+              branch: {
+                select: {
+                  id: true,
+                  name: true,
+                  code: true,
+                  status: true,
+                  isMain: true,
+                },
+              },
+            }
+          : {}),
         items: {
           orderBy: [{ createdAt: "asc" }],
         },
@@ -358,7 +599,11 @@ async function printDeliveryNoteHtml(req, res) {
       return res.status(404).send("Delivery note not found");
     }
 
-    const tenant = await buildTenantDocumentBranding(prisma, tenantId);
+    const tenant = await buildTenantDocumentBranding(
+      prisma,
+      tenantId,
+      typeof note.branchId !== "undefined" ? note.branchId : null
+    );
 
     const html = renderDeliveryNoteHtml({
       tenant,
@@ -386,12 +631,18 @@ async function printDeliveryNoteHtml(req, res) {
         receivedByPhone: note.receivedByPhone,
         notes: note.notes || tenant?.deliveryNoteTerms || null,
         badgeText: "DELIVERY",
+        branchName: note.branch?.name || null,
+        branchCode: note.branch?.code || null,
       },
     });
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.send(html);
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).send("Branch access denied");
+    }
+
     console.error("printDeliveryNoteHtml error:", err);
     return res.status(500).send("Failed to render delivery note");
   }

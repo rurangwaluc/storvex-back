@@ -8,6 +8,14 @@ function getTenantId(req) {
   return req.user?.tenantId || null;
 }
 
+function getActiveBranchId(req) {
+  return req.user?.branchId || req.branch?.id || null;
+}
+
+function canViewAllBranches(req) {
+  return Boolean(req.user?.canViewAllBranches);
+}
+
 function cleanString(x) {
   const s = String(x ?? "").trim();
   return s || null;
@@ -30,9 +38,70 @@ function saleItemsOrderBy() {
   return hasField(prisma.saleItem, "createdAt") ? [{ createdAt: "asc" }] : [{ id: "asc" }];
 }
 
+function resolveInvoiceBranchScope(req) {
+  const requestedBranchId =
+    cleanString(req.query?.branchId) ||
+    cleanString(req.headers["x-branch-id"]) ||
+    null;
+
+  const allBranchesRequested =
+    String(req.query?.allBranches || "")
+      .trim()
+      .toLowerCase() === "true";
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (allBranchesRequested) {
+    if (!canViewAllBranches(req)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "ALL_BRANCHES",
+      branchId: null,
+      allowedBranchIds,
+    };
+  }
+
+  if (requestedBranchId) {
+    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "SINGLE_BRANCH",
+      branchId: requestedBranchId,
+      allowedBranchIds,
+    };
+  }
+
+  return {
+    mode: "SINGLE_BRANCH",
+    branchId: getActiveBranchId(req),
+    allowedBranchIds,
+  };
+}
+
+function applyInvoiceBranchScope(where, scope) {
+  const next = { ...(where || {}) };
+
+  if (scope?.mode === "SINGLE_BRANCH" && scope?.branchId) {
+    next.branchId = scope.branchId;
+  }
+
+  return next;
+}
+
 function saleSelect() {
   return {
     id: true,
+    ...(hasField(prisma.sale, "branchId") ? { branchId: true } : {}),
     ...(hasField(prisma.sale, "invoiceNumber") ? { invoiceNumber: true } : {}),
     ...(hasField(prisma.sale, "receiptNumber") ? { receiptNumber: true } : {}),
     ...(hasField(prisma.sale, "createdAt") ? { createdAt: true } : {}),
@@ -46,6 +115,19 @@ function saleSelect() {
     ...(hasField(prisma.sale, "isCancelled") ? { isCancelled: true } : {}),
     ...(hasField(prisma.sale, "cancelledAt") ? { cancelledAt: true } : {}),
     ...(hasField(prisma.sale, "cancelNote") ? { cancelNote: true } : {}),
+    ...(hasField(prisma.sale, "branchId")
+      ? {
+          branch: {
+            select: {
+              ...(hasField(prisma.branch, "id") ? { id: true } : {}),
+              ...(hasField(prisma.branch, "name") ? { name: true } : {}),
+              ...(hasField(prisma.branch, "code") ? { code: true } : {}),
+              ...(hasField(prisma.branch, "status") ? { status: true } : {}),
+              ...(hasField(prisma.branch, "isMain") ? { isMain: true } : {}),
+            },
+          },
+        }
+      : {}),
     cashier: {
       select: {
         ...(hasField(prisma.user, "name") ? { name: true } : {}),
@@ -89,6 +171,16 @@ function saleSelectWithItems() {
 function mapSaleToInvoiceListRow(sale) {
   return {
     id: sale.id,
+    branchId: sale.branchId || null,
+    branch: sale.branch
+      ? {
+          id: sale.branch.id || null,
+          name: sale.branch.name || null,
+          code: sale.branch.code || null,
+          status: sale.branch.status || null,
+          isMain: Boolean(sale.branch.isMain),
+        }
+      : null,
     number: sale.invoiceNumber || null,
     receiptNumber: sale.receiptNumber || null,
     date: sale.createdAt || null,
@@ -134,6 +226,16 @@ function mapSaleToInvoiceDetail(sale, branding) {
   return {
     invoice: {
       id: sale.id,
+      branchId: sale.branchId || null,
+      branch: sale.branch
+        ? {
+            id: sale.branch.id || null,
+            name: sale.branch.name || null,
+            code: sale.branch.code || null,
+            status: sale.branch.status || null,
+            isMain: Boolean(sale.branch.isMain),
+          }
+        : null,
       number: sale.invoiceNumber || null,
       receiptNumber: sale.receiptNumber || null,
       date: sale.createdAt || null,
@@ -175,6 +277,8 @@ function mapSaleToInvoiceDetail(sale, branding) {
             warrantyTerms: branding.warrantyTerms || null,
             proformaTerms: branding.proformaTerms || null,
             deliveryNoteTerms: branding.deliveryNoteTerms || null,
+            branchName: branding.branchName || sale.branch?.name || null,
+            branchCode: branding.branchCode || sale.branch?.code || null,
           }
         : null,
     },
@@ -188,12 +292,16 @@ async function listInvoices(req, res) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const scope = resolveInvoiceBranchScope(req);
     const q = cleanString(req.query.q);
 
-    const where = {
-      tenantId,
-      ...saleDraftWhereFalse(),
-    };
+    const where = applyInvoiceBranchScope(
+      {
+        tenantId,
+        ...saleDraftWhereFalse(),
+      },
+      scope
+    );
 
     if (q) {
       where.OR = [
@@ -220,8 +328,13 @@ async function listInvoices(req, res) {
     return res.json({
       invoices: rows.map(mapSaleToInvoiceListRow),
       count: rows.length,
+      branchScope: scope,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("listInvoices error:", err);
     return res.status(500).json({ message: "Failed to load invoices" });
   }
@@ -234,17 +347,21 @@ async function getInvoice(req, res) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const scope = resolveInvoiceBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) {
       return res.status(400).json({ message: "Invoice id is required" });
     }
 
     const sale = await prisma.sale.findFirst({
-      where: {
-        tenantId,
-        ...saleDraftWhereFalse(),
-        OR: [{ id }, ...(hasField(prisma.sale, "invoiceNumber") ? [{ invoiceNumber: id }] : [])],
-      },
+      where: applyInvoiceBranchScope(
+        {
+          tenantId,
+          ...saleDraftWhereFalse(),
+          OR: [{ id }, ...(hasField(prisma.sale, "invoiceNumber") ? [{ invoiceNumber: id }] : [])],
+        },
+        scope
+      ),
       select: saleSelectWithItems(),
     });
 
@@ -252,10 +369,21 @@ async function getInvoice(req, res) {
       return res.status(404).json({ message: "Invoice not found" });
     }
 
-    const branding = await buildTenantDocumentBranding(prisma, tenantId);
+    const branding = await buildTenantDocumentBranding(
+      prisma,
+      tenantId,
+      sale.branchId || null
+    );
 
-    return res.json(mapSaleToInvoiceDetail(sale, branding));
+    return res.json({
+      ...mapSaleToInvoiceDetail(sale, branding),
+      branchScope: scope,
+    });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("getInvoice error:", err);
     return res.status(500).json({ message: "Failed to load invoice" });
   }
@@ -268,17 +396,21 @@ async function printInvoiceHtml(req, res) {
       return res.status(401).send("Unauthorized");
     }
 
+    const scope = resolveInvoiceBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) {
       return res.status(400).send("Invoice id is required");
     }
 
     const sale = await prisma.sale.findFirst({
-      where: {
-        tenantId,
-        ...saleDraftWhereFalse(),
-        OR: [{ id }, ...(hasField(prisma.sale, "invoiceNumber") ? [{ invoiceNumber: id }] : [])],
-      },
+      where: applyInvoiceBranchScope(
+        {
+          tenantId,
+          ...saleDraftWhereFalse(),
+          OR: [{ id }, ...(hasField(prisma.sale, "invoiceNumber") ? [{ invoiceNumber: id }] : [])],
+        },
+        scope
+      ),
       select: saleSelectWithItems(),
     });
 
@@ -286,7 +418,11 @@ async function printInvoiceHtml(req, res) {
       return res.status(404).send("Invoice not found");
     }
 
-    const branding = await buildTenantDocumentBranding(prisma, tenantId);
+    const branding = await buildTenantDocumentBranding(
+      prisma,
+      tenantId,
+      sale.branchId || null
+    );
 
     const items = (sale.items || []).map((item) => {
       const quantity = Number(item.quantity || 0);
@@ -321,6 +457,8 @@ async function printInvoiceHtml(req, res) {
         warrantyTerms: branding?.warrantyTerms || null,
         proformaTerms: branding?.proformaTerms || null,
         deliveryNoteTerms: branding?.deliveryNoteTerms || null,
+        branchName: branding?.branchName || sale.branch?.name || null,
+        branchCode: branding?.branchCode || sale.branch?.code || null,
       },
       document: {
         number: sale.invoiceNumber || sale.id,
@@ -353,6 +491,8 @@ async function printInvoiceHtml(req, res) {
         status: sale.status || "INVOICE",
         saleRef: sale.receiptNumber || sale.id,
         dueDate: sale.dueDate || null,
+        branchName: sale.branch?.name || null,
+        branchCode: sale.branch?.code || null,
         invoiceTerms: branding?.invoiceTerms || null,
       },
     });
@@ -360,6 +500,10 @@ async function printInvoiceHtml(req, res) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.send(html);
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).send("Branch access denied");
+    }
+
     console.error("printInvoiceHtml error:", err);
     return res.status(500).send("Failed to render invoice");
   }

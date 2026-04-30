@@ -39,12 +39,31 @@ function getTrialStaffLimit() {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 3;
 }
 
+function getTrialBranchLimit() {
+  const n = Number(process.env.TRIAL_BRANCH_LIMIT || 1);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+}
+
 function money(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return 0;
   return Math.round(n);
 }
 
+/**
+ * Launch strategy:
+ * - Keep entry affordable for Rwanda adoption
+ * - Keep structure simple
+ * - Growth in plan should clearly unlock both staff and branch expansion
+ *
+ * Branch ladder:
+ * - SOLO     => 1 staff, 1 branch
+ * - DUO      => 2 staff, 1 branch
+ * - TEAM_3   => 3 staff, 2 branches
+ * - TEAM_4   => 4 staff, 3 branches
+ * - TEAM_5   => 5 staff, 4 branches
+ * - TEAM_10  => 10 staff, 5 branches
+ */
 const PAID_PLANS = Object.freeze([
   {
     key: "SOLO_M1",
@@ -54,9 +73,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Solo",
     cycleLabel: "Monthly",
     days: 30,
-    price: money(15000),
+    price: money(7000),
     currency: CURRENCY,
     staffLimit: 1,
+    branchLimit: 1,
     isEnterprise: false,
   },
   {
@@ -67,9 +87,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Solo",
     cycleLabel: "3 Months",
     days: 90,
-    price: money(40500),
+    price: money(18900),
     currency: CURRENCY,
     staffLimit: 1,
+    branchLimit: 1,
     isEnterprise: false,
   },
   {
@@ -80,9 +101,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Solo",
     cycleLabel: "6 Months",
     days: 180,
-    price: money(76500),
+    price: money(35700),
     currency: CURRENCY,
     staffLimit: 1,
+    branchLimit: 1,
     isEnterprise: false,
   },
   {
@@ -93,9 +115,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Solo",
     cycleLabel: "1 Year",
     days: 365,
-    price: money(144000),
+    price: money(67200),
     currency: CURRENCY,
     staffLimit: 1,
+    branchLimit: 1,
     isEnterprise: false,
   },
 
@@ -107,9 +130,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Duo",
     cycleLabel: "Monthly",
     days: 30,
-    price: money(25000),
+    price: money(12000),
     currency: CURRENCY,
     staffLimit: 2,
+    branchLimit: 1,
     isEnterprise: false,
   },
   {
@@ -120,9 +144,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Duo",
     cycleLabel: "3 Months",
     days: 90,
-    price: money(67500),
+    price: money(32400),
     currency: CURRENCY,
     staffLimit: 2,
+    branchLimit: 1,
     isEnterprise: false,
   },
   {
@@ -133,9 +158,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Duo",
     cycleLabel: "6 Months",
     days: 180,
-    price: money(127500),
+    price: money(61200),
     currency: CURRENCY,
     staffLimit: 2,
+    branchLimit: 1,
     isEnterprise: false,
   },
   {
@@ -146,9 +172,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Duo",
     cycleLabel: "1 Year",
     days: 365,
-    price: money(240000),
+    price: money(115200),
     currency: CURRENCY,
     staffLimit: 2,
+    branchLimit: 1,
     isEnterprise: false,
   },
 
@@ -160,9 +187,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 3",
     cycleLabel: "Monthly",
     days: 30,
-    price: money(35000),
+    price: money(15000),
     currency: CURRENCY,
     staffLimit: 3,
+    branchLimit: 2,
     isEnterprise: false,
   },
   {
@@ -173,9 +201,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 3",
     cycleLabel: "3 Months",
     days: 90,
-    price: money(94500),
+    price: money(40500),
     currency: CURRENCY,
     staffLimit: 3,
+    branchLimit: 2,
     isEnterprise: false,
   },
   {
@@ -186,9 +215,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 3",
     cycleLabel: "6 Months",
     days: 180,
-    price: money(178500),
+    price: money(76500),
     currency: CURRENCY,
     staffLimit: 3,
+    branchLimit: 2,
     isEnterprise: false,
   },
   {
@@ -199,9 +229,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 3",
     cycleLabel: "1 Year",
     days: 365,
-    price: money(336000),
+    price: money(144000),
     currency: CURRENCY,
     staffLimit: 3,
+    branchLimit: 2,
     isEnterprise: false,
   },
 
@@ -213,9 +244,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 4",
     cycleLabel: "Monthly",
     days: 30,
-    price: money(45000),
+    price: money(19000),
     currency: CURRENCY,
     staffLimit: 4,
+    branchLimit: 3,
     isEnterprise: false,
   },
   {
@@ -226,9 +258,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 4",
     cycleLabel: "3 Months",
     days: 90,
-    price: money(121500),
+    price: money(51300),
     currency: CURRENCY,
     staffLimit: 4,
+    branchLimit: 3,
     isEnterprise: false,
   },
   {
@@ -239,9 +272,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 4",
     cycleLabel: "6 Months",
     days: 180,
-    price: money(229500),
+    price: money(96900),
     currency: CURRENCY,
     staffLimit: 4,
+    branchLimit: 3,
     isEnterprise: false,
   },
   {
@@ -252,9 +286,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 4",
     cycleLabel: "1 Year",
     days: 365,
-    price: money(432000),
+    price: money(182400),
     currency: CURRENCY,
     staffLimit: 4,
+    branchLimit: 3,
     isEnterprise: false,
   },
 
@@ -266,9 +301,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 5",
     cycleLabel: "Monthly",
     days: 30,
-    price: money(55000),
+    price: money(23000),
     currency: CURRENCY,
     staffLimit: 5,
+    branchLimit: 4,
     isEnterprise: false,
   },
   {
@@ -279,9 +315,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 5",
     cycleLabel: "3 Months",
     days: 90,
-    price: money(148500),
+    price: money(62100),
     currency: CURRENCY,
     staffLimit: 5,
+    branchLimit: 4,
     isEnterprise: false,
   },
   {
@@ -292,9 +329,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 5",
     cycleLabel: "6 Months",
     days: 180,
-    price: money(280500),
+    price: money(117300),
     currency: CURRENCY,
     staffLimit: 5,
+    branchLimit: 4,
     isEnterprise: false,
   },
   {
@@ -305,9 +343,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 5",
     cycleLabel: "1 Year",
     days: 365,
-    price: money(528000),
+    price: money(220800),
     currency: CURRENCY,
     staffLimit: 5,
+    branchLimit: 4,
     isEnterprise: false,
   },
 
@@ -319,9 +358,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 10",
     cycleLabel: "Monthly",
     days: 30,
-    price: money(95000),
+    price: money(45000),
     currency: CURRENCY,
     staffLimit: 10,
+    branchLimit: 5,
     isEnterprise: false,
   },
   {
@@ -332,9 +372,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 10",
     cycleLabel: "3 Months",
     days: 90,
-    price: money(256500),
+    price: money(121500),
     currency: CURRENCY,
     staffLimit: 10,
+    branchLimit: 5,
     isEnterprise: false,
   },
   {
@@ -345,9 +386,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 10",
     cycleLabel: "6 Months",
     days: 180,
-    price: money(484500),
+    price: money(229500),
     currency: CURRENCY,
     staffLimit: 10,
+    branchLimit: 5,
     isEnterprise: false,
   },
   {
@@ -358,9 +400,10 @@ const PAID_PLANS = Object.freeze([
     tierLabel: "Team 10",
     cycleLabel: "1 Year",
     days: 365,
-    price: money(912000),
+    price: money(432000),
     currency: CURRENCY,
     staffLimit: 10,
+    branchLimit: 5,
     isEnterprise: false,
   },
 
@@ -375,6 +418,7 @@ const PAID_PLANS = Object.freeze([
     price: 0,
     currency: CURRENCY,
     staffLimit: null,
+    branchLimit: null,
     isEnterprise: true,
   },
 ]);
@@ -391,6 +435,7 @@ function getTrialPlan() {
     price: 0,
     currency: CURRENCY,
     staffLimit: getTrialStaffLimit(),
+    branchLimit: getTrialBranchLimit(),
     isEnterprise: false,
   };
 }
@@ -443,6 +488,11 @@ function getStaffLimitForPlanKey(planKey) {
   return plan?.staffLimit ?? null;
 }
 
+function getBranchLimitForPlanKey(planKey) {
+  const plan = getPlanByKey(planKey);
+  return plan?.branchLimit ?? null;
+}
+
 function getPriceForPlanKey(planKey) {
   const plan = getPlanByKey(planKey);
   return plan?.price ?? null;
@@ -463,6 +513,7 @@ function getPlanSnapshot(planKey) {
     price: plan.price,
     currency: plan.currency,
     staffLimit: plan.staffLimit,
+    branchLimit: plan.branchLimit,
     isEnterprise: Boolean(plan.isEnterprise),
   };
 }
@@ -476,6 +527,7 @@ module.exports = {
   getTrialDays,
   getGraceDays,
   getTrialStaffLimit,
+  getTrialBranchLimit,
   getTrialPlan,
   getPaidPlans,
   getAllPlans,
@@ -486,6 +538,7 @@ module.exports = {
   isTrialPlanKey,
   isEnterprisePlanKey,
   getStaffLimitForPlanKey,
+  getBranchLimitForPlanKey,
   getPriceForPlanKey,
   getPlanSnapshot,
 };

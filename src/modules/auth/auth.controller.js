@@ -51,6 +51,59 @@ function sha256(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex");
 }
 
+function fieldExists(model, fieldName) {
+  return typeof model?.fields?.[fieldName] !== "undefined";
+}
+
+function getBranchLimitFromPlan(plan, signupMode = "PAID") {
+  const raw = plan?.branchLimit;
+
+  if (Number.isFinite(Number(raw)) && Number(raw) > 0) {
+    return Number(raw);
+  }
+
+  if (String(signupMode || "").toUpperCase() === "TRIAL") {
+    return 1;
+  }
+
+  return 1;
+}
+
+function makeMainBranchCode(storeName) {
+  const cleaned = String(storeName || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9\s]/g, " ")
+    .trim();
+
+  const parts = cleaned.split(/\s+/).filter(Boolean);
+
+  if (parts.length >= 2) {
+    const initials = parts
+      .slice(0, 3)
+      .map((p) => p[0])
+      .join("");
+
+    if (initials) return `${initials}_MAIN`;
+  }
+
+  if (parts.length === 1 && parts[0]) {
+    const base = parts[0].slice(0, 6);
+    return `${base}_MAIN`;
+  }
+
+  return "MAIN";
+}
+
+function makeMainBranchName(storeName) {
+  const name = cleanString(storeName);
+  if (!name) return "Main Branch";
+
+  const lower = name.toLowerCase();
+  if (lower.includes("main branch")) return name;
+
+  return `${name} Main Branch`;
+}
+
 function snapshotPlanOrNull(plan) {
   if (!plan) return null;
 
@@ -59,6 +112,7 @@ function snapshotPlanOrNull(plan) {
     tierKey: plan.tierKey || null,
     cycleKey: plan.cycleKey || null,
     staffLimit: Number.isFinite(Number(plan.staffLimit)) ? Number(plan.staffLimit) : null,
+    branchLimit: getBranchLimitFromPlan(plan),
     priceAmount: Number.isFinite(Number(plan.price)) ? Number(plan.price) : null,
     requestedPriceAmount: Number.isFinite(Number(plan.price)) ? Number(plan.price) : null,
     currency: plan.currency || null,
@@ -70,6 +124,204 @@ function createForbiddenTrialError(reason = "Free trial already used. Please cho
   const err = new Error(reason);
   err.status = 403;
   return err;
+}
+
+function buildTenantCreateData(intent, ownerEmail, ownerPhone) {
+  const data = {
+    name: String(intent.storeName || "").trim(),
+    email: ownerEmail,
+    phone: ownerPhone,
+    status: "ACTIVE",
+  };
+
+  if (fieldExists(prisma.tenant, "shopType")) {
+    data.shopType = cleanString(intent.shopType);
+  }
+
+  if (fieldExists(prisma.tenant, "district")) {
+    data.district = cleanString(intent.district);
+  }
+
+  if (fieldExists(prisma.tenant, "sector")) {
+    data.sector = cleanString(intent.sector);
+  }
+
+  if (fieldExists(prisma.tenant, "address")) {
+    data.address = cleanString(intent.address);
+  }
+
+  if (fieldExists(prisma.tenant, "countryCode")) {
+    data.countryCode = "RW";
+  }
+
+  if (fieldExists(prisma.tenant, "currencyCode")) {
+    data.currencyCode = "RWF";
+  }
+
+  if (fieldExists(prisma.tenant, "timezone")) {
+    data.timezone = "Africa/Kigali";
+  }
+
+  return data;
+}
+
+function buildTenantSelect() {
+  return {
+    id: true,
+    name: true,
+    email: true,
+    phone: true,
+    status: true,
+    ...(fieldExists(prisma.tenant, "mainBranchId") ? { mainBranchId: true } : {}),
+    ...(fieldExists(prisma.tenant, "shopType") ? { shopType: true } : {}),
+    ...(fieldExists(prisma.tenant, "district") ? { district: true } : {}),
+    ...(fieldExists(prisma.tenant, "sector") ? { sector: true } : {}),
+    ...(fieldExists(prisma.tenant, "address") ? { address: true } : {}),
+    ...(fieldExists(prisma.tenant, "countryCode") ? { countryCode: true } : {}),
+    ...(fieldExists(prisma.tenant, "currencyCode") ? { currencyCode: true } : {}),
+    ...(fieldExists(prisma.tenant, "timezone") ? { timezone: true } : {}),
+    ...(fieldExists(prisma.tenant, "logoUrl") ? { logoUrl: true } : {}),
+  };
+}
+
+function buildBranchPayload(branch) {
+  if (!branch) return null;
+
+  return {
+    id: branch.id,
+    tenantId: branch.tenantId,
+    name: branch.name,
+    code: branch.code,
+    type: branch.type,
+    status: branch.status,
+    isMain: Boolean(branch.isMain),
+  };
+}
+
+async function getWorkspaceContextForUser(userId, fallbackTenantId = null) {
+  if (!userId) {
+    return {
+      tenant: null,
+      activeBranch: null,
+      allowedBranches: [],
+    };
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      tenantId: true,
+      role: true,
+      email: true,
+      name: true,
+      phone: true,
+      tenant: {
+        select: buildTenantSelect(),
+      },
+    },
+  });
+
+  const tenantId = user?.tenantId || fallbackTenantId || null;
+
+  if (!tenantId) {
+    return {
+      tenant: null,
+      activeBranch: null,
+      allowedBranches: [],
+    };
+  }
+
+  const assignments = await prisma.userBranchAssignment
+    .findMany({
+      where: {
+        tenantId,
+        userId,
+        canOperate: true,
+        branch: {
+          tenantId,
+          status: "ACTIVE",
+        },
+      },
+      orderBy: [{ isDefault: "desc" }],
+      select: {
+        isDefault: true,
+        canOperate: true,
+        canViewReports: true,
+        branch: {
+          select: {
+            id: true,
+            tenantId: true,
+            name: true,
+            code: true,
+            type: true,
+            status: true,
+            isMain: true,
+          },
+        },
+      },
+    })
+    .catch(() => []);
+
+  const branches = assignments
+    .map((assignment) => ({
+      ...buildBranchPayload(assignment.branch),
+      isDefault: Boolean(assignment.isDefault),
+      canOperate: Boolean(assignment.canOperate),
+      canViewReports: Boolean(assignment.canViewReports),
+    }))
+    .filter((branch) => branch?.id);
+
+  let activeBranch =
+    branches.find((branch) => branch.isDefault) ||
+    branches.find((branch) => branch.isMain) ||
+    branches[0] ||
+    null;
+
+  if (!activeBranch && user?.tenant?.mainBranchId) {
+    const mainBranch = await prisma.branch
+      .findFirst({
+        where: {
+          id: user.tenant.mainBranchId,
+          tenantId,
+          status: "ACTIVE",
+        },
+        select: {
+          id: true,
+          tenantId: true,
+          name: true,
+          code: true,
+          type: true,
+          status: true,
+          isMain: true,
+        },
+      })
+      .catch(() => null);
+
+    activeBranch = buildBranchPayload(mainBranch);
+  }
+
+  return {
+    tenant: user?.tenant || null,
+    activeBranch,
+    allowedBranches: branches,
+  };
+}
+
+function signAuthToken({ user, tokenId }) {
+  assertJwtSecret();
+
+  return jwt.sign(
+    {
+      userId: user.id,
+      role: user.role,
+      tenantId: user.tenantId,
+      email: user.email,
+      tokenId,
+    },
+    JWT_SECRET,
+    { expiresIn: "8h" }
+  );
 }
 
 async function enforceTrialGuardOrThrowTx(
@@ -277,6 +529,10 @@ async function ownerIntent(req, res) {
         ownerName: true,
         email: true,
         phone: true,
+        shopType: true,
+        district: true,
+        sector: true,
+        address: true,
         deviceId: true,
         browserFingerprint: true,
         emailVerified: true,
@@ -326,7 +582,9 @@ async function login(req, res) {
         id: true,
         tenantId: true,
         role: true,
+        name: true,
         email: true,
+        phone: true,
         password: true,
         isActive: true,
       },
@@ -375,19 +633,23 @@ async function login(req, res) {
       },
     }).catch(() => null);
 
-    const token = jwt.sign(
-      {
-        userId: user.id,
-        role: user.role,
-        tenantId: user.tenantId,
-        email: user.email,
-        tokenId,
-      },
-      JWT_SECRET,
-      { expiresIn: "8h" }
-    );
+    const token = signAuthToken({ user, tokenId });
+    const workspace = await getWorkspaceContextForUser(user.id, user.tenantId);
 
-    return res.json({ token });
+    return res.json({
+      token,
+      user: {
+        id: user.id,
+        tenantId: user.tenantId,
+        role: user.role,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+      },
+      tenant: workspace.tenant,
+      activeBranch: workspace.activeBranch,
+      allowedBranches: workspace.allowedBranches,
+    });
   } catch (err) {
     console.error("login error:", err);
     return res.status(500).json({ message: "Server error" });
@@ -417,6 +679,10 @@ async function confirmSignup(req, res) {
         ownerName: true,
         email: true,
         phone: true,
+        shopType: true,
+        district: true,
+        sector: true,
+        address: true,
         status: true,
         expiresAt: true,
         emailVerified: true,
@@ -520,6 +786,7 @@ async function confirmSignup(req, res) {
 
       if (!selectedPlan && Number.isFinite(Number(planDays))) {
         const fallbackDays = Number(planDays);
+
         if (!Number.isFinite(fallbackDays) || fallbackDays <= 0 || fallbackDays > 3650) {
           return res.status(400).json({ message: "Invalid planDays" });
         }
@@ -539,8 +806,8 @@ async function confirmSignup(req, res) {
           price: Number.isFinite(Number(latestSuccessfulPayment?.priceAmount))
             ? Number(latestSuccessfulPayment.priceAmount)
             : Number.isFinite(Number(intent.requestedPriceAmount))
-            ? Number(intent.requestedPriceAmount)
-            : null,
+              ? Number(intent.requestedPriceAmount)
+              : null,
           currency:
             cleanString(latestSuccessfulPayment?.currency) ||
             cleanString(intent.requestedCurrency) ||
@@ -548,8 +815,9 @@ async function confirmSignup(req, res) {
           staffLimit: Number.isFinite(Number(latestSuccessfulPayment?.staffLimit))
             ? Number(latestSuccessfulPayment.staffLimit)
             : Number.isFinite(Number(intent.requestedStaffLimit))
-            ? Number(intent.requestedStaffLimit)
-            : null,
+              ? Number(intent.requestedStaffLimit)
+              : null,
+          branchLimit: 1,
         };
       }
 
@@ -573,6 +841,7 @@ async function confirmSignup(req, res) {
       staffLimit: Number.isFinite(Number(selectedPlan.staffLimit))
         ? Number(selectedPlan.staffLimit)
         : null,
+      branchLimit: getBranchLimitFromPlan(selectedPlan, signupMode),
       isEnterprise: Boolean(selectedPlan.isEnterprise),
     };
 
@@ -592,12 +861,8 @@ async function confirmSignup(req, res) {
       }
 
       const tenant = await tx.tenant.create({
-        data: {
-          name: tenantName,
-          email: ownerEmail,
-          phone: ownerPhone,
-          status: "ACTIVE",
-        },
+        data: buildTenantCreateData(intent, ownerEmail, ownerPhone),
+        select: buildTenantSelect(),
       });
 
       const owner = await tx.user.create({
@@ -608,6 +873,56 @@ async function confirmSignup(req, res) {
           phone: ownerPhone,
           password: hashedPassword,
           role: "OWNER",
+        },
+        select: {
+          id: true,
+          tenantId: true,
+          name: true,
+          email: true,
+          phone: true,
+          role: true,
+        },
+      });
+
+      const mainBranch = await tx.branch.create({
+        data: {
+          tenantId: tenant.id,
+          name: makeMainBranchName(tenantName),
+          code: makeMainBranchCode(tenantName),
+          type: "MAIN",
+          status: "ACTIVE",
+          phone: ownerPhone,
+          countryCode: "RW",
+          isMain: true,
+        },
+        select: {
+          id: true,
+          tenantId: true,
+          name: true,
+          code: true,
+          type: true,
+          status: true,
+          isMain: true,
+        },
+      });
+
+      if (fieldExists(tx.tenant, "mainBranchId")) {
+        await tx.tenant.update({
+          where: { id: tenant.id },
+          data: {
+            mainBranchId: mainBranch.id,
+          },
+        });
+      }
+
+      await tx.userBranchAssignment.create({
+        data: {
+          tenantId: tenant.id,
+          userId: owner.id,
+          branchId: mainBranch.id,
+          isDefault: true,
+          canOperate: true,
+          canViewReports: true,
         },
       });
 
@@ -626,6 +941,8 @@ async function confirmSignup(req, res) {
           tierKey: planSnapshot.tierKey,
           cycleKey: planSnapshot.cycleKey,
           staffLimit: planSnapshot.staffLimit,
+          branchLimit: planSnapshot.branchLimit,
+          extraBranchCount: 0,
           priceAmount: planSnapshot.price,
           currency: planSnapshot.currency,
           startDate,
@@ -670,7 +987,13 @@ async function confirmSignup(req, res) {
               },
       });
 
-      return { tenant, owner, planSnapshot };
+      return {
+        tenant,
+        owner,
+        mainBranch,
+        planSnapshot,
+        startDate,
+      };
     });
 
     const tokenId = crypto.randomUUID();
@@ -689,17 +1012,17 @@ async function confirmSignup(req, res) {
       },
     });
 
-    const token = jwt.sign(
-      {
-        userId: result.owner.id,
+    const token = signAuthToken({
+      user: {
+        id: result.owner.id,
         tenantId: result.tenant.id,
         role: "OWNER",
         email: result.owner.email,
-        tokenId,
       },
-      JWT_SECRET,
-      { expiresIn: "8h" }
-    );
+      tokenId,
+    });
+
+    const workspace = await getWorkspaceContextForUser(result.owner.id, result.tenant.id);
 
     return res.status(201).json({
       message: signupMode === "TRIAL" ? "Trial started" : "Tenant created successfully",
@@ -708,14 +1031,42 @@ async function confirmSignup(req, res) {
       ownerEmail: result.owner.email,
       mode: signupMode,
       subscriptionDays,
+
+      user: {
+        id: result.owner.id,
+        tenantId: result.owner.tenantId,
+        role: result.owner.role,
+        name: result.owner.name,
+        email: result.owner.email,
+        phone: result.owner.phone,
+      },
+
+      tenant: workspace.tenant || result.tenant,
+
+      mainBranch: buildBranchPayload(result.mainBranch),
+      activeBranch: workspace.activeBranch || buildBranchPayload(result.mainBranch),
+      allowedBranches:
+        workspace.allowedBranches && workspace.allowedBranches.length
+          ? workspace.allowedBranches
+          : [
+              {
+                ...buildBranchPayload(result.mainBranch),
+                isDefault: true,
+                canOperate: true,
+                canViewReports: true,
+              },
+            ],
+
       subscription: {
         planKey: result.planSnapshot.planKey,
         tierKey: result.planSnapshot.tierKey,
         cycleKey: result.planSnapshot.cycleKey,
         staffLimit: result.planSnapshot.staffLimit,
+        branchLimit: result.planSnapshot.branchLimit,
+        extraBranchCount: 0,
         priceAmount: result.planSnapshot.price,
         currency: result.planSnapshot.currency,
-        startDate: new Date(),
+        startDate: result.startDate,
       },
     });
   } catch (err) {

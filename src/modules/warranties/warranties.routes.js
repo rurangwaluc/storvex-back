@@ -8,25 +8,33 @@ const controller = require("./warranties.controller");
 const authenticate = require("../../middlewares/authenticate");
 const authenticateHeaderOrQueryToken = require("../../middlewares/authenticateHeaderOrQueryToken");
 const requireTenant = require("../../middlewares/requireTenant");
-const requireRole = require("../../middlewares/requireRole");
 const {
   requireActiveSubscription,
   requireWritableSubscription,
 } = require("../../middlewares/requireActiveSubscription");
+const requireDbPermission = require("../../middlewares/requireDbPermission");
+const { PERMISSIONS } = require("../auth/permissions");
 
-const allowedRoles = ["OWNER", "MANAGER", "STOREKEEPER", "SELLER", "CASHIER", "TECHNICIAN"];
-const createEditRoles = ["OWNER", "MANAGER", "SELLER", "CASHIER"];
-const deleteRoles = ["OWNER", "MANAGER"];
+const readBase = [
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+];
+
+const writeBase = [
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+  requireWritableSubscription,
+];
 
 // -----------------------
 // GET /api/warranties
 // -----------------------
 router.get(
   "/",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole(...allowedRoles),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.POS_VIEW_SALES),
   controller.listWarranties
 );
 
@@ -35,11 +43,8 @@ router.get(
 // -----------------------
 router.post(
   "/",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole(...createEditRoles),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.WARRANTY_CREATE),
   controller.createWarranty
 );
 
@@ -52,7 +57,7 @@ router.get(
   authenticateHeaderOrQueryToken,
   requireTenant,
   requireActiveSubscription,
-  requireRole(...allowedRoles),
+  requireDbPermission(PERMISSIONS.POS_VIEW_SALES),
   controller.printWarrantyHtml
 );
 
@@ -61,10 +66,8 @@ router.get(
 // -----------------------
 router.get(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole(...allowedRoles),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.POS_VIEW_SALES),
   controller.getWarranty
 );
 
@@ -73,11 +76,8 @@ router.get(
 // -----------------------
 router.patch(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole(...createEditRoles),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.WARRANTY_CREATE),
   controller.updateWarranty
 );
 
@@ -86,11 +86,8 @@ router.patch(
 // -----------------------
 router.delete(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole(...deleteRoles),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.WARRANTY_CREATE),
   controller.deleteWarranty
 );
 

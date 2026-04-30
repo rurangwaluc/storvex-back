@@ -1,6 +1,5 @@
-// src/modules/auth/auth.routes.js
-
 const express = require("express");
+
 const router = express.Router();
 
 const authController = require("./auth.controller");
@@ -24,43 +23,22 @@ function isRwandaMsisdn250(phone) {
   return /^2507\d{8}$/.test(String(phone || ""));
 }
 
-// Owner intent (before payment)
-router.post("/owner-intent", authController.ownerIntent);
+function cleanString(value) {
+  const s = String(value || "").trim();
+  return s || "";
+}
 
-// OTP
-router.post("/otp/send", otpController.sendOtp);
-router.post("/otp/verify", otpController.verifyOtp);
-
-/**
- * Pricing plans (server-authoritative)
- * GET /api/auth/plans
- */
-router.get("/plans", (req, res) => {
-  return res.json({
-    trialDays: getTrialDays(),
-    plans: getPaidPlans(),
-  });
-});
-
-/**
- * ✅ Who am I + subscription status
- * GET /api/auth/me
- */
-router.get("/me", authenticate, meController.me);
-
-/**
- * Owner payment (MoMo sandbox)
- * Body:
- * { intentId, planKey, phone: "07XXXXXXXX" | "2507XXXXXXXX" }
- */
-router.post("/owner-payment", async (req, res) => {
-  const { intentId, phone, planKey } = req.body;
+async function createOwnerPayment(req, res) {
+  const { intentId, phone, planKey } = req.body || {};
 
   if (!intentId || !phone || !planKey) {
-    return res.status(400).json({ message: "intentId, planKey, phone required" });
+    return res.status(400).json({
+      message: "intentId, planKey, phone required",
+    });
   }
 
   const phoneNorm = normalizePhoneTo250(phone);
+
   if (!phoneNorm || !isRwandaMsisdn250(phoneNorm)) {
     return res.status(400).json({
       message: "Invalid MSISDN format. Use 07XXXXXXXX or 2507XXXXXXXX",
@@ -69,8 +47,8 @@ router.post("/owner-payment", async (req, res) => {
 
   try {
     const result = await momoService.createPaymentFromPlan(
-      String(intentId).trim(),
-      String(planKey).trim(),
+      cleanString(intentId),
+      cleanString(planKey),
       phoneNorm
     );
 
@@ -90,21 +68,74 @@ router.post("/owner-payment", async (req, res) => {
       error: err.response?.data || err.message,
     });
   }
+}
+
+// -----------------------------------------------------------------------------
+// Public onboarding routes
+// -----------------------------------------------------------------------------
+
+// Owner intent: first signup step before OTP/payment.
+router.post("/owner-intent", authController.ownerIntent);
+router.post("/signup/owner-intent", authController.ownerIntent);
+
+// OTP verification.
+router.post("/otp/send", otpController.sendOtp);
+router.post("/otp/verify", otpController.verifyOtp);
+
+// Cleaner onboarding aliases.
+router.post("/signup/otp/send", otpController.sendOtp);
+router.post("/signup/otp/verify", otpController.verifyOtp);
+
+// Server-authoritative pricing plans.
+router.get("/plans", (req, res) => {
+  return res.json({
+    trialDays: getTrialDays(),
+    plans: getPaidPlans(),
+  });
 });
 
-// MoMo webhook callback
-router.post("/payments/momo/callback", express.json(), paymentController.momoCallback);
-router.post("/payments/momo/callback/dev", express.json(), paymentController.momoCallbackDev);
+// Owner payment.
+router.post("/owner-payment", createOwnerPayment);
+router.post("/signup/payment", createOwnerPayment);
 
-// Tenant owner signup
-router.post("/signup/initiate", authController.initiateSignup);
+// Final owner signup.
+// This creates tenant, owner user, main branch, subscription, branch assignment,
+// and returns token + workspace context.
 router.post("/confirm-signup", authController.confirmSignup);
+router.post("/signup/confirm", authController.confirmSignup);
 
-// Tenant user login
+// Legacy/mock route kept to avoid breaking older frontend calls.
+router.post("/signup/initiate", authController.initiateSignup);
+
+// Login.
 router.post("/login", authController.login);
 
-// Password reset
+// Password reset.
 router.post("/password/forgot", authController.forgotPassword);
 router.post("/password/reset", authController.resetPassword);
+
+// -----------------------------------------------------------------------------
+// Authenticated account/workspace route
+// -----------------------------------------------------------------------------
+
+router.get("/me", authenticate, meController.me);
+
+// -----------------------------------------------------------------------------
+// Payment callbacks
+// -----------------------------------------------------------------------------
+
+// MoMo webhook callback.
+router.post(
+  "/payments/momo/callback",
+  express.json(),
+  paymentController.momoCallback
+);
+
+// Local/dev callback simulator.
+router.post(
+  "/payments/momo/callback/dev",
+  express.json(),
+  paymentController.momoCallbackDev
+);
 
 module.exports = router;

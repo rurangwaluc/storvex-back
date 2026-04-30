@@ -16,6 +16,7 @@ model PlatformUser {
   role      PlatformRole @default(PLATFORM_ADMIN)
   createdAt DateTime     @default(now())
 }
+
 model Permission {
   id          String   @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
   key         String   @unique @db.Text
@@ -59,68 +60,69 @@ model UserPermission {
 /// /////////////////////////
 /// /////////////////////////
 model OwnerIntent {
-  id                          String            @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
-  email                       String            @db.Text
-  phone                       String            @db.Text
-  storeName                   String            @db.Text
-  status                      OwnerIntentStatus @default(PENDING)
-  expiresAt                   DateTime
-  createdAt                   DateTime          @default(now())
+  id                        String            @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  email                     String            @db.Text
+  phone                     String            @db.Text
+  storeName                 String            @db.Text
+  status                    OwnerIntentStatus @default(PENDING)
+  expiresAt                 DateTime
+  createdAt                 DateTime          @default(now())
 
-  address                     String?           @db.Text
-  convertedAt                 DateTime?
-  district                    String?           @db.Text
-  ownerName                   String            @db.Text
-  sector                      String?           @db.Text
-  shopType                    String?           @db.Text
-  updatedAt                   DateTime          @default(now()) @updatedAt
+  address                   String?           @db.Text
+  convertedAt               DateTime?
+  district                  String?           @db.Text
+  ownerName                 String            @db.Text
+  sector                    String?           @db.Text
+  shopType                  String?           @db.Text
+  updatedAt                 DateTime          @default(now()) @updatedAt
 
-  emailVerified               Boolean           @default(false)
-  phoneVerified               Boolean           @default(false)
-  emailVerifiedAt             DateTime?
-  phoneVerifiedAt             DateTime?
+  emailVerified             Boolean           @default(false)
+  phoneVerified             Boolean           @default(false)
+  emailVerifiedAt           DateTime?
+  phoneVerifiedAt           DateTime?
 
-  deviceId                    String?           @db.Text
-  browserFingerprint          String?           @db.Text
-  signupIp                    String?           @db.Text
-  signupUserAgent             String?           @db.Text
+  deviceId                  String?           @db.Text
+  browserFingerprint        String?           @db.Text
+  signupIp                  String?           @db.Text
+  signupUserAgent           String?           @db.Text
 
-  trialGrantedAt              DateTime?
-  trialEligibilityCheckedAt   DateTime?
-  trialBlockedReason          String?           @db.Text
+  trialGrantedAt            DateTime?
+  trialEligibilityCheckedAt DateTime?
+  trialBlockedReason        String?           @db.Text
 
-  requestedPlanKey            String?           @db.Text
-  requestedTierKey            String?           @db.Text
-  requestedCycleKey           String?           @db.Text
-  requestedStaffLimit         Int?
-  requestedPriceAmount        Float?
-  requestedCurrency           String?           @db.Text
+  requestedPlanKey          String?           @db.Text
+  requestedTierKey          String?           @db.Text
+  requestedCycleKey         String?           @db.Text
+  requestedStaffLimit       Int?
+  requestedPriceAmount      Float?
+  requestedCurrency         String?           @db.Text
 
-  otps                        OtpCode[]
-  otpDeliveryLogs             OtpDeliveryLog[]
-  payments                    Payment[]
+  otps                      OtpCode[]
+  otpDeliveryLogs           OtpDeliveryLog[]
+  payments                  Payment[]
 }
 
 model Payment {
-  id           String        @id @default(uuid())
-  intentId     String?
-  amount       Float
-  currency     String        @default("RWF")
-  reference    String        @unique
-  status       PaymentStatus @default(PENDING)
-  provider     String
-  createdAt    DateTime      @default(now())
-  tenantId     String?
-  planKey      String?
-  tierKey      String?       @db.Text
-  cycleKey     String?       @db.Text
-  staffLimit   Int?
-  priceAmount  Float?
-  purpose      String
-  updatedAt    DateTime      @default(now()) @updatedAt
+  id          String        @id @default(uuid())
+  intentId    String?
+  amount      Float
+  currency    String        @default("RWF")
+  reference   String        @unique
+  status      PaymentStatus @default(PENDING)
+  provider    String
+  createdAt   DateTime      @default(now())
+  tenantId    String?
+  planKey     String?
+  tierKey     String?       @db.Text
+  cycleKey    String?       @db.Text
+  staffLimit  Int?
+  branchLimit Int?
+  priceAmount Float?
+  purpose     String
+  updatedAt   DateTime      @default(now()) @updatedAt
 
-  intent       OwnerIntent?  @relation(fields: [intentId], references: [id])
-  tenant       Tenant?       @relation(fields: [tenantId], references: [id])
+  intent      OwnerIntent?  @relation(fields: [intentId], references: [id])
+  tenant      Tenant?       @relation(fields: [tenantId], references: [id])
 
   @@index([intentId])
   @@index([tenantId])
@@ -144,12 +146,6 @@ model Tenant {
   receiptFooter                String?                   @db.Text
   logoKey                      String?                   @db.Text
 
-  proformas                    Proforma[]
-
-  sessions                     UserSession[]
-  loginEvents                  LoginEvent[]
-  passwordChangeEvents         PasswordChangeEvent[]
-
   shopType                     String?                   @db.Text
   district                     String?                   @db.Text
   sector                       String?                   @db.Text
@@ -161,12 +157,25 @@ model Tenant {
   onboardingCompletedAt        DateTime?
   cash_drawer_block_cash_sales Boolean                   @default(true)
 
+  mainBranchId                 String?                   @unique @db.Text
+
+  mainBranch                   Branch?                   @relation("TenantMainBranch", fields: [mainBranchId], references: [id])
+  branches                     Branch[]                  @relation("TenantBranches")
+  userBranchAssignments        UserBranchAssignment[]
+  branchInventory              BranchInventory[]
+
   documentSettings             TenantDocumentSettings?
   documentCounter              TenantDocumentCounter?
+  deliveryNoteCounters         DeliveryNoteCounter?
+  subscription                 Subscription?
+
+  proformas                    Proforma[]
+  sessions                     UserSession[]
+  loginEvents                  LoginEvent[]
+  passwordChangeEvents         PasswordChangeEvent[]
 
   customers                    Customer[]
   deliveryNotes                DeliveryNote[]
-  deliveryNoteCounters         DeliveryNoteCounter?
   expenses                     Expense[]
   borrowedDeals                InterStoreDeal[]          @relation("BorrowerDeals")
   suppliedDeals                InterStoreDeal[]          @relation("SupplierDeals")
@@ -182,7 +191,6 @@ model Tenant {
   salePayments                 SalePayment[]
   saleRefunds                  SaleRefund[]              @relation("TenantToSaleRefunds")
   stockAdjustments             StockAdjustment[]
-  subscription                 Subscription?
   suppliers                    Supplier[]
   SupplierSupply               SupplierSupply[]
   SupplierSupplyItem           SupplierSupplyItem[]
@@ -192,49 +200,114 @@ model Tenant {
   whatsAppConversations        WhatsAppConversation[]
   whatsAppMessages             WhatsAppMessage[]
   saleWarranties               SaleWarranty[]
+  auditLogs                    AuditLog[]
 
   @@map("Tenant")
 }
 
+model Branch {
+  id          String       @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  tenantId    String       @db.Text
+  name        String       @db.Text
+  code        String       @db.Text
+  type        BranchType   @default(STANDARD)
+  status      BranchStatus @default(ACTIVE)
+
+  phone       String?      @db.Text
+  email       String?      @db.Text
+  countryCode String       @default("RW") @db.Text
+  district    String?      @db.Text
+  sector      String?      @db.Text
+  address     String?      @db.Text
+
+  isMain      Boolean      @default(false)
+  createdById String?      @db.Text
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @default(now()) @updatedAt
+
+  tenant      Tenant       @relation("TenantBranches", fields: [tenantId], references: [id], onDelete: Cascade)
+  mainForTenant Tenant?    @relation("TenantMainBranch")
+
+  userAssignments UserBranchAssignment[]
+  inventory       BranchInventory[]
+
+  sales            Sale[]
+  salePayments     SalePayment[]
+  saleRefunds      SaleRefund[]
+  repairs          Repair[]
+  expenses         Expense[]
+  stockAdjustments StockAdjustment[]
+  purchaseOrders   PurchaseOrder[]
+  supplierSupplies SupplierSupply[]
+  deliveryNotes    DeliveryNote[]
+  saleWarranties   SaleWarranty[]
+  proformas        Proforma[]
+  auditLogs        AuditLog[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("Branch")
+}
+
+model UserBranchAssignment {
+  id             String   @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  tenantId       String   @db.Text
+  userId         String
+  branchId       String   @db.Text
+  isDefault      Boolean  @default(false)
+  canOperate     Boolean  @default(true)
+  canViewReports Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch         Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, branchId])
+  @@index([tenantId, userId])
+  @@index([tenantId, branchId])
+  @@map("UserBranchAssignment")
+}
 
 model TenantDocumentSettings {
-  tenantId              String   @id @db.Text
-  receiptPrefix         String   @default("RCT") @db.Text
-  invoicePrefix         String   @default("INV") @db.Text
-  warrantyPrefix        String   @default("WAR") @db.Text
-  receiptPadding        Int      @default(6)
-  invoicePadding        Int      @default(6)
-  warrantyPadding       Int      @default(6)
-  invoiceTerms          String?  @db.Text
-  warrantyTerms         String?  @db.Text
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @default(now()) @updatedAt
+  tenantId             String   @id @db.Text
+  receiptPrefix        String   @default("RCT") @db.Text
+  invoicePrefix        String   @default("INV") @db.Text
+  warrantyPrefix       String   @default("WAR") @db.Text
+  receiptPadding       Int      @default(6)
+  invoicePadding       Int      @default(6)
+  warrantyPadding      Int      @default(6)
+  invoiceTerms         String?  @db.Text
+  warrantyTerms        String?  @db.Text
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @default(now()) @updatedAt
 
-  proformaPrefix        String   @default("PRF")
-  proformaPadding       Int      @default(6)
-  proformaTerms         String?  @db.Text
-  deliveryNoteTerms     String?  @db.Text
+  proformaPrefix       String   @default("PRF")
+  proformaPadding      Int      @default(6)
+  proformaTerms        String?  @db.Text
+  deliveryNoteTerms    String?  @db.Text
 
-  documentPrimaryColor  String?  @db.Text
-  documentAccentColor   String?  @db.Text
+  documentPrimaryColor String?  @db.Text
+  documentAccentColor  String?  @db.Text
 
-  tenant                Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant               Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@map("TenantDocumentSettings")
 }
 
 model TenantDocumentCounter {
-  tenantId         String   @id @db.Text
-  nextReceiptSeq   BigInt   @default(1)
-  nextInvoiceSeq   BigInt   @default(1)
-  nextWarrantySeq  BigInt   @default(1)
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @default(now()) @updatedAt
+  tenantId        String   @id @db.Text
+  nextReceiptSeq  BigInt   @default(1)
+  nextInvoiceSeq  BigInt   @default(1)
+  nextWarrantySeq BigInt   @default(1)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @default(now()) @updatedAt
 
-  tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  nextProformaSeq BigInt @default(1)
-  
+  nextProformaSeq BigInt   @default(1)
+
   @@map("TenantDocumentCounter")
 }
 
@@ -278,6 +351,7 @@ model User {
   assignedConversations      WhatsAppConversation[]
   whatsAppMessages           WhatsAppMessage[]
   saleWarranties             SaleWarranty[]
+  branchAssignments          UserBranchAssignment[]
 
   @@index([tenantId])
   @@index([tenantId, id])
@@ -294,6 +368,8 @@ model Subscription {
   tierKey             String?                 @db.Text
   cycleKey            String?                 @db.Text
   staffLimit          Int?
+  branchLimit         Int?
+  extraBranchCount    Int                     @default(0)
   priceAmount         Float?
   currency            String?                 @db.Text
 
@@ -353,8 +429,8 @@ model Product {
   saleItems                 SaleItem[]
   stockAdjustments          StockAdjustment[]
   SupplierSupplyItem        SupplierSupplyItem[]
-
-  proformaItems ProformaItem[]
+  proformaItems             ProformaItem[]
+  branchInventory           BranchInventory[]
 
   @@index([tenantId, supplierId])
   @@index([tenantId])
@@ -364,6 +440,27 @@ model Product {
   @@index([tenantId, barcode])
   @@index([tenantId, brand])
   @@index([tenantId, supplierName])
+}
+
+model BranchInventory {
+  id            String   @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  tenantId      String   @db.Text
+  branchId      String   @db.Text
+  productId     String
+  qtyOnHand     Int      @default(0)
+  qtyReserved   Int      @default(0)
+  minStockLevel Int?
+  shelfLabel    String?  @db.Text
+  updatedAt     DateTime @default(now()) @updatedAt
+
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch        Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  product       Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, productId])
+  @@index([tenantId, branchId])
+  @@index([tenantId, productId])
+  @@map("BranchInventory")
 }
 
 model Customer {
@@ -385,8 +482,7 @@ model Customer {
   repairs               Repair[]
   sales                 Sale[]
   whatsAppConversations WhatsAppConversation[]
-
-  proformas Proforma[]
+  proformas             Proforma[]
 
   @@unique([tenantId, phone])
   @@index([tenantId])
@@ -398,49 +494,50 @@ model Customer {
 }
 
 model Sale {
-  id         String            @id @default(uuid())
-  tenantId   String
-  cashierId  String
-  customerId String?
-  total      Float
-  createdAt  DateTime          @default(now())
-  amountPaid Float             @default(0)
-  balanceDue Float             @default(0)
-  dueDate    DateTime?
-  saleType   SaleType          @default(CASH)
-  status     SalePaymentStatus @default(PAID)
+  id             String            @id @default(uuid())
+  tenantId       String
+  branchId       String?           @db.Text
+  cashierId      String
+  customerId     String?
+  total          Float
+  createdAt      DateTime          @default(now())
+  amountPaid     Float             @default(0)
+  balanceDue     Float             @default(0)
+  dueDate        DateTime?
+  saleType       SaleType          @default(CASH)
+  status         SalePaymentStatus @default(PAID)
 
-  // draft lifecycle
-  isDraft     Boolean   @default(false)
-  draftSource String?
-  finalizedAt DateTime?
+  isDraft        Boolean           @default(false)
+  draftSource    String?
+  finalizedAt    DateTime?
 
-  // cancel/void support
-  isCancelled   Boolean   @default(false)
-  cancelledAt   DateTime?
-  cancelledById String?
-  cancelNote    String?
+  isCancelled    Boolean           @default(false)
+  cancelledAt    DateTime?
+  cancelledById  String?
+  cancelNote     String?
 
-  // refund summary
-  refundedTotal Float @default(0)
+  refundedTotal  Float             @default(0)
 
-  deliveryNotes DeliveryNote[]
-  cashier       User           @relation("CashierSales", fields: [cashierId], references: [id])
-  customer      Customer?      @relation(fields: [customerId], references: [id])
-  tenant        Tenant         @relation(fields: [tenantId], references: [id])
-  items         SaleItem[]
-  payments      SalePayment[]  @relation("SalePayments")
-  refunds       SaleRefund[]   @relation("SaleToRefunds")
-  warranties    SaleWarranty[]
-
-  receiptNumber String?
-  invoiceNumber String?
+  receiptNumber  String?
+  invoiceNumber  String?
 
   conversationId String?
   conversation   WhatsAppConversation? @relation(fields: [conversationId], references: [id])
-  @@index([conversationId])
 
+  deliveryNotes  DeliveryNote[]
+  cashier        User               @relation("CashierSales", fields: [cashierId], references: [id])
+  customer       Customer?          @relation(fields: [customerId], references: [id])
+  tenant         Tenant             @relation(fields: [tenantId], references: [id])
+  branch         Branch?            @relation(fields: [branchId], references: [id])
+  items          SaleItem[]
+  payments       SalePayment[]      @relation("SalePayments")
+  refunds        SaleRefund[]       @relation("SaleToRefunds")
+  warranties     SaleWarranty[]
+
+  @@index([conversationId])
   @@index([tenantId])
+  @@index([branchId])
+  @@index([tenantId, branchId, createdAt])
   @@index([tenantId, isDraft])
   @@index([tenantId, draftSource])
   @@index([saleType])
@@ -464,57 +561,64 @@ model SalePayment {
   id           String            @id @default(uuid())
   saleId       String
   tenantId     String
+  branchId     String?           @db.Text
   receivedById String?
   amount       Float
   method       SalePaymentMethod @default(CASH)
   note         String?
   createdAt    DateTime          @default(now())
+
   receivedBy   User?             @relation("ReceivedSalePayments", fields: [receivedById], references: [id])
   sale         Sale              @relation("SalePayments", fields: [saleId], references: [id])
   tenant       Tenant            @relation(fields: [tenantId], references: [id])
+  branch       Branch?           @relation(fields: [branchId], references: [id])
 
   @@unique([tenantId, note])
   @@index([saleId])
   @@index([tenantId])
+  @@index([branchId])
   @@index([receivedById])
 }
 
 model Proforma {
-  id               String          @id @default(cuid())
-  tenantId         String
-  customerId       String?
-  createdById      String?
+  id                String          @id @default(cuid())
+  tenantId          String
+  branchId          String?         @db.Text
+  customerId        String?
+  createdById       String?
 
-  number           String
-  status           ProformaStatus  @default(DRAFT)
+  number            String
+  status            ProformaStatus  @default(DRAFT)
 
-  customerName     String
-  customerPhone    String?
-  customerEmail    String?
-  customerAddress  String?
+  customerName      String
+  customerPhone     String?
+  customerEmail     String?
+  customerAddress   String?
 
-  subtotal         Float           @default(0)
-  total            Float           @default(0)
-  currency         String          @default("RWF")
+  subtotal          Float           @default(0)
+  total             Float           @default(0)
+  currency          String          @default("RWF")
 
-  validUntil       DateTime?
-  preparedBy       String?
-  reference        String?
-  notes            String?
+  validUntil        DateTime?
+  preparedBy        String?
+  reference         String?
+  notes             String?
 
   convertedToSaleId String?
-  convertedAt      DateTime?
+  convertedAt       DateTime?
 
-  createdAt        DateTime        @default(now())
-  updatedAt        DateTime        @updatedAt
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
 
-  tenant           Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  customer         Customer?       @relation(fields: [customerId], references: [id], onDelete: SetNull)
-  createdBy        User?           @relation("ProformaCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
-  items            ProformaItem[]
+  tenant            Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch            Branch?         @relation(fields: [branchId], references: [id])
+  customer          Customer?       @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  createdBy         User?           @relation("ProformaCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  items             ProformaItem[]
 
   @@unique([tenantId, number])
   @@index([tenantId, status, createdAt])
+  @@index([tenantId, branchId, createdAt])
   @@index([tenantId, customerName])
   @@index([tenantId, customerPhone])
   @@index([tenantId, validUntil])
@@ -545,24 +649,26 @@ model SaleRefund {
   id          String @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
   saleId      String @map("sale_id") @db.Text
   tenantId    String @map("tenant_id") @db.Text
+  branchId    String? @map("branch_id") @db.Text
   createdById String @map("created_by_id") @db.Text
 
-  // ✅ these exist in DB (you showed them)
-  total  Float   @map("total")
-  method String  @map("method") @db.Text // keep String because DB column is TEXT (not a Postgres enum)
-  note   String? @map("note") @db.Text
+  total       Float   @map("total")
+  method      String  @map("method") @db.Text
+  note        String? @map("note") @db.Text
 
-  reason    String?  @db.Text
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  reason      String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  sale      Sale   @relation(fields: [saleId], references: [id], name: "SaleToRefunds")
-  tenant    Tenant @relation(fields: [tenantId], references: [id], name: "TenantToSaleRefunds")
-  createdBy User   @relation(fields: [createdById], references: [id], name: "UserToSaleRefunds")
+  sale        Sale     @relation(fields: [saleId], references: [id], name: "SaleToRefunds")
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], name: "TenantToSaleRefunds")
+  branch      Branch?  @relation(fields: [branchId], references: [id])
+  createdBy   User     @relation(fields: [createdById], references: [id], name: "UserToSaleRefunds")
 
-  items SaleRefundItem[] @relation("RefundToItems")
+  items       SaleRefundItem[] @relation("RefundToItems")
 
   @@index([saleId])
   @@index([tenantId])
+  @@index([branchId])
   @@index([createdById])
   @@map("SaleRefund")
 }
@@ -574,8 +680,8 @@ model SaleRefundItem {
   quantity  Int    @map("quantity")
   price     Float  @map("price")
 
-  refund  SaleRefund @relation(fields: [refundId], references: [id], name: "RefundToItems")
-  product Product    @relation(fields: [productId], references: [id], name: "ProductToRefundItems")
+  refund    SaleRefund @relation(fields: [refundId], references: [id], name: "RefundToItems")
+  product   Product    @relation(fields: [productId], references: [id], name: "ProductToRefundItems")
 
   @@index([refundId])
   @@index([productId])
@@ -585,6 +691,7 @@ model SaleRefundItem {
 model Repair {
   id           String       @id @default(uuid())
   tenantId     String
+  branchId     String?      @db.Text
   customerId   String
   technicianId String?
   device       String
@@ -593,11 +700,15 @@ model Repair {
   status       RepairStatus
   warrantyEnd  DateTime?
   createdAt    DateTime     @default(now())
+
   customer     Customer     @relation(fields: [customerId], references: [id])
   technician   User?        @relation("TechnicianRepairs", fields: [technicianId], references: [id])
   tenant       Tenant       @relation(fields: [tenantId], references: [id])
+  branch       Branch?      @relation(fields: [branchId], references: [id])
 
   @@index([tenantId])
+  @@index([branchId])
+  @@index([tenantId, branchId, createdAt])
 }
 
 model Expense {
@@ -608,15 +719,20 @@ model Expense {
   createdAt    DateTime        @default(now())
   approvedAt   DateTime?
   tenantId     String
+  branchId     String?         @db.Text
   createdById  String
   approvedById String?
   category     ExpenseCategory
   amount       Float
+
   approvedBy   User?           @relation("ApprovedExpenses", fields: [approvedById], references: [id])
   createdBy    User            @relation("CreatedExpenses", fields: [createdById], references: [id])
   tenant       Tenant          @relation(fields: [tenantId], references: [id])
+  branch       Branch?         @relation(fields: [branchId], references: [id])
 
   @@index([tenantId])
+  @@index([branchId])
+  @@index([tenantId, branchId, createdAt])
 }
 
 model InterStoreDeal {
@@ -657,6 +773,7 @@ model InterStoreDeal {
   returnedQuantity      Int                  @default(0)
   dueDate               DateTime?
   takenAt               DateTime?
+
   borrowerTenant        Tenant               @relation("BorrowerDeals", fields: [borrowerTenantId], references: [id])
   product               Product?             @relation("ProductDeals", fields: [productId], references: [id])
   receivedProduct       Product?             @relation("ReceivedProduct", fields: [receivedProductId], references: [id])
@@ -680,6 +797,7 @@ model InterStorePayment {
   method       InterStorePaymentMethod @default(CASH)
   note         String?
   createdAt    DateTime                @default(now())
+
   deal         InterStoreDeal          @relation(fields: [dealId], references: [id])
   receivedBy   User?                   @relation("ReceivedInterStorePayments", fields: [receivedById], references: [id])
   tenant       Tenant                  @relation(fields: [tenantId], references: [id])
@@ -692,15 +810,20 @@ model InterStorePayment {
 model AuditLog {
   id        String      @id @default(uuid())
   tenantId  String
+  branchId  String?     @db.Text
   entityId  String?
   createdAt DateTime    @default(now())
   userId    String?
   metadata  Json?
   action    AuditAction
   entity    AuditEntity
+
   user      User?       @relation(fields: [userId], references: [id])
+  tenant    Tenant      @relation(fields: [tenantId], references: [id])
+  branch    Branch?     @relation(fields: [branchId], references: [id])
 
   @@index([tenantId, createdAt])
+  @@index([tenantId, branchId, createdAt])
   @@index([tenantId, entity, createdAt])
   @@index([tenantId, action, createdAt])
 }
@@ -742,7 +865,7 @@ model WhatsAppConversation {
   customer     Customer?          @relation(fields: [customerId], references: [id])
   tenant       Tenant             @relation(fields: [tenantId], references: [id])
   messages     WhatsAppMessage[]
-  sales Sale[]
+  sales        Sale[]
 
   @@index([tenantId])
   @@index([phone])
@@ -838,6 +961,7 @@ model Notification {
   @@index([recipientUserId])
   @@index([recipientRole])
 }
+
 model OtpCode {
   id           String           @id @default(uuid())
   intentId     String           @db.Text
@@ -913,6 +1037,7 @@ model OtpDeliveryLog {
 model StockAdjustment {
   id          String              @id @default(uuid())
   tenantId    String
+  branchId    String?             @db.Text
   productId   String
   type        StockAdjustmentType
   delta       Int
@@ -921,15 +1046,17 @@ model StockAdjustment {
   note        String?
   createdById String?
   createdAt   DateTime            @default(now())
+
   createdBy   User?               @relation(fields: [createdById], references: [id])
   product     Product             @relation(fields: [productId], references: [id], onDelete: Cascade)
   tenant      Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch      Branch?             @relation(fields: [branchId], references: [id])
 
   @@index([tenantId, createdAt])
+  @@index([branchId, createdAt])
   @@index([tenantId, productId, createdAt])
 }
 
-/// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
 model Supplier {
   id             String             @id @default(uuid())
   tenantId       String
@@ -960,23 +1087,27 @@ model Supplier {
 }
 
 model PurchaseOrder {
-  id          String                    @id @default(uuid())
+  id          String              @id @default(uuid())
   tenantId    String
+  branchId    String?             @db.Text
   supplierId  String
-  status      PurchaseOrderStatus       @default(DRAFT)
-  orderDate   DateTime?                 @db.Date
+  status      PurchaseOrderStatus @default(DRAFT)
+  orderDate   DateTime?           @db.Date
   receivedAt  DateTime?
   note        String?
   createdById String?
-  createdAt   DateTime                  @default(now())
-  updatedAt   DateTime                  @default(now()) @updatedAt
-  createdBy   User?                     @relation(fields: [createdById], references: [id], onUpdate: NoAction)
-  supplier    Supplier                  @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
-  tenant      Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @default(now()) @updatedAt
+
+  createdBy   User?               @relation(fields: [createdById], references: [id], onUpdate: NoAction)
+  supplier    Supplier            @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
+  tenant      Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  branch      Branch?             @relation(fields: [branchId], references: [id])
   items       PurchaseOrderItem[]
   serials     PurchaseOrderItemSerial[]
 
   @@index([tenantId])
+  @@index([branchId])
   @@index([supplierId])
   @@index([tenantId, status, createdAt])
 }
@@ -1022,21 +1153,24 @@ model PurchaseOrderItemSerial {
 model SupplierSupply {
   id                 String               @id @default(dbgenerated("(gen_random_uuid())::text"))
   tenantId           String
+  branchId           String?              @db.Text
   supplierId         String
   sourceType         SupplySourceType     @default(OTHER)
   sourceDetails      String?
   documentRef        String?
   notes              String?
   createdAt          DateTime             @default(now()) @db.Timestamp(6)
+
   Supplier           Supplier             @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
   Tenant             Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  branch             Branch?              @relation(fields: [branchId], references: [id])
   SupplierSupplyItem SupplierSupplyItem[]
 
   @@index([supplierId, createdAt])
   @@index([tenantId, createdAt])
+  @@index([branchId, createdAt])
 }
 
-/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 model SupplierSupplyItem {
   id               String         @id @default(dbgenerated("(gen_random_uuid())::text"))
   tenantId         String
@@ -1068,10 +1202,11 @@ model DeliveryNoteCounter {
 }
 
 model DeliveryNote {
-  id              String             @id @default(dbgenerated("(gen_random_uuid())::text"))
+  id              String       @id @default(dbgenerated("(gen_random_uuid())::text"))
   tenantId        String
+  branchId        String?      @db.Text
   number          Int
-  date            DateTime           @default(dbgenerated("CURRENT_DATE")) @db.Date
+  date            DateTime     @default(dbgenerated("CURRENT_DATE")) @db.Date
   saleId          String?
   customerName    String
   customerPhone   String?
@@ -1081,16 +1216,19 @@ model DeliveryNote {
   receivedByPhone String?
   notes           String?
   createdById     String?
-  createdAt       DateTime           @default(now()) @db.Timestamp(6)
-  updatedAt       DateTime           @default(now()) @updatedAt @db.Timestamp(6)
-  createdBy       User?              @relation(fields: [createdById], references: [id], onUpdate: NoAction)
-  sale            Sale?              @relation(fields: [saleId], references: [id], onUpdate: NoAction)
-  tenant          Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  createdAt       DateTime     @default(now()) @db.Timestamp(6)
+  updatedAt       DateTime     @default(now()) @updatedAt @db.Timestamp(6)
+
+  createdBy       User?        @relation(fields: [createdById], references: [id], onUpdate: NoAction)
+  sale            Sale?        @relation(fields: [saleId], references: [id], onUpdate: NoAction)
+  tenant          Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  branch          Branch?      @relation(fields: [branchId], references: [id])
   items           DeliveryNoteItem[]
 
   @@unique([tenantId, number], map: "DeliveryNote_tenant_number_key")
   @@index([tenantId, createdAt(sort: Desc)], map: "DeliveryNote_tenant_createdAt_idx")
   @@index([tenantId, saleId], map: "DeliveryNote_tenant_sale_idx")
+  @@index([branchId, createdAt(sort: Desc)])
 }
 
 model DeliveryNoteItem {
@@ -1108,7 +1246,6 @@ model DeliveryNoteItem {
   @@index([productId], map: "DeliveryNoteItem_product_idx")
 }
 
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model cash_drawer_events {
   id                   String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tenant_id            String                 @db.Uuid
@@ -1124,7 +1261,6 @@ model cash_drawer_events {
   @@index([tenant_id, created_at(sort: Desc)], map: "idx_cash_drawer_events_tenant_created")
 }
 
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model cash_drawer_sessions {
   id                 String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tenant_id          String               @db.Uuid
@@ -1142,7 +1278,6 @@ model cash_drawer_sessions {
   @@index([tenant_id, closed_at], map: "idx_cash_drawer_sessions_tenant_open")
 }
 
-/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 model cash_movements {
   id            String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tenant_id     String               @db.Uuid
@@ -1174,29 +1309,32 @@ model cash_sessions {
 }
 
 model SaleWarranty {
-  id          String @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
-  saleId      String @map("sale_id") @db.Text
-  tenantId    String @map("tenant_id") @db.Text
-  createdById String @map("created_by_id") @db.Text
+  id             String   @id @default(dbgenerated("(gen_random_uuid())::text")) @db.Text
+  saleId         String   @map("sale_id") @db.Text
+  tenantId       String   @map("tenant_id") @db.Text
+  branchId       String?  @map("branch_id") @db.Text
+  createdById    String   @map("created_by_id") @db.Text
 
-  policy         String?   @db.Text
-  durationMonths Int?      @map("duration_months")
-  durationDays   Int?      @map("duration_days")
-  startsAt       DateTime  @map("starts_at") @db.Timestamptz(6)
+  policy         String?  @db.Text
+  durationMonths Int?     @map("duration_months")
+  durationDays   Int?     @map("duration_days")
+  startsAt       DateTime @map("starts_at") @db.Timestamptz(6)
   endsAt         DateTime? @map("ends_at") @db.Timestamptz(6)
 
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  sale      Sale   @relation(fields: [saleId], references: [id])
-  tenant    Tenant @relation(fields: [tenantId], references: [id])
-  createdBy User   @relation(fields: [createdById], references: [id])
+  sale           Sale     @relation(fields: [saleId], references: [id])
+  tenant         Tenant   @relation(fields: [tenantId], references: [id])
+  branch         Branch?  @relation(fields: [branchId], references: [id])
+  createdBy      User     @relation(fields: [createdById], references: [id])
 
-  units SaleWarrantyUnit[]
+  units          SaleWarrantyUnit[]
 
-  warrantyNumber String? @map("warrantyNumber") @db.Text
+  warrantyNumber String?  @map("warrantyNumber") @db.Text
 
   @@index([saleId])
   @@index([tenantId])
+  @@index([branchId])
   @@index([createdById])
   @@map("SaleWarranty")
 }
@@ -1207,18 +1345,18 @@ model SaleWarrantyUnit {
   saleItemId String @map("sale_item_id") @db.Text
   productId  String @map("product_id") @db.Text
 
-  serial    String? @db.Text
-  imei1     String? @db.Text
-  imei2     String? @db.Text
-  unitLabel String? @map("unit_label") @db.Text
+  serial     String? @db.Text
+  imei1      String? @db.Text
+  imei2      String? @db.Text
+  unitLabel  String? @map("unit_label") @db.Text
 
-  startsAt DateTime @map("starts_at") @db.Timestamptz(6)
-  endsAt   DateTime @map("ends_at") @db.Timestamptz(6)
+  startsAt   DateTime @map("starts_at") @db.Timestamptz(6)
+  endsAt     DateTime @map("ends_at") @db.Timestamptz(6)
 
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  warranty SaleWarranty @relation(fields: [warrantyId], references: [id], onDelete: Cascade)
-  saleItem SaleItem     @relation(fields: [saleItemId], references: [id], onDelete: Cascade)
+  warranty   SaleWarranty @relation(fields: [warrantyId], references: [id], onDelete: Cascade)
+  saleItem   SaleItem     @relation(fields: [saleItemId], references: [id], onDelete: Cascade)
 
   @@unique([warrantyId, serial], map: "SaleWarrantyUnit_unique_serial_per_warranty")
   @@index([warrantyId])
@@ -1299,6 +1437,17 @@ enum UserRole {
 
 enum PlatformRole {
   PLATFORM_ADMIN
+}
+
+enum BranchType {
+  MAIN
+  STANDARD
+}
+
+enum BranchStatus {
+  ACTIVE
+  CLOSED
+  ARCHIVED
 }
 
 enum OwnerIntentStatus {

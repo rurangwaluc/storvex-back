@@ -10,7 +10,15 @@ function getTenantId(req) {
 }
 
 function getUserId(req) {
-  return req.user?.userId || null;
+  return req.user?.userId || req.user?.id || null;
+}
+
+function getActiveBranchId(req) {
+  return req.user?.branchId || req.branch?.id || null;
+}
+
+function canViewAllBranches(req) {
+  return Boolean(req.user?.canViewAllBranches);
 }
 
 function cleanString(x) {
@@ -34,10 +42,128 @@ function normalizeStatus(x) {
   return null;
 }
 
+function resolveProformaBranchScope(req) {
+  const requestedBranchId =
+    cleanString(req.query?.branchId) ||
+    cleanString(req.headers["x-branch-id"]) ||
+    null;
+
+  const allBranchesRequested =
+    String(req.query?.allBranches || "")
+      .trim()
+      .toLowerCase() === "true";
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (allBranchesRequested) {
+    if (!canViewAllBranches(req)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "ALL_BRANCHES",
+      branchId: null,
+      allowedBranchIds,
+    };
+  }
+
+  if (requestedBranchId) {
+    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "SINGLE_BRANCH",
+      branchId: requestedBranchId,
+      allowedBranchIds,
+    };
+  }
+
+  return {
+    mode: "SINGLE_BRANCH",
+    branchId: getActiveBranchId(req),
+    allowedBranchIds,
+  };
+}
+
+function applyProformaBranchScope(where, scope) {
+  const next = { ...(where || {}) };
+
+  if (
+    scope?.mode === "SINGLE_BRANCH" &&
+    scope?.branchId &&
+    typeof prisma.proforma.fields?.branchId !== "undefined"
+  ) {
+    next.branchId = scope.branchId;
+  }
+
+  return next;
+}
+
+async function ensureWritableBranchAccessOrThrow(req) {
+  const tenantId = getTenantId(req);
+  const branchId = getActiveBranchId(req);
+
+  if (!tenantId || !branchId) {
+    const e = new Error("BRANCH_REQUIRED");
+    e.code = "BRANCH_REQUIRED";
+    throw e;
+  }
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(branchId)) {
+    const e = new Error("BRANCH_ACCESS_DENIED");
+    e.code = "BRANCH_ACCESS_DENIED";
+    throw e;
+  }
+
+  const branch = await prisma.branch.findFirst({
+    where: {
+      id: branchId,
+      tenantId,
+      status: {
+        in: ["ACTIVE", "CLOSED"],
+      },
+    },
+    select: {
+      id: true,
+      tenantId: true,
+      name: true,
+      code: true,
+      status: true,
+      isMain: true,
+    },
+  });
+
+  if (!branch) {
+    const e = new Error("BRANCH_NOT_FOUND");
+    e.code = "BRANCH_NOT_FOUND";
+    throw e;
+  }
+
+  if (branch.status !== "ACTIVE") {
+    const e = new Error("BRANCH_NOT_ACTIVE");
+    e.code = "BRANCH_NOT_ACTIVE";
+    throw e;
+  }
+
+  return branch;
+}
 
 function mapProformaListRow(p) {
   return {
     id: p.id,
+    branchId: p.branchId || null,
+    branch: p.branch || null,
     number: p.number,
     status: p.status,
     customerName: p.customerName,
@@ -61,6 +187,16 @@ function mapProformaDetail(p, tenant) {
   return {
     proforma: {
       id: p.id,
+      branchId: p.branchId || null,
+      branch: p.branch
+        ? {
+            id: p.branch.id || null,
+            name: p.branch.name || null,
+            code: p.branch.code || null,
+            status: p.branch.status || null,
+            isMain: Boolean(p.branch.isMain),
+          }
+        : null,
       number: p.number,
       status: p.status,
       tenantId: p.tenantId,
@@ -119,6 +255,8 @@ function mapProformaDetail(p, tenant) {
             logoSignedUrl: tenant.logoSignedUrl || null,
             receiptHeader: tenant.receiptHeader || null,
             receiptFooter: tenant.receiptFooter || null,
+            branchName: tenant.branchName || p.branch?.name || null,
+            branchCode: tenant.branchCode || p.branch?.code || null,
           }
         : null,
 
@@ -156,10 +294,11 @@ async function listProformas(req, res) {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
+    const scope = resolveProformaBranchScope(req);
     const q = cleanString(req.query.q);
     const status = normalizeStatus(req.query.status);
 
-    const where = { tenantId };
+    const where = applyProformaBranchScope({ tenantId }, scope);
 
     if (status) {
       where.status = status;
@@ -183,6 +322,20 @@ async function listProformas(req, res) {
       take: 200,
       select: {
         id: true,
+        ...(typeof prisma.proforma.fields?.branchId !== "undefined" ? { branchId: true } : {}),
+        ...(typeof prisma.proforma.fields?.branchId !== "undefined"
+          ? {
+              branch: {
+                select: {
+                  id: true,
+                  name: true,
+                  code: true,
+                  status: true,
+                  isMain: true,
+                },
+              },
+            }
+          : {}),
         number: true,
         status: true,
         customerName: true,
@@ -207,8 +360,13 @@ async function listProformas(req, res) {
     return res.json({
       proformas: rows.map(mapProformaListRow),
       count: rows.length,
+      branchScope: scope,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("listProformas error:", err);
     return res.status(500).json({ message: "Failed to load proformas" });
   }
@@ -223,6 +381,8 @@ async function createProforma(req, res) {
     const userId = getUserId(req);
 
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
+    const activeBranch = await ensureWritableBranchAccessOrThrow(req);
 
     const {
       customerId,
@@ -317,31 +477,38 @@ async function createProforma(req, res) {
       const subtotal = itemRows.reduce((sum, item) => sum + Number(item.total || 0), 0);
       const total = subtotal;
 
+      const createData = {
+        tenantId,
+        customerId: customer?.id || cleanString(customerId),
+        createdById: userId || null,
+
+        number: doc.proformaNumber,
+        status: finalStatus,
+
+        customerName: cleanCustomerName,
+        customerPhone: cleanString(customerPhone) || customer?.phone || null,
+        customerEmail: cleanString(customerEmail) || customer?.email || null,
+        customerAddress: cleanString(customerAddress) || customer?.address || null,
+
+        subtotal,
+        total,
+        currency: cleanString(currency) || "RWF",
+
+        validUntil: parsedValidUntil,
+        preparedBy: preparedByText,
+        reference: cleanString(reference),
+        notes: cleanString(notes),
+      };
+
+      if (typeof tx.proforma.fields?.branchId !== "undefined") {
+        createData.branchId = activeBranch.id;
+      }
+
       const proforma = await tx.proforma.create({
-        data: {
-          tenantId,
-          customerId: customer?.id || cleanString(customerId),
-          createdById: userId || null,
-
-          number: doc.proformaNumber,
-          status: finalStatus,
-
-          customerName: cleanCustomerName,
-          customerPhone: cleanString(customerPhone) || customer?.phone || null,
-          customerEmail: cleanString(customerEmail) || customer?.email || null,
-          customerAddress: cleanString(customerAddress) || customer?.address || null,
-
-          subtotal,
-          total,
-          currency: cleanString(currency) || "RWF",
-
-          validUntil: parsedValidUntil,
-          preparedBy: preparedByText,
-          reference: cleanString(reference),
-          notes: cleanString(notes),
-        },
+        data: createData,
         select: {
           id: true,
+          ...(typeof tx.proforma.fields?.branchId !== "undefined" ? { branchId: true } : {}),
           number: true,
           status: true,
           customerName: true,
@@ -372,7 +539,10 @@ async function createProforma(req, res) {
         })),
       });
 
-      return proforma;
+      return {
+        ...proforma,
+        branchId: proforma.branchId || activeBranch.id,
+      };
     });
 
     return res.status(201).json({
@@ -380,7 +550,22 @@ async function createProforma(req, res) {
       proforma: result,
     });
   } catch (err) {
-    if (String(err?.message || "") === "CUSTOMER_NOT_FOUND") {
+    const code = err?.code;
+    const msg = String(err?.message || "");
+
+    if (code === "BRANCH_REQUIRED" || msg === "BRANCH_REQUIRED") {
+      return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
+    }
+    if (code === "BRANCH_ACCESS_DENIED" || msg === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
+    }
+    if (code === "BRANCH_NOT_FOUND" || msg === "BRANCH_NOT_FOUND") {
+      return res.status(404).json({ message: "Branch not found" });
+    }
+    if (code === "BRANCH_NOT_ACTIVE" || msg === "BRANCH_NOT_ACTIVE") {
+      return res.status(409).json({ message: "Selected branch is not active" });
+    }
+    if (msg === "CUSTOMER_NOT_FOUND") {
       return res.status(404).json({ message: "Customer not found" });
     }
 
@@ -397,15 +582,32 @@ async function getProforma(req, res) {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
+    const scope = resolveProformaBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).json({ message: "Proforma id is required" });
 
     const proforma = await prisma.proforma.findFirst({
-      where: {
-        tenantId,
-        OR: [{ id }, { number: id }],
-      },
+      where: applyProformaBranchScope(
+        {
+          tenantId,
+          OR: [{ id }, { number: id }],
+        },
+        scope
+      ),
       include: {
+        ...(typeof prisma.proforma.fields?.branchId !== "undefined"
+          ? {
+              branch: {
+                select: {
+                  id: true,
+                  name: true,
+                  code: true,
+                  status: true,
+                  isMain: true,
+                },
+              },
+            }
+          : {}),
         customer: {
           select: {
             id: true,
@@ -448,9 +650,21 @@ async function getProforma(req, res) {
       return res.status(404).json({ message: "Proforma not found" });
     }
 
-    const tenant = await buildTenantDocumentBranding(prisma, tenantId);
-    return res.json(mapProformaDetail(proforma, tenant));
+    const tenant = await buildTenantDocumentBranding(
+      prisma,
+      tenantId,
+      proforma.branchId || null
+    );
+
+    return res.json({
+      ...mapProformaDetail(proforma, tenant),
+      branchScope: scope,
+    });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("getProforma error:", err);
     return res.status(500).json({ message: "Failed to load proforma" });
   }
@@ -464,14 +678,18 @@ async function updateProforma(req, res) {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
+    const scope = resolveProformaBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).json({ message: "Proforma id is required" });
 
     const existing = await prisma.proforma.findFirst({
-      where: {
-        tenantId,
-        OR: [{ id }, { number: id }],
-      },
+      where: applyProformaBranchScope(
+        {
+          tenantId,
+          OR: [{ id }, { number: id }],
+        },
+        scope
+      ),
       select: {
         id: true,
         status: true,
@@ -572,7 +790,7 @@ async function updateProforma(req, res) {
         where: { id: existing.id },
         data: {
           ...(req.body?.customerName !== undefined
-            ? { customerName: cleanString(req.body.customerName) || existing.customerName }
+            ? { customerName: cleanString(req.body.customerName) || undefined }
             : {}),
           ...(req.body?.customerPhone !== undefined
             ? { customerPhone: cleanString(req.body.customerPhone) }
@@ -602,6 +820,7 @@ async function updateProforma(req, res) {
         },
         select: {
           id: true,
+          ...(typeof tx.proforma.fields?.branchId !== "undefined" ? { branchId: true } : {}),
           number: true,
           status: true,
           customerName: true,
@@ -630,25 +849,32 @@ async function updateProforma(req, res) {
       proforma: result,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("updateProforma error:", err);
     return res.status(500).json({ message: "Failed to update proforma" });
   }
 }
-
 
 async function deleteProforma(req, res) {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
+    const scope = resolveProformaBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).json({ message: "Proforma id is required" });
 
     const existing = await prisma.proforma.findFirst({
-      where: {
-        tenantId,
-        OR: [{ id }, { number: id }],
-      },
+      where: applyProformaBranchScope(
+        {
+          tenantId,
+          OR: [{ id }, { number: id }],
+        },
+        scope
+      ),
       select: {
         id: true,
         number: true,
@@ -677,6 +903,10 @@ async function deleteProforma(req, res) {
       number: existing.number || null,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("deleteProforma error:", err);
     return res.status(500).json({ message: "Failed to delete proforma" });
   }
@@ -690,15 +920,32 @@ async function printProformaHtml(req, res) {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).send("Unauthorized");
 
+    const scope = resolveProformaBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).send("Proforma id is required");
 
     const proforma = await prisma.proforma.findFirst({
-      where: {
-        tenantId,
-        OR: [{ id }, { number: id }],
-      },
+      where: applyProformaBranchScope(
+        {
+          tenantId,
+          OR: [{ id }, { number: id }],
+        },
+        scope
+      ),
       include: {
+        ...(typeof prisma.proforma.fields?.branchId !== "undefined"
+          ? {
+              branch: {
+                select: {
+                  id: true,
+                  name: true,
+                  code: true,
+                  status: true,
+                  isMain: true,
+                },
+              },
+            }
+          : {}),
         customer: {
           select: {
             id: true,
@@ -727,10 +974,18 @@ async function printProformaHtml(req, res) {
 
     if (!proforma) return res.status(404).send("Proforma not found");
 
-    const tenant = await buildTenantDocumentBranding(prisma, tenantId);
+    const tenant = await buildTenantDocumentBranding(
+      prisma,
+      tenantId,
+      proforma.branchId || null
+    );
 
     const html = renderProformaHtml({
-      tenant,
+      tenant: {
+        ...tenant,
+        branchName: tenant?.branchName || proforma.branch?.name || null,
+        branchCode: tenant?.branchCode || proforma.branch?.code || null,
+      },
       document: {
         number: proforma.number,
         date: proforma.createdAt,
@@ -767,12 +1022,18 @@ async function printProformaHtml(req, res) {
         preparedBy: proforma.preparedBy,
         validUntil: proforma.validUntil,
         reference: proforma.reference,
+        branchName: proforma.branch?.name || null,
+        branchCode: proforma.branch?.code || null,
       },
     });
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(html);
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).send("Branch access denied");
+    }
+
     console.error("printProformaHtml error:", err);
     return res.status(500).send("Failed to render proforma");
   }

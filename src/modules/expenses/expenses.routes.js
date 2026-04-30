@@ -18,28 +18,30 @@ const writeBase = [
   requireWritableSubscription,
 ];
 
-// Recommended policy:
-// - CASHIER/TECHNICIAN can create (request)
-// - OWNER can list/approve/delete
+// Real-world policy:
+// - OWNER / MANAGER can view expenses
+// - OWNER / MANAGER / CASHIER / TECHNICIAN can create expense requests
+// - OWNER / MANAGER can approve
+// - OWNER can delete (kept strict for now)
 
 router.post(
   "/",
   ...writeBase,
-  requireRole("OWNER", "CASHIER", "TECHNICIAN"),
+  requireRole("OWNER", "MANAGER", "CASHIER", "TECHNICIAN"),
   controller.createExpense
 );
 
 router.get(
   "/",
   ...readBase,
-  requireRole("OWNER"),
+  requireRole("OWNER", "MANAGER"),
   controller.listExpenses
 );
 
 router.patch(
   "/:id/approve",
   ...writeBase,
-  requireRole("OWNER"),
+  requireRole("OWNER", "MANAGER"),
   controller.approveExpense
 );
 

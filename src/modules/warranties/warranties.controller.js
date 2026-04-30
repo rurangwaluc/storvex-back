@@ -13,6 +13,14 @@ function getActorUserId(req) {
   return req.user?.userId || req.user?.id || null;
 }
 
+function getActiveBranchId(req) {
+  return req.user?.branchId || req.branch?.id || null;
+}
+
+function canViewAllBranches(req) {
+  return Boolean(req.user?.canViewAllBranches);
+}
+
 function cleanString(x) {
   const s = String(x ?? "").trim();
   return s || null;
@@ -70,7 +78,124 @@ function normalizeUnitInput(unit, startsAt, endsAt) {
   };
 }
 
-async function resolveSaleByReference(tenantId, saleRef) {
+function resolveWarrantyBranchScope(req) {
+  const requestedBranchId =
+    cleanString(req.query?.branchId) ||
+    cleanString(req.headers["x-branch-id"]) ||
+    null;
+
+  const allBranchesRequested =
+    String(req.query?.allBranches || "")
+      .trim()
+      .toLowerCase() === "true";
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (allBranchesRequested) {
+    if (!canViewAllBranches(req)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "ALL_BRANCHES",
+      branchId: null,
+      allowedBranchIds,
+    };
+  }
+
+  if (requestedBranchId) {
+    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
+      const e = new Error("BRANCH_ACCESS_DENIED");
+      e.code = "BRANCH_ACCESS_DENIED";
+      throw e;
+    }
+
+    return {
+      mode: "SINGLE_BRANCH",
+      branchId: requestedBranchId,
+      allowedBranchIds,
+    };
+  }
+
+  return {
+    mode: "SINGLE_BRANCH",
+    branchId: getActiveBranchId(req),
+    allowedBranchIds,
+  };
+}
+
+function applyWarrantyBranchScope(where, scope) {
+  const next = { ...(where || {}) };
+
+  if (
+    scope?.mode === "SINGLE_BRANCH" &&
+    scope?.branchId &&
+    typeof prisma.saleWarranty.fields?.branchId !== "undefined"
+  ) {
+    next.branchId = scope.branchId;
+  }
+
+  return next;
+}
+
+async function ensureWritableBranchAccessOrThrow(req) {
+  const tenantId = getTenantId(req);
+  const branchId = getActiveBranchId(req);
+
+  if (!tenantId || !branchId) {
+    const e = new Error("BRANCH_REQUIRED");
+    e.code = "BRANCH_REQUIRED";
+    throw e;
+  }
+
+  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
+    ? req.user.allowedBranchIds
+    : [];
+
+  if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(branchId)) {
+    const e = new Error("BRANCH_ACCESS_DENIED");
+    e.code = "BRANCH_ACCESS_DENIED";
+    throw e;
+  }
+
+  const branch = await prisma.branch.findFirst({
+    where: {
+      id: branchId,
+      tenantId,
+      status: {
+        in: ["ACTIVE", "CLOSED"],
+      },
+    },
+    select: {
+      id: true,
+      tenantId: true,
+      name: true,
+      code: true,
+      status: true,
+      isMain: true,
+    },
+  });
+
+  if (!branch) {
+    const e = new Error("BRANCH_NOT_FOUND");
+    e.code = "BRANCH_NOT_FOUND";
+    throw e;
+  }
+
+  if (branch.status !== "ACTIVE") {
+    const e = new Error("BRANCH_NOT_ACTIVE");
+    e.code = "BRANCH_NOT_ACTIVE";
+    throw e;
+  }
+
+  return branch;
+}
+
+async function resolveSaleByReference(tenantId, saleRef, scope = null) {
   const ref = cleanString(saleRef);
   if (!tenantId || !ref) return null;
 
@@ -78,6 +203,7 @@ async function resolveSaleByReference(tenantId, saleRef) {
     where: {
       tenantId,
       ...saleDraftWhereFalse(),
+      ...(scope?.mode === "SINGLE_BRANCH" && scope?.branchId ? { branchId: scope.branchId } : {}),
       OR: [
         { id: ref },
         ...(typeof prisma.sale.fields?.receiptNumber !== "undefined" ? [{ receiptNumber: ref }] : []),
@@ -87,9 +213,23 @@ async function resolveSaleByReference(tenantId, saleRef) {
     select: {
       id: true,
       tenantId: true,
+      ...(typeof prisma.sale.fields?.branchId !== "undefined" ? { branchId: true } : {}),
       createdAt: true,
-      receiptNumber: typeof prisma.sale.fields?.receiptNumber !== "undefined",
-      invoiceNumber: typeof prisma.sale.fields?.invoiceNumber !== "undefined",
+      ...(typeof prisma.sale.fields?.receiptNumber !== "undefined" ? { receiptNumber: true } : {}),
+      ...(typeof prisma.sale.fields?.invoiceNumber !== "undefined" ? { invoiceNumber: true } : {}),
+      ...(typeof prisma.sale.fields?.branchId !== "undefined"
+        ? {
+            branch: {
+              select: {
+                id: true,
+                name: true,
+                code: true,
+                status: true,
+                isMain: true,
+              },
+            },
+          }
+        : {}),
       customer: {
         select: {
           id: true,
@@ -131,6 +271,8 @@ async function resolveSaleByReference(tenantId, saleRef) {
 function mapWarrantyToListRow(warranty) {
   return {
     id: warranty.id,
+    branchId: warranty.branchId || null,
+    branch: warranty.branch || null,
     number: warranty.warrantyNumber || null,
     saleId: warranty.saleId,
     customerName: warranty.sale?.customer?.name || "Walk-in Customer",
@@ -168,6 +310,16 @@ function mapWarrantyToDetail(warranty, tenant) {
   return {
     warranty: {
       id: warranty.id,
+      branchId: warranty.branchId || null,
+      branch: warranty.branch
+        ? {
+            id: warranty.branch.id || null,
+            name: warranty.branch.name || null,
+            code: warranty.branch.code || null,
+            status: warranty.branch.status || null,
+            isMain: Boolean(warranty.branch.isMain),
+          }
+        : null,
       number: warranty.warrantyNumber || null,
       warrantyNumber: warranty.warrantyNumber || null,
       saleId: warranty.saleId,
@@ -208,6 +360,8 @@ function mapWarrantyToDetail(warranty, tenant) {
             warrantyTerms: tenant.warrantyTerms || null,
             proformaTerms: tenant.proformaTerms || null,
             deliveryNoteTerms: tenant.deliveryNoteTerms || null,
+            branchName: tenant.branchName || warranty.branch?.name || null,
+            branchCode: tenant.branchCode || warranty.branch?.code || null,
           }
         : null,
       units,
@@ -222,15 +376,19 @@ async function listWarranties(req, res) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const scope = resolveWarrantyBranchScope(req);
     const q = cleanString(req.query.q);
 
-    const where = {
-      tenantId,
-      sale: {
+    const where = applyWarrantyBranchScope(
+      {
         tenantId,
-        ...saleDraftWhereFalse(),
+        sale: {
+          tenantId,
+          ...saleDraftWhereFalse(),
+        },
       },
-    };
+      scope
+    );
 
     if (q) {
       where.OR = [
@@ -252,6 +410,20 @@ async function listWarranties(req, res) {
       select: {
         id: true,
         saleId: true,
+        ...(typeof prisma.saleWarranty.fields?.branchId !== "undefined" ? { branchId: true } : {}),
+        ...(typeof prisma.saleWarranty.fields?.branchId !== "undefined"
+          ? {
+              branch: {
+                select: {
+                  id: true,
+                  name: true,
+                  code: true,
+                  status: true,
+                  isMain: true,
+                },
+              },
+            }
+          : {}),
         warrantyNumber: true,
         policy: true,
         durationMonths: true,
@@ -266,8 +438,8 @@ async function listWarranties(req, res) {
           select: {
             id: true,
             createdAt: true,
-            receiptNumber: true,
-            invoiceNumber: true,
+            ...(typeof prisma.sale.fields?.receiptNumber !== "undefined" ? { receiptNumber: true } : {}),
+            ...(typeof prisma.sale.fields?.invoiceNumber !== "undefined" ? { invoiceNumber: true } : {}),
             cashier: {
               select: { name: true },
             },
@@ -282,8 +454,13 @@ async function listWarranties(req, res) {
     return res.json({
       warranties: warranties.map(mapWarrantyToListRow),
       count: warranties.length,
+      branchScope: scope,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("listWarranties error:", err);
     return res.status(500).json({ message: "Failed to load warranties" });
   }
@@ -301,6 +478,13 @@ async function createWarranty(req, res) {
     if (!createdById) {
       return res.status(401).json({ message: "Authenticated user id is missing" });
     }
+
+    const activeBranch = await ensureWritableBranchAccessOrThrow(req);
+    const scope = {
+      mode: "SINGLE_BRANCH",
+      branchId: activeBranch.id,
+      allowedBranchIds: [activeBranch.id],
+    };
 
     const saleRef = cleanString(req.body?.saleRef || req.body?.saleId);
     const policy = cleanString(req.body?.policy);
@@ -326,7 +510,7 @@ async function createWarranty(req, res) {
     const explicitEndsAt = parseDateOrNull(req.body?.endsAt);
     const endsAt = deriveEndDate(startsAt, durationMonths, durationDays, explicitEndsAt);
 
-    const sale = await resolveSaleByReference(tenantId, saleRef);
+    const sale = await resolveSaleByReference(tenantId, saleRef, scope);
 
     if (!sale) {
       return res.status(404).json({ message: "Sale not found" });
@@ -389,32 +573,39 @@ async function createWarranty(req, res) {
           createdAt: new Date(),
         });
 
-        const warranty = await tx.saleWarranty.create({
-          data: {
-            warrantyNumber: doc.warrantyNumber,
-            policy,
-            durationMonths,
-            durationDays,
-            startsAt,
-            endsAt,
-            sale: {
-              connect: {
-                id: sale.id,
-              },
-            },
-            tenant: {
-              connect: {
-                id: tenantId,
-              },
-            },
-            createdBy: {
-              connect: {
-                id: createdById,
-              },
+        const createData = {
+          warrantyNumber: doc.warrantyNumber,
+          policy,
+          durationMonths,
+          durationDays,
+          startsAt,
+          endsAt,
+          sale: {
+            connect: {
+              id: sale.id,
             },
           },
+          tenant: {
+            connect: {
+              id: tenantId,
+            },
+          },
+          createdBy: {
+            connect: {
+              id: createdById,
+            },
+          },
+        };
+
+        if (typeof tx.saleWarranty.fields?.branchId !== "undefined") {
+          createData.branchId = sale.branchId || activeBranch.id;
+        }
+
+        const warranty = await tx.saleWarranty.create({
+          data: createData,
           select: {
             id: true,
+            ...(typeof tx.saleWarranty.fields?.branchId !== "undefined" ? { branchId: true } : {}),
             warrantyNumber: true,
             saleId: true,
             policy: true,
@@ -453,6 +644,22 @@ async function createWarranty(req, res) {
       warranty: result,
     });
   } catch (err) {
+    const code = err?.code;
+    const msg = String(err?.message || "");
+
+    if (code === "BRANCH_REQUIRED" || msg === "BRANCH_REQUIRED") {
+      return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
+    }
+    if (code === "BRANCH_ACCESS_DENIED" || msg === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
+    }
+    if (code === "BRANCH_NOT_FOUND" || msg === "BRANCH_NOT_FOUND") {
+      return res.status(404).json({ message: "Branch not found" });
+    }
+    if (code === "BRANCH_NOT_ACTIVE" || msg === "BRANCH_NOT_ACTIVE") {
+      return res.status(409).json({ message: "Selected branch is not active" });
+    }
+
     console.error("createWarranty error:", err);
     return res.status(500).json({ message: "Failed to create warranty" });
   }
@@ -465,22 +672,40 @@ async function getWarranty(req, res) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const scope = resolveWarrantyBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) {
       return res.status(400).json({ message: "Warranty id is required" });
     }
 
     const warranty = await prisma.saleWarranty.findFirst({
-      where: {
-        tenantId,
-        sale: {
+      where: applyWarrantyBranchScope(
+        {
           tenantId,
-          ...saleDraftWhereFalse(),
+          sale: {
+            tenantId,
+            ...saleDraftWhereFalse(),
+          },
+          OR: [{ id }, { warrantyNumber: id }],
         },
-        OR: [{ id }, { warrantyNumber: id }],
-      },
+        scope
+      ),
       select: {
         id: true,
+        ...(typeof prisma.saleWarranty.fields?.branchId !== "undefined" ? { branchId: true } : {}),
+        ...(typeof prisma.saleWarranty.fields?.branchId !== "undefined"
+          ? {
+              branch: {
+                select: {
+                  id: true,
+                  name: true,
+                  code: true,
+                  status: true,
+                  isMain: true,
+                },
+              },
+            }
+          : {}),
         saleId: true,
         tenantId: true,
         createdById: true,
@@ -495,8 +720,8 @@ async function getWarranty(req, res) {
           select: {
             id: true,
             createdAt: true,
-            receiptNumber: true,
-            invoiceNumber: true,
+            ...(typeof prisma.sale.fields?.receiptNumber !== "undefined" ? { receiptNumber: true } : {}),
+            ...(typeof prisma.sale.fields?.invoiceNumber !== "undefined" ? { invoiceNumber: true } : {}),
             cashier: {
               select: {
                 name: true,
@@ -551,9 +776,21 @@ async function getWarranty(req, res) {
       return res.status(404).json({ message: "Warranty not found" });
     }
 
-    const tenant = await buildTenantDocumentBranding(prisma, tenantId);
-    return res.json(mapWarrantyToDetail(warranty, tenant));
+    const tenant = await buildTenantDocumentBranding(
+      prisma,
+      tenantId,
+      warranty.branchId || null
+    );
+
+    return res.json({
+      ...mapWarrantyToDetail(warranty, tenant),
+      branchScope: scope,
+    });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("getWarranty error:", err);
     return res.status(500).json({ message: "Failed to load warranty" });
   }
@@ -567,16 +804,20 @@ async function updateWarranty(req, res) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const scope = resolveWarrantyBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) {
       return res.status(400).json({ message: "Warranty id is required" });
     }
 
     const existing = await prisma.saleWarranty.findFirst({
-      where: {
-        tenantId,
-        OR: [{ id }, { warrantyNumber: id }],
-      },
+      where: applyWarrantyBranchScope(
+        {
+          tenantId,
+          OR: [{ id }, { warrantyNumber: id }],
+        },
+        scope
+      ),
       select: {
         id: true,
         saleId: true,
@@ -606,6 +847,7 @@ async function updateWarranty(req, res) {
           endsAt: true,
           durationMonths: true,
           durationDays: true,
+          ...(typeof tx.saleWarranty.fields?.branchId !== "undefined" ? { branchId: true } : {}),
         },
       });
 
@@ -629,6 +871,7 @@ async function updateWarranty(req, res) {
         },
         select: {
           id: true,
+          ...(typeof tx.saleWarranty.fields?.branchId !== "undefined" ? { branchId: true } : {}),
           warrantyNumber: true,
           saleId: true,
           policy: true,
@@ -679,6 +922,10 @@ async function updateWarranty(req, res) {
       warranty: result,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("updateWarranty error:", err);
     return res.status(500).json({ message: "Failed to update warranty" });
   }
@@ -691,20 +938,24 @@ async function deleteWarranty(req, res) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const scope = resolveWarrantyBranchScope(req);
     const id = String(req.params.id || "").trim();
     if (!id) {
       return res.status(400).json({ message: "Warranty id is required" });
     }
 
     const existing = await prisma.saleWarranty.findFirst({
-      where: {
-        tenantId,
-        sale: {
+      where: applyWarrantyBranchScope(
+        {
           tenantId,
-          ...saleDraftWhereFalse(),
+          sale: {
+            tenantId,
+            ...saleDraftWhereFalse(),
+          },
+          OR: [{ id }, { warrantyNumber: id }],
         },
-        OR: [{ id }, { warrantyNumber: id }],
-      },
+        scope
+      ),
       select: {
         id: true,
         warrantyNumber: true,
@@ -727,6 +978,10 @@ async function deleteWarranty(req, res) {
       saleId: existing.saleId || null,
     });
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).json({ message: "Branch access denied" });
+    }
+
     console.error("deleteWarranty error:", err);
     return res.status(500).json({ message: "Failed to delete warranty" });
   }
@@ -740,6 +995,7 @@ async function printWarrantyHtml(req, res) {
       return res.status(401).send("Unauthorized");
     }
 
+    const scope = resolveWarrantyBranchScope(req);
     const id = String(req.params.id || "").trim();
 
     if (!id) {
@@ -747,16 +1003,33 @@ async function printWarrantyHtml(req, res) {
     }
 
     const warranty = await prisma.saleWarranty.findFirst({
-      where: {
-        tenantId,
-        sale: {
+      where: applyWarrantyBranchScope(
+        {
           tenantId,
-          ...saleDraftWhereFalse(),
+          sale: {
+            tenantId,
+            ...saleDraftWhereFalse(),
+          },
+          OR: [{ id }, { warrantyNumber: id }],
         },
-        OR: [{ id }, { warrantyNumber: id }],
-      },
+        scope
+      ),
       select: {
         id: true,
+        ...(typeof prisma.saleWarranty.fields?.branchId !== "undefined" ? { branchId: true } : {}),
+        ...(typeof prisma.saleWarranty.fields?.branchId !== "undefined"
+          ? {
+              branch: {
+                select: {
+                  id: true,
+                  name: true,
+                  code: true,
+                  status: true,
+                  isMain: true,
+                },
+              },
+            }
+          : {}),
         saleId: true,
         tenantId: true,
         createdById: true,
@@ -771,8 +1044,8 @@ async function printWarrantyHtml(req, res) {
           select: {
             id: true,
             createdAt: true,
-            receiptNumber: true,
-            invoiceNumber: true,
+            ...(typeof prisma.sale.fields?.receiptNumber !== "undefined" ? { receiptNumber: true } : {}),
+            ...(typeof prisma.sale.fields?.invoiceNumber !== "undefined" ? { invoiceNumber: true } : {}),
             cashier: {
               select: {
                 name: true,
@@ -824,7 +1097,11 @@ async function printWarrantyHtml(req, res) {
       return res.status(404).send("Warranty not found");
     }
 
-    const tenant = await buildTenantDocumentBranding(prisma, tenantId);
+    const tenant = await buildTenantDocumentBranding(
+      prisma,
+      tenantId,
+      warranty.branchId || null
+    );
 
     const items = (warranty.units || []).map((unit) => ({
       productName: unit.saleItem?.product?.name || unit.unitLabel || "—",
@@ -836,7 +1113,11 @@ async function printWarrantyHtml(req, res) {
     }));
 
     const html = renderWarrantyHtml({
-      tenant,
+      tenant: {
+        ...tenant,
+        branchName: tenant?.branchName || warranty.branch?.name || null,
+        branchCode: tenant?.branchCode || warranty.branch?.code || null,
+      },
       document: {
         number: warranty.warrantyNumber || warranty.id,
         date: warranty.createdAt,
@@ -867,6 +1148,8 @@ async function printWarrantyHtml(req, res) {
         issuedBy: warranty.sale?.cashier?.name || null,
         startDate: warranty.startsAt || null,
         endDate: warranty.endsAt || null,
+        branchName: warranty.branch?.name || null,
+        branchCode: warranty.branch?.code || null,
         warrantyTerms:
           warranty.policy ||
           tenant?.warrantyTerms ||
@@ -877,6 +1160,10 @@ async function printWarrantyHtml(req, res) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(html);
   } catch (err) {
+    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).send("Branch access denied");
+    }
+
     console.error("printWarrantyHtml error:", err);
     return res.status(500).send("Failed to render warranty");
   }

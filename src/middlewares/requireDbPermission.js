@@ -7,9 +7,8 @@ module.exports = function requireDbPermission(permissionOrList) {
     try {
       const role = String(req.user?.role || "").toUpperCase();
       const userId = req.user?.userId || req.user?.id;
-      const tenantId = req.user?.tenantId;
 
-      if (!role || !userId || !tenantId) {
+      if (!role || !userId) {
         return res.status(401).json({ message: "Unauthorized" });
       }
 
@@ -17,7 +16,6 @@ module.exports = function requireDbPermission(permissionOrList) {
         req.dbPermissions = await resolveEffectiveDbPermissions({
           userId,
           role,
-          tenantId,
         });
       }
 
@@ -41,6 +39,7 @@ module.exports = function requireDbPermission(permissionOrList) {
         role: req.user?.role,
         userId: req.user?.userId || req.user?.id,
         tenantId: req.user?.tenantId,
+        branchId: req.user?.branchId,
         message: err?.message,
         code: err?.code,
         stack: err?.stack,

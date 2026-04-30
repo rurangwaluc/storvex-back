@@ -5,88 +5,76 @@ const suppliersController = require("./suppliers.controller");
 
 const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
-const requireRole = require("../../middlewares/requireRole");
 const {
   requireActiveSubscription,
   requireWritableSubscription,
 } = require("../../middlewares/requireActiveSubscription");
+const requireDbPermission = require("../../middlewares/requireDbPermission");
+const { PERMISSIONS } = require("../auth/permissions");
+
+const readBase = [authenticate, requireTenant, requireActiveSubscription];
+const writeBase = [
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+  requireWritableSubscription,
+];
 
 // Suppliers
 router.get(
   "/",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.SUPPLIERS_VIEW),
   suppliersController.listSuppliers
 );
 
 router.post(
   "/",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.SUPPLIERS_CREATE),
   suppliersController.createSupplier
 );
 
 router.get(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.SUPPLIERS_VIEW),
   suppliersController.getSupplier
 );
 
 router.put(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.SUPPLIERS_EDIT),
   suppliersController.updateSupplier
 );
 
 router.patch(
   "/:id/activate",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.SUPPLIERS_EDIT),
   suppliersController.activateSupplier
 );
 
 router.patch(
   "/:id/deactivate",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.SUPPLIERS_EDIT),
   suppliersController.deactivateSupplier
 );
 
-// Supplies (deliveries)
+// Supplies
 router.get(
   "/:id/supplies",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.SUPPLIERS_VIEW),
   suppliersController.listSupplies
 );
 
 router.post(
   "/:id/supplies",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.SUPPLIERS_EDIT),
   suppliersController.createSupply
 );
 

@@ -42,6 +42,7 @@ function snapshotFromPlan(plan) {
     price: Number.isFinite(Number(plan.price)) ? Number(plan.price) : null,
     currency: plan.currency || "RWF",
     staffLimit: Number.isFinite(Number(plan.staffLimit)) ? Number(plan.staffLimit) : null,
+    branchLimit: Number.isFinite(Number(plan.branchLimit)) ? Number(plan.branchLimit) : null,
     isEnterprise: Boolean(plan.isEnterprise),
   };
 }
@@ -210,6 +211,7 @@ async function markSignupPaymentSuccessful({ payment, provider }) {
         tierKey: snap.tierKey,
         cycleKey: snap.cycleKey,
         staffLimit: snap.staffLimit,
+        branchLimit: snap.branchLimit,
         priceAmount: snap.price,
       },
       select: {
@@ -228,6 +230,7 @@ async function markSignupPaymentSuccessful({ payment, provider }) {
         tierKey: true,
         cycleKey: true,
         staffLimit: true,
+        branchLimit: true,
         priceAmount: true,
       },
     });
@@ -289,6 +292,8 @@ async function markRenewalPaymentSuccessful({ payment, provider }) {
       tierKey: true,
       cycleKey: true,
       staffLimit: true,
+      branchLimit: true,
+      extraBranchCount: true,
       priceAmount: true,
       currency: true,
       startDate: true,
@@ -337,6 +342,7 @@ async function markRenewalPaymentSuccessful({ payment, provider }) {
         tierKey: snap.tierKey,
         cycleKey: snap.cycleKey,
         staffLimit: snap.staffLimit,
+        branchLimit: snap.branchLimit,
         priceAmount: snap.price,
       },
       select: {
@@ -355,6 +361,7 @@ async function markRenewalPaymentSuccessful({ payment, provider }) {
         tierKey: true,
         cycleKey: true,
         staffLimit: true,
+        branchLimit: true,
         priceAmount: true,
       },
     });
@@ -368,6 +375,7 @@ async function markRenewalPaymentSuccessful({ payment, provider }) {
         tierKey: snap.tierKey,
         cycleKey: snap.cycleKey,
         staffLimit: snap.staffLimit,
+        branchLimit: snap.branchLimit,
         priceAmount: snap.price,
         currency: snap.currency,
         startDate: renewalStart,
@@ -387,6 +395,8 @@ async function markRenewalPaymentSuccessful({ payment, provider }) {
         tierKey: true,
         cycleKey: true,
         staffLimit: true,
+        branchLimit: true,
+        extraBranchCount: true,
         priceAmount: true,
         currency: true,
         startDate: true,
@@ -425,6 +435,7 @@ async function markPaymentSuccessfulByReference({ reference, provider }) {
       tierKey: true,
       cycleKey: true,
       staffLimit: true,
+      branchLimit: true,
       priceAmount: true,
     },
   });
@@ -515,6 +526,7 @@ async function listSignupPlans(req, res) {
       cycleKey: p.cycleKey,
       cycleLabel: p.cycleLabel,
       staffLimit: p.staffLimit,
+      branchLimit: p.branchLimit,
       days: p.days,
       price: p.price,
       currency: p.currency,
@@ -576,6 +588,7 @@ async function initiateOwnerPayment(req, res) {
           tierKey: snap.tierKey,
           cycleKey: snap.cycleKey,
           staffLimit: snap.staffLimit,
+          branchLimit: snap.branchLimit,
           priceAmount: snap.price,
         },
         create: {
@@ -590,6 +603,7 @@ async function initiateOwnerPayment(req, res) {
           tierKey: snap.tierKey,
           cycleKey: snap.cycleKey,
           staffLimit: snap.staffLimit,
+          branchLimit: snap.branchLimit,
           priceAmount: snap.price,
         },
         select: {
@@ -607,6 +621,7 @@ async function initiateOwnerPayment(req, res) {
           tierKey: true,
           cycleKey: true,
           staffLimit: true,
+          branchLimit: true,
           priceAmount: true,
         },
       });
@@ -682,6 +697,7 @@ async function getOwnerPaymentStatus(req, res) {
         tierKey: true,
         cycleKey: true,
         staffLimit: true,
+        branchLimit: true,
         priceAmount: true,
       },
     });

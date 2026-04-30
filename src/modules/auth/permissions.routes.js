@@ -6,28 +6,44 @@ const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
 const {
   requireActiveSubscription,
-} = require("../../middlewares/requireActiveSubscription");const requirePermission = require("../../middlewares/requirePermission");
+} = require("../../middlewares/requireActiveSubscription");
+const requirePermission = require("../../middlewares/requirePermission");
 
-const { PERMISSIONS, listRolePermissions, exportRolePermissions } = require("./permissions");
+const {
+  PERMISSIONS,
+  listRolePermissions,
+  exportRolePermissions,
+} = require("./permissions");
 
-// Owner-only Settings area should be the one reading this
+// Settings / permission policy area
 router.use(authenticate, requireTenant, requireActiveSubscription);
 
 // who am I + my permissions
 router.get("/me", (req, res) => {
   const role = req.user?.role || null;
+
   return res.json({
     role,
     permissions: listRolePermissions(role),
   });
 });
 
-// full policy map (only owner can view policy)
+// full permission catalog + role policy map
+// Owner-only
 router.get(
   "/policy",
-  requirePermission(PERMISSIONS.SETTINGS_VIEW),
+  requirePermission(PERMISSIONS.BILLING_VIEW),
   (req, res) => {
+    const role = String(req.user?.role || "").trim().toUpperCase();
+
+    if (role !== "OWNER" && role !== "PLATFORM_ADMIN") {
+      return res.status(403).json({
+        message: "Forbidden",
+      });
+    }
+
     return res.json({
+      permissions: Object.values(PERMISSIONS),
       roles: exportRolePermissions(),
     });
   }

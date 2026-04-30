@@ -8,67 +8,59 @@ const controller = require("./deliveryNotes.controller");
 const authenticate = require("../../middlewares/authenticate");
 const authenticateHeaderOrQueryToken = require("../../middlewares/authenticateHeaderOrQueryToken");
 const requireTenant = require("../../middlewares/requireTenant");
-const requireRole = require("../../middlewares/requireRole");
 const {
   requireActiveSubscription,
   requireWritableSubscription,
 } = require("../../middlewares/requireActiveSubscription");
+const requireDbPermission = require("../../middlewares/requireDbPermission");
+const { PERMISSIONS } = require("../auth/permissions");
 
-const ELECTRONICS_ROLES = [
-  "OWNER",
-  "MANAGER",
-  "STOREKEEPER",
-  "SELLER",
-  "CASHIER",
-  "TECHNICIAN",
+const readBase = [
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+];
+
+const writeBase = [
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+  requireWritableSubscription,
 ];
 
 router.get(
   "/",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole(...ELECTRONICS_ROLES),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.DELIVERY_NOTES_VIEW),
   controller.listDeliveryNotes
 );
 
 router.post(
   "/",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER", "MANAGER", "STOREKEEPER", "SELLER", "CASHIER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.DELIVERY_NOTES_CREATE),
   controller.createDeliveryNote
 );
 
 router.get(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole(...ELECTRONICS_ROLES),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.DELIVERY_NOTES_VIEW),
   controller.getDeliveryNote
 );
 
 router.patch(
   "/:id",
   express.json(),
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER", "MANAGER", "STOREKEEPER", "SELLER", "CASHIER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.DELIVERY_NOTES_CREATE),
   controller.updateDeliveryNote
 );
 
 router.delete(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER", "MANAGER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.DELIVERY_NOTES_CREATE),
   controller.deleteDeliveryNote
 );
 
@@ -77,7 +69,7 @@ router.get(
   authenticateHeaderOrQueryToken,
   requireTenant,
   requireActiveSubscription,
-  requireRole(...ELECTRONICS_ROLES),
+  requireDbPermission(PERMISSIONS.DELIVERY_NOTES_VIEW),
   controller.printDeliveryNoteHtml
 );
 

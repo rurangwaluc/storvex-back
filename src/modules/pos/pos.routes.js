@@ -12,12 +12,9 @@ const {
   requireWritableSubscription,
 } = require("../../middlewares/requireActiveSubscription");
 const requireDbPermission = require("../../middlewares/requireDbPermission");
+const { PERMISSIONS } = require("../auth/permissions");
 
-const readBase = [
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-];
+const readBase = [authenticate, requireTenant, requireActiveSubscription];
 
 const writeBase = [
   authenticate,
@@ -30,7 +27,7 @@ const writeBase = [
 router.get(
   "/quick-picks",
   ...readBase,
-  requireDbPermission("sale.view"),
+  requireDbPermission(PERMISSIONS.POS_VIEW),
   posController.quickPicks
 );
 
@@ -38,14 +35,14 @@ router.get(
 router.post(
   "/sales",
   ...writeBase,
-  requireDbPermission("sale.create"),
+  requireDbPermission(PERMISSIONS.POS_CREATE_SALE),
   posController.createSale
 );
 
 router.get(
   "/sales",
   ...readBase,
-  requireDbPermission("sale.view"),
+  requireDbPermission(PERMISSIONS.POS_VIEW_SALES),
   posController.listSales
 );
 
@@ -53,14 +50,14 @@ router.get(
 router.get(
   "/sales/:id",
   ...readBase,
-  requireDbPermission("sale.view"),
+  requireDbPermission(PERMISSIONS.POS_VIEW_SALES),
   posController.getSaleReceipt
 );
 
 router.get(
   "/sales/:id/receipt",
   ...readBase,
-  requireDbPermission("sale.view"),
+  requireDbPermission(PERMISSIONS.POS_VIEW_SALES),
   posController.getSaleReceipt
 );
 
@@ -68,7 +65,7 @@ router.get(
 router.post(
   "/sales/:id/payments",
   ...writeBase,
-  requireDbPermission("payment.add"),
+  requireDbPermission(PERMISSIONS.POS_VIEW_CREDIT),
   posController.addSalePayment
 );
 
@@ -76,7 +73,7 @@ router.post(
 router.post(
   "/sales/:id/warranty",
   ...writeBase,
-  requireDbPermission("warranty.create"),
+  requireDbPermission(PERMISSIONS.DELIVERY_NOTES_CREATE),
   posController.createSaleWarranty
 );
 
@@ -84,14 +81,14 @@ router.post(
 router.get(
   "/credit/outstanding",
   ...readBase,
-  requireDbPermission("report.credit.view"),
+  requireDbPermission(PERMISSIONS.POS_VIEW_CREDIT),
   posController.listOutstandingCredit
 );
 
 router.get(
   "/credit/overdue",
   ...readBase,
-  requireDbPermission("report.credit.view"),
+  requireDbPermission(PERMISSIONS.POS_VIEW_CREDIT),
   posController.listOverdueCredit
 );
 
@@ -99,7 +96,7 @@ router.get(
 router.post(
   "/sales/:id/cancel",
   ...writeBase,
-  requireDbPermission("sale.cancel"),
+  requireDbPermission(PERMISSIONS.POS_CREATE_SALE),
   posController.cancelSale
 );
 
@@ -107,7 +104,7 @@ router.post(
 router.post(
   "/sales/:id/refunds",
   ...writeBase,
-  requireDbPermission("sale.refund"),
+  requireDbPermission(PERMISSIONS.POS_VIEW_SALES),
   posController.createSaleRefund
 );
 

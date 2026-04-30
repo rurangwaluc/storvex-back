@@ -6,8 +6,7 @@ function normalizeRole(role) {
 
 /**
  * Owner is the tenant super-admin.
- * In a world-class store system, OWNER should never be blocked by missing
- * seeded rolePermission rows.
+ * In a serious retail control system, OWNER must never depend on seed completeness.
  */
 function ownerPermissionSet() {
   return ["*"];
@@ -15,17 +14,20 @@ function ownerPermissionSet() {
 
 /**
  * Resolve effective permissions for a user:
- * 1) Start with role permissions
+ * 1) Start with role permissions from DB
  * 2) Apply user-specific overrides
  *    - isGranted=true  => force add
  *    - isGranted=false => force remove
  *
  * Returns string[] permission keys
+ *
+ * Important:
+ * - UserPermission does NOT have tenantId in schema, so never filter on tenantId here.
+ * - Tenant safety is already implicit because userId belongs to one tenant user record.
  */
-async function resolveEffectiveDbPermissions({ userId, role, tenantId }) {
+async function resolveEffectiveDbPermissions({ userId, role }) {
   const normalizedRole = normalizeRole(role);
   const safeUserId = String(userId || "").trim();
-  const safeTenantId = String(tenantId || "").trim();
 
   if (!normalizedRole || !safeUserId) return [];
 
@@ -49,7 +51,6 @@ async function resolveEffectiveDbPermissions({ userId, role, tenantId }) {
     prisma.userPermission.findMany({
       where: {
         userId: safeUserId,
-        ...(safeTenantId ? { tenantId: safeTenantId } : {}),
       },
       select: {
         isGranted: true,
@@ -63,17 +64,18 @@ async function resolveEffectiveDbPermissions({ userId, role, tenantId }) {
   ]);
 
   const effective = new Set(
-    roleRows
-      .map((row) => row?.permission?.key)
-      .filter(Boolean)
+    roleRows.map((row) => row?.permission?.key).filter(Boolean)
   );
 
   for (const row of userRows) {
     const key = row?.permission?.key;
     if (!key) continue;
 
-    if (row.isGranted) effective.add(key);
-    else effective.delete(key);
+    if (row.isGranted === true) {
+      effective.add(key);
+    } else if (row.isGranted === false) {
+      effective.delete(key);
+    }
   }
 
   return Array.from(effective).sort();

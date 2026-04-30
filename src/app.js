@@ -11,17 +11,27 @@ const {
 } = require("./middlewares/requireActiveSubscription");
 
 const authRoutes = require("./modules/auth/auth.routes");
+const permissionsRoutes = require("./modules/auth/permissions.routes");
+
 const userRoutes = require("./modules/users/users.routes");
 const tenantRoutes = require("./modules/tenants/tenants.routes");
 const posRoutes = require("./modules/pos/pos.routes");
 const cashDrawerRouter = require("./modules/cashDrawer/cashDrawer.routes");
 const storeRoutes = require("./modules/store/store.routes");
+const branchesRoutes = require("./modules/branches/branches.routes");
 
 const repairRoutes = require("./modules/repairs/repairs.routes");
 const inventoryRoutes = require("./modules/inventory/inventory.routes");
 const customerRoutes = require("./modules/customers/customers.routes");
 const reportRoutes = require("./modules/reports/reports.routes");
 const interstoreRoutes = require("./modules/interStore/interStore.routes");
+
+const supplierRoutes = require("./modules/suppliers/suppliers.routes");
+const expenseRoutes = require("./modules/expenses/expenses.routes");
+const billingRoutes = require("./modules/billing/billing.routes");
+const auditRoutes = require("./modules/audit/audit.routes");
+const dashboardRoutes = require("./modules/dashboard/dashboard.routes");
+const employeeRoutes = require("./modules/employees/employee.routes");
 
 const whatsappRoutes = require("./modules/whatsapp/whatsapp.routes");
 const whatsappAccountsRoutes = require("./modules/whatsapp/whatsapp.accounts.routes");
@@ -33,9 +43,10 @@ const invoicesRoutes = require("./modules/invoices/invoices.routes");
 const proformasRoutes = require("./modules/proformas/proformas.routes");
 const warrantiesRoutes = require("./modules/warranties/warranties.routes");
 
-const permissionsRoutes = require("./modules/auth/permissions.routes");
-
 const securityRoutes = require("./modules/settings/security.routes");
+
+const platformRoutes = require("./modules/platform/platform.routes");
+const platformAuthRoutes = require("./modules/platform/platform.auth.routes");
 
 const app = express();
 
@@ -54,12 +65,6 @@ app.get("/health", (req, res) => {
   res.json({ status: "OK", service: "Storvex API" });
 });
 
-// Auth routes
-app.use("/api/auth", authRoutes);
-
-// Permissions routes
-app.use("/api/auth/permissions", permissionsRoutes);
-
 app.get("/api", authenticate, requireActiveSubscription, (req, res) => {
   res.json({ message: "Storvex API root" });
 });
@@ -68,51 +73,58 @@ app.get("/api/auth-test", authenticate, (req, res) => {
   res.json({ message: "Authentication successful", user: req.user });
 });
 
-// Platform routes
-app.use("/api/platform", require("./modules/platform/platform.routes"));
-app.use("/api/platform/auth", require("./modules/platform/platform.auth.routes"));
+// Auth
+app.use("/api/auth", authRoutes);
+app.use("/api/auth/permissions", permissionsRoutes);
 
-// Tenant routes
+// Platform
+app.use("/api/platform", platformRoutes);
+app.use("/api/platform/auth", platformAuthRoutes);
+
+// Tenant / workspace-level modules
 app.use("/api/tenants", tenantRoutes);
+app.use("/api/dashboard", dashboardRoutes);
+app.use("/api/employees", employeeRoutes);
+app.use("/api/audit", auditRoutes);
+app.use("/api/expenses", expenseRoutes);
+app.use("/api/billing", billingRoutes);
+app.use("/api/suppliers", supplierRoutes);
+app.use("/api/branches", branchesRoutes);
 
-// Other modules
-app.use("/api/dashboard", require("./modules/dashboard/dashboard.routes"));
-app.use("/api/employees", require("./modules/employees/employee.routes"));
-app.use("/api/audit", require("./modules/audit/audit.routes"));
-app.use("/api/expenses", require("./modules/expenses/expenses.routes"));
-app.use("/api/billing", require("./modules/billing/billing.routes"));
-app.use("/api/suppliers", require("./modules/suppliers/suppliers.routes"));
-
+// Store module
+// Auth + tenant + active subscription at mount level.
+// Fine-grained authorization is handled inside store.routes.js.
 app.use(
   "/api/store",
   authenticate,
   requireTenant,
   requireActiveSubscription,
-  requireRole("OWNER", "MANAGER", "STOREKEEPER", "SELLER", "CASHIER", "TECHNICIAN"),
   storeRoutes
 );
 
+// Cash drawer module
+// Auth + tenant + active subscription at mount level.
+// Fine-grained authorization is handled inside cashDrawer.routes.js.
 app.use(
   "/api/cash-drawer",
   authenticate,
   requireTenant,
   requireActiveSubscription,
-  requireRole("OWNER", "MANAGER", "CASHIER"),
   cashDrawerRouter
 );
 
-// Document routes
+// Documents
 app.use("/api/delivery-notes", deliveryNotesRoutes);
 app.use("/api/receipts", receiptsRoutes);
 app.use("/api/invoices", invoicesRoutes);
 app.use("/api/proformas", proformasRoutes);
 app.use("/api/warranties", warrantiesRoutes);
 
-// Core business routes
+// Core business modules
 app.use("/api/users", userRoutes);
 app.use("/api/pos", posRoutes);
 app.use("/api/inventory", inventoryRoutes);
-app.use("/api/customers", authenticate, customerRoutes);
+app.use("/api/customers", customerRoutes);
 app.use("/api/repairs", repairRoutes);
 app.use("/api/reports", reportRoutes);
 app.use("/api/interstore", interstoreRoutes);
@@ -128,7 +140,7 @@ app.use(
   whatsappRoutes
 );
 
-// WhatsApp accounts (OWNER only)
+// WhatsApp account management (OWNER only for now)
 app.use(
   "/api/whatsapp",
   authenticate,
@@ -140,6 +152,7 @@ app.use(
 // WhatsApp inbox / protected actions inside its own route layer
 app.use("/api/whatsapp", whatsappInboxRoutes);
 
+// Settings
 app.use("/api/settings/security", securityRoutes);
 
 module.exports = app;

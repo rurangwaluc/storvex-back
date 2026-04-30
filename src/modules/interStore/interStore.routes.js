@@ -4,127 +4,145 @@ const router = express.Router();
 
 const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
-const requireRole = require("../../middlewares/requireRole");
 const {
   requireActiveSubscription,
   requireWritableSubscription,
 } = require("../../middlewares/requireActiveSubscription");
+const requireDbPermission = require("../../middlewares/requireDbPermission");
+const { PERMISSIONS } = require("../auth/permissions");
 
 const controller = require("./interStore.controller");
 
-router.use(authenticate, requireTenant, requireActiveSubscription);
+const readBase = [authenticate, requireTenant, requireActiveSubscription];
+const writeBase = [
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+  requireWritableSubscription,
+];
 
 router.get(
   "/internal-suppliers",
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_VIEW),
   controller.listInternalSuppliers
 );
 
 router.get(
   "/internal-suppliers/:supplierTenantId/products",
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_VIEW),
   controller.searchInternalSupplierProducts
 );
 
 router.get(
   "/outstanding",
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_VIEW),
   controller.listOutstanding
 );
 
 router.get(
   "/overdue",
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_VIEW),
   controller.listOverdue
 );
 
 router.get(
   "/search",
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_VIEW),
   controller.searchDeals
 );
 
 router.get(
   "/collections/search",
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_VIEW),
   controller.searchCollections
 );
 
 router.get(
   "/payments",
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_VIEW),
   controller.listPayments
 );
 
 router.get(
   "/audit",
-  requireRole("OWNER", "MANAGER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_AUDIT_VIEW),
   controller.listDealAudit
 );
 
 router.get(
   "/",
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_VIEW),
   controller.listDeals
 );
 
 router.post(
   "/",
   express.json(),
-  requireWritableSubscription,
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_CREATE),
   controller.createDeal
 );
 
 router.post(
   "/:id/receive",
   express.json(),
-  requireWritableSubscription,
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_RECEIVE),
   controller.markReceived
 );
 
 router.post(
   "/:id/sell",
   express.json(),
-  requireWritableSubscription,
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_SELL),
   controller.markSold
 );
 
 router.post(
   "/:id/return",
   express.json(),
-  requireWritableSubscription,
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_RETURN),
   controller.markReturned
 );
 
 router.post(
   "/:id/paid",
   express.json(),
-  requireWritableSubscription,
-  requireRole("OWNER", "MANAGER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_PAY),
   controller.markPaid
 );
 
 router.get(
   "/:id/payments",
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_VIEW),
   controller.getDealPayments
 );
 
 router.post(
   "/:id/payments",
   express.json(),
-  requireWritableSubscription,
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_PAYMENT_ADD),
   controller.addPayment
 );
 
 router.get(
   "/:id",
-  requireRole("OWNER", "MANAGER", "CASHIER"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.INTERSTORE_VIEW),
   controller.getDeal
 );
 

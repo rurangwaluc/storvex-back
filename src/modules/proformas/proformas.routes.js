@@ -8,31 +8,24 @@ const controller = require("./proformas.controller");
 const authenticate = require("../../middlewares/authenticate");
 const authenticateHeaderOrQueryToken = require("../../middlewares/authenticateHeaderOrQueryToken");
 const requireTenant = require("../../middlewares/requireTenant");
-const requireRole = require("../../middlewares/requireRole");
 const {
   requireActiveSubscription,
   requireWritableSubscription,
 } = require("../../middlewares/requireActiveSubscription");
+const requireDbPermission = require("../../middlewares/requireDbPermission");
+const { PERMISSIONS } = require("../auth/permissions");
 
-const ELECTRONICS_ROLES = [
-  "OWNER",
-  "MANAGER",
-  "STOREKEEPER",
-  "SELLER",
-  "CASHIER",
-  "TECHNICIAN",
+const readBase = [
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
 ];
 
-const CREATE_EDIT_ROLES = [
-  "OWNER",
-  "MANAGER",
-  "SELLER",
-  "CASHIER",
-];
-
-const DELETE_ROLES = [
-  "OWNER",
-  "MANAGER",
+const writeBase = [
+  authenticate,
+  requireTenant,
+  requireActiveSubscription,
+  requireWritableSubscription,
 ];
 
 // -----------------------
@@ -40,10 +33,8 @@ const DELETE_ROLES = [
 // -----------------------
 router.get(
   "/",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole(...ELECTRONICS_ROLES),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.POS_VIEW_SALES),
   controller.listProformas
 );
 
@@ -53,11 +44,8 @@ router.get(
 router.post(
   "/",
   express.json(),
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole(...CREATE_EDIT_ROLES),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.POS_CREATE_SALE),
   controller.createProforma
 );
 
@@ -66,10 +54,8 @@ router.post(
 // -----------------------
 router.get(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole(...ELECTRONICS_ROLES),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.POS_VIEW_SALES),
   controller.getProforma
 );
 
@@ -79,11 +65,8 @@ router.get(
 router.patch(
   "/:id",
   express.json(),
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole(...CREATE_EDIT_ROLES),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.POS_CREATE_SALE),
   controller.updateProforma
 );
 
@@ -92,11 +75,8 @@ router.patch(
 // -----------------------
 router.delete(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole(...DELETE_ROLES),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.POS_CREATE_SALE),
   controller.deleteProforma
 );
 
@@ -109,7 +89,7 @@ router.get(
   authenticateHeaderOrQueryToken,
   requireTenant,
   requireActiveSubscription,
-  requireRole(...ELECTRONICS_ROLES),
+  requireDbPermission(PERMISSIONS.POS_VIEW_SALES),
   controller.printProformaHtml
 );
 

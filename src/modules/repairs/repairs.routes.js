@@ -4,110 +4,91 @@ const repairsController = require("./repairs.controller");
 
 const authenticate = require("../../middlewares/authenticate");
 const requireTenant = require("../../middlewares/requireTenant");
-const requireRole = require("../../middlewares/requireRole");
 const {
   requireActiveSubscription,
   requireWritableSubscription,
 } = require("../../middlewares/requireActiveSubscription");
+const requireDbPermission = require("../../middlewares/requireDbPermission");
+const { PERMISSIONS } = require("../auth/permissions");
 
-// ==========================
-// REPAIR ROUTES
-// ==========================
-
-// Create repair (OWNER & CASHIER)
-router.post(
-  "/",
+const readBase = [authenticate, requireTenant, requireActiveSubscription];
+const writeBase = [
   authenticate,
   requireTenant,
   requireActiveSubscription,
   requireWritableSubscription,
-  requireRole("OWNER", "CASHIER"),
+];
+
+// Create repair
+router.post(
+  "/",
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.REPAIRS_CREATE),
   repairsController.createRepair
 );
 
-// List all repairs (OWNER, CASHIER, TECHNICIAN)
+// List all repairs
 router.get(
   "/",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER", "CASHIER", "TECHNICIAN"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.REPAIRS_VIEW),
   repairsController.getRepairs
 );
 
 // IMPORTANT: static routes must come before /:id to avoid being shadowed
-// Get technicians list (OWNER, CASHIER, TECHNICIAN)
+// Get technicians list
 router.get(
   "/technicians",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER", "CASHIER", "TECHNICIAN"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.REPAIRS_VIEW),
   repairsController.getTechnicians
 );
 
-// Get single repair (OWNER, CASHIER, TECHNICIAN)
+// Get single repair
 router.get(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireRole("OWNER", "CASHIER", "TECHNICIAN"),
+  ...readBase,
+  requireDbPermission(PERMISSIONS.REPAIRS_VIEW),
   repairsController.getRepairById
 );
 
-// Update full repair details (OWNER & CASHIER)
+// Update full repair details
 router.put(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER", "CASHIER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.REPAIRS_EDIT),
   repairsController.updateRepair
 );
 
-// Update repair status only (OWNER & TECHNICIAN)
+// Update repair status only
 router.put(
   "/:id/status",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER", "TECHNICIAN"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.REPAIRS_EDIT),
   repairsController.updateRepairStatus
 );
 
-// Assign technician (OWNER only)
+// Assign technician
 router.put(
   "/:id/assign",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.REPAIRS_EDIT),
   repairsController.assignTechnician
 );
 
-// Archive repair (soft delete) (OWNER only)
+// Archive repair (soft delete)
 router.delete(
   "/:id/archive",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.REPAIRS_EDIT),
   repairsController.archiveRepair
 );
 
-// Hard delete repair (OWNER only)
+// Hard delete repair
 router.delete(
   "/:id",
-  authenticate,
-  requireTenant,
-  requireActiveSubscription,
-  requireWritableSubscription,
-  requireRole("OWNER"),
+  ...writeBase,
+  requireDbPermission(PERMISSIONS.REPAIRS_EDIT),
   repairsController.deleteRepair
 );
 

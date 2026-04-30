@@ -12,6 +12,10 @@ function daysBetweenCeil(futureDate, now = new Date()) {
   return Math.max(0, Math.ceil(ms / (1000 * 60 * 60 * 24)));
 }
 
+function normalizeUpper(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
 function resolveSubscriptionAccess({
   tenantStatus,
   subscription,
@@ -32,27 +36,32 @@ function resolveSubscriptionAccess({
     };
   }
 
+  const tenantStatusUpper = normalizeUpper(tenantStatus);
+  const subscriptionStatusUpper = normalizeUpper(subscription.status);
+  const accessModeUpper = normalizeUpper(subscription.accessMode);
+
+  const endDate = toValidDate(subscription.endDate);
+  const trialEndDate = toValidDate(subscription.trialEndDate);
+  const graceEndDate = toValidDate(subscription.graceEndDate);
+  const readOnlySince = toValidDate(subscription.readOnlySince);
+
   if (
-    String(tenantStatus || "").toUpperCase() === "SUSPENDED" ||
-    String(subscription.status || "").toUpperCase() === "SUSPENDED" ||
-    String(subscription.accessMode || "").toUpperCase() === "SUSPENDED"
+    tenantStatusUpper === "SUSPENDED" ||
+    subscriptionStatusUpper === "SUSPENDED" ||
+    accessModeUpper === "SUSPENDED"
   ) {
     return {
       mode: "SUSPENDED",
       canRead: false,
       canOperate: false,
       reason: "Tenant is suspended",
-      endDate: subscription.endDate || null,
-      trialEndDate: subscription.trialEndDate || null,
-      graceEndDate: subscription.graceEndDate || null,
-      readOnlySince: subscription.readOnlySince || null,
+      endDate: endDate || null,
+      trialEndDate: trialEndDate || null,
+      graceEndDate: graceEndDate || null,
+      readOnlySince: readOnlySince || null,
       daysLeft: null,
     };
   }
-
-  const endDate = toValidDate(subscription.endDate);
-  const trialEndDate = toValidDate(subscription.trialEndDate);
-  const graceEndDate = toValidDate(subscription.graceEndDate);
 
   if (!endDate) {
     return {
@@ -68,8 +77,12 @@ function resolveSubscriptionAccess({
     };
   }
 
-  // 1. Trial active
-  if (trialEndDate && trialEndDate >= now) {
+  const trialStillValid = !!trialEndDate && trialEndDate >= now;
+  const paidStillValid = endDate >= now;
+  const graceStillValid = !!graceEndDate && graceEndDate >= now;
+
+  // 1. Explicit trial state, only if trial is still valid
+  if (accessModeUpper === "TRIAL" && trialStillValid) {
     return {
       mode: "TRIAL",
       canRead: true,
@@ -83,8 +96,38 @@ function resolveSubscriptionAccess({
     };
   }
 
-  // 2. Paid / active subscription
-  if (endDate >= now) {
+  // 2. Trial still valid even if accessMode is stale/missing
+  if (trialStillValid) {
+    return {
+      mode: "TRIAL",
+      canRead: true,
+      canOperate: true,
+      reason: "Trial active",
+      endDate,
+      trialEndDate,
+      graceEndDate,
+      readOnlySince: null,
+      daysLeft: daysBetweenCeil(trialEndDate, now),
+    };
+  }
+
+  // 3. Explicit read-only state takes precedence once trial is over
+  if (accessModeUpper === "READ_ONLY") {
+    return {
+      mode: "READ_ONLY",
+      canRead: true,
+      canOperate: false,
+      reason: "Read-only mode enforced",
+      endDate,
+      trialEndDate,
+      graceEndDate,
+      readOnlySince: readOnlySince || now,
+      daysLeft: graceStillValid ? daysBetweenCeil(graceEndDate, now) : 0,
+    };
+  }
+
+  // 4. Paid / active subscription
+  if (paidStillValid) {
     return {
       mode: "ACTIVE",
       canRead: true,
@@ -98,8 +141,8 @@ function resolveSubscriptionAccess({
     };
   }
 
-  // 3. Grace / restricted period
-  if (graceEndDate && graceEndDate >= now) {
+  // 5. Grace / restricted period
+  if (graceStillValid) {
     return {
       mode: "READ_ONLY",
       canRead: true,
@@ -108,12 +151,26 @@ function resolveSubscriptionAccess({
       endDate,
       trialEndDate,
       graceEndDate,
-      readOnlySince: subscription.readOnlySince || now,
+      readOnlySince: readOnlySince || now,
       daysLeft: daysBetweenCeil(graceEndDate, now),
     };
   }
 
-  // 4. Fully expired
+  // 6. Explicit expired state or fully expired fallback
+  if (subscriptionStatusUpper === "EXPIRED") {
+    return {
+      mode: "READ_ONLY",
+      canRead: true,
+      canOperate: false,
+      reason: "Subscription expired; read-only mode enforced",
+      endDate,
+      trialEndDate,
+      graceEndDate,
+      readOnlySince: readOnlySince || now,
+      daysLeft: 0,
+    };
+  }
+
   return {
     mode: "READ_ONLY",
     canRead: true,
@@ -122,7 +179,7 @@ function resolveSubscriptionAccess({
     endDate,
     trialEndDate,
     graceEndDate,
-    readOnlySince: subscription.readOnlySince || now,
+    readOnlySince: readOnlySince || now,
     daysLeft: 0,
   };
 }
