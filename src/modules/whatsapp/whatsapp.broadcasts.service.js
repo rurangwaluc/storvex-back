@@ -1,6 +1,13 @@
 const prisma = require("../../config/database");
 const whatsappService = require("./whatsapp.service");
 
+function appError(code, extra = {}) {
+  const err = new Error(code);
+  err.code = code;
+  Object.assign(err, extra);
+  return err;
+}
+
 function normalizeText(value) {
   const s = String(value || "").trim();
   return s || null;
@@ -17,6 +24,19 @@ function normalizeStatus(value, fallback = "DRAFT") {
   return fallback;
 }
 
+function normalizeTargetMode(value) {
+  const v = String(value || "ALL_OPTED_IN").trim().toUpperCase();
+
+  if (v === "ALL_OPTED_IN") return "ALL_OPTED_IN";
+  if (v === "BRANCH_CUSTOMERS") return "BRANCH_CUSTOMERS";
+  if (v === "CREDIT_CUSTOMERS") return "CREDIT_CUSTOMERS";
+  if (v === "OVERDUE_CREDIT_CUSTOMERS") return "OVERDUE_CREDIT_CUSTOMERS";
+  if (v === "PRODUCT_BUYERS") return "PRODUCT_BUYERS";
+  if (v === "MANUAL_CUSTOMERS") return "MANUAL_CUSTOMERS";
+
+  return "ALL_OPTED_IN";
+}
+
 function digitsOnly(value) {
   return String(value || "").replace(/[^\d]/g, "");
 }
@@ -31,8 +51,89 @@ function toInt(value, fallback = 0) {
   return Number.isFinite(n) ? Math.floor(n) : fallback;
 }
 
+function clampLimit(value, fallback = 50, max = 200) {
+  const n = toInt(value, fallback);
+  return Math.min(max, Math.max(1, n));
+}
+
+function getModelFields(delegate) {
+  try {
+    return delegate?.fields || {};
+  } catch {
+    return {};
+  }
+}
+
+function modelHasField(delegate, fieldName) {
+  const fields = getModelFields(delegate);
+  return typeof fields[fieldName] !== "undefined";
+}
+
+function buildCustomerWhereBase(tenantId) {
+  const customerFields = getModelFields(prisma.customer);
+
+  return {
+    tenantId,
+    ...(typeof customerFields.isActive !== "undefined" ? { isActive: true } : {}),
+    ...(typeof customerFields.whatsappOptIn !== "undefined" ? { whatsappOptIn: true } : {}),
+    phone: { not: null },
+  };
+}
+
+function customerSelectShape() {
+  const customerFields = getModelFields(prisma.customer);
+
+  return {
+    id: true,
+    name: true,
+    phone: true,
+    ...(typeof customerFields.email !== "undefined" ? { email: true } : {}),
+    ...(typeof customerFields.whatsappOptIn !== "undefined" ? { whatsappOptIn: true } : {}),
+    ...(typeof customerFields.isActive !== "undefined" ? { isActive: true } : {}),
+  };
+}
+
+function broadcastIncludeShape() {
+  return {
+    account: {
+      select: {
+        id: true,
+        phoneNumber: true,
+        businessName: true,
+        isActive: true,
+      },
+    },
+    promotion: {
+      select: {
+        id: true,
+        title: true,
+        message: true,
+        productId: true,
+        sentAt: true,
+        createdAt: true,
+      },
+    },
+    createdBy: {
+      select: {
+        id: true,
+        name: true,
+        role: true,
+      },
+    },
+    messages: {
+      select: {
+        id: true,
+        messageId: true,
+        conversationId: true,
+      },
+    },
+  };
+}
+
 function buildPublicBroadcast(broadcast) {
   if (!broadcast) return null;
+
+  const messages = Array.isArray(broadcast.messages) ? broadcast.messages : [];
 
   return {
     id: broadcast.id,
@@ -46,6 +147,14 @@ function buildPublicBroadcast(broadcast) {
     queuedAt: broadcast.queuedAt || null,
     sentAt: broadcast.sentAt || null,
     createdAt: broadcast.createdAt,
+
+    strategy: {
+      mode: "ONE_STORE_NUMBER",
+      customerFacingLabel: "One WhatsApp number for the store",
+      internalTargeting:
+        "Broadcasts are sent from the store number. Branch targeting is internal and only controls which customers receive the message.",
+    },
+
     account: broadcast.account
       ? {
           id: broadcast.account.id,
@@ -54,6 +163,7 @@ function buildPublicBroadcast(broadcast) {
           isActive: Boolean(broadcast.account.isActive),
         }
       : null,
+
     promotion: broadcast.promotion
       ? {
           id: broadcast.promotion.id,
@@ -64,6 +174,7 @@ function buildPublicBroadcast(broadcast) {
           createdAt: broadcast.promotion.createdAt || null,
         }
       : null,
+
     createdBy: broadcast.createdBy
       ? {
           id: broadcast.createdBy.id,
@@ -71,24 +182,50 @@ function buildPublicBroadcast(broadcast) {
           role: broadcast.createdBy.role,
         }
       : null,
-    recipientCount: Array.isArray(broadcast.messages) ? broadcast.messages.length : 0,
-    deliveredCount: Array.isArray(broadcast.messages)
-      ? broadcast.messages.filter((m) => String(m.messageId || "").trim()).length
-      : 0,
+
+    recipientCount: messages.length,
+    deliveredCount: messages.filter((m) => String(m.messageId || "").trim()).length,
   };
 }
 
 async function ensureTenantExists(tenantId) {
+  if (!tenantId) {
+    throw appError("TENANT_REQUIRED");
+  }
+
   const tenant = await prisma.tenant.findUnique({
     where: { id: tenantId },
     select: { id: true, name: true },
   });
 
   if (!tenant) {
-    throw new Error("TENANT_NOT_FOUND");
+    throw appError("TENANT_NOT_FOUND");
   }
 
   return tenant;
+}
+
+async function assertBranchBelongsToTenant(tenantId, branchId) {
+  if (!branchId) throw appError("BRANCH_REQUIRED");
+
+  const branch = await prisma.branch.findFirst({
+    where: {
+      id: String(branchId),
+      tenantId,
+      status: "ACTIVE",
+    },
+    select: {
+      id: true,
+      name: true,
+      code: true,
+      isMain: true,
+      status: true,
+    },
+  });
+
+  if (!branch) throw appError("BRANCH_NOT_FOUND");
+
+  return branch;
 }
 
 async function getActiveAccountOrThrow(tenantId, accountId) {
@@ -113,15 +250,15 @@ async function getActiveAccountOrThrow(tenantId, accountId) {
   });
 
   if (!account) {
-    throw new Error("WHATSAPP_ACCOUNT_NOT_FOUND");
+    throw appError("WHATSAPP_ACCOUNT_NOT_FOUND");
   }
 
   if (!account.phoneNumberId) {
-    throw new Error("WHATSAPP_ACCOUNT_PHONE_NUMBER_ID_MISSING");
+    throw appError("WHATSAPP_ACCOUNT_PHONE_NUMBER_ID_MISSING");
   }
 
   if (!account.accessToken) {
-    throw new Error("WHATSAPP_ACCOUNT_ACCESS_TOKEN_MISSING");
+    throw appError("WHATSAPP_ACCOUNT_ACCESS_TOKEN_MISSING");
   }
 
   return account;
@@ -144,7 +281,7 @@ async function getPromotionOrThrow(tenantId, promotionId) {
   });
 
   if (!promotion) {
-    throw new Error("PROMOTION_NOT_FOUND");
+    throw appError("PROMOTION_NOT_FOUND");
   }
 
   return promotion;
@@ -156,46 +293,34 @@ async function getBroadcastOrThrow(tenantId, broadcastId) {
       id: String(broadcastId),
       tenantId,
     },
-    include: {
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
-      promotion: {
-        select: {
-          id: true,
-          title: true,
-          message: true,
-          productId: true,
-          sentAt: true,
-          createdAt: true,
-        },
-      },
-      createdBy: {
-        select: {
-          id: true,
-          name: true,
-          role: true,
-        },
-      },
-      messages: {
-        select: {
-          id: true,
-          messageId: true,
-        },
-      },
-    },
+    include: broadcastIncludeShape(),
   });
 
   if (!broadcast) {
-    throw new Error("BROADCAST_NOT_FOUND");
+    throw appError("BROADCAST_NOT_FOUND");
   }
 
   return broadcast;
+}
+
+function normalizeTargeting(body = {}) {
+  const target = body.targeting && typeof body.targeting === "object" ? body.targeting : body;
+
+  const mode = normalizeTargetMode(target.targetMode || target.mode || body.targetMode);
+
+  const branchId = normalizeText(target.branchId || body.branchId);
+  const productId = normalizeText(target.productId || body.productId);
+
+  const manualCustomerIds = Array.isArray(target.customerIds || body.customerIds)
+    ? (target.customerIds || body.customerIds).map(normalizeText).filter(Boolean)
+    : [];
+
+  return {
+    mode,
+    branchId,
+    productId,
+    manualCustomerIds,
+  };
 }
 
 async function listBroadcasts({ tenantId, status, accountId, q, limit = 50 }) {
@@ -204,7 +329,7 @@ async function listBroadcasts({ tenantId, status, accountId, q, limit = 50 }) {
   const cleanStatus = status ? normalizeStatus(status, "") : null;
   const cleanAccountId = normalizeText(accountId);
   const cleanQuery = normalizeText(q);
-  const take = Math.min(100, Math.max(1, toInt(limit, 50)));
+  const take = clampLimit(limit, 50, 100);
 
   const broadcasts = await prisma.whatsAppBroadcast.findMany({
     where: {
@@ -230,39 +355,7 @@ async function listBroadcasts({ tenantId, status, accountId, q, limit = 50 }) {
           }
         : {}),
     },
-    include: {
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
-      promotion: {
-        select: {
-          id: true,
-          title: true,
-          message: true,
-          productId: true,
-          sentAt: true,
-          createdAt: true,
-        },
-      },
-      createdBy: {
-        select: {
-          id: true,
-          name: true,
-          role: true,
-        },
-      },
-      messages: {
-        select: {
-          id: true,
-          messageId: true,
-        },
-      },
-    },
+    include: broadcastIncludeShape(),
     orderBy: [{ createdAt: "desc" }],
     take,
   });
@@ -276,11 +369,7 @@ async function getBroadcast({ tenantId, broadcastId }) {
   return buildPublicBroadcast(broadcast);
 }
 
-async function createBroadcast({
-  tenantId,
-  userId,
-  body,
-}) {
+async function createBroadcast({ tenantId, userId, body }) {
   await ensureTenantExists(tenantId);
 
   const account = await getActiveAccountOrThrow(tenantId, body?.accountId || null);
@@ -290,12 +379,25 @@ async function createBroadcast({
   const languageCode = normalizeLanguageCode(body?.languageCode);
 
   if (!templateName) {
-    throw new Error("TEMPLATE_NAME_REQUIRED");
+    throw appError("TEMPLATE_NAME_REQUIRED");
   }
 
   let promotion = null;
   if (promotionId) {
     promotion = await getPromotionOrThrow(tenantId, promotionId);
+  }
+
+  const targeting = normalizeTargeting(body || {});
+  if (targeting.mode === "BRANCH_CUSTOMERS" && targeting.branchId) {
+    await assertBranchBelongsToTenant(tenantId, targeting.branchId);
+  }
+
+  if (targeting.mode === "PRODUCT_BUYERS" && !targeting.productId && !promotion?.productId) {
+    throw appError("PRODUCT_ID_REQUIRED_FOR_TARGET");
+  }
+
+  if (targeting.mode === "MANUAL_CUSTOMERS" && targeting.manualCustomerIds.length === 0) {
+    throw appError("CUSTOMER_IDS_REQUIRED_FOR_TARGET");
   }
 
   const created = await prisma.whatsAppBroadcast.create({
@@ -308,55 +410,30 @@ async function createBroadcast({
       status: "DRAFT",
       createdById: userId,
     },
-    include: {
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
-      promotion: {
-        select: {
-          id: true,
-          title: true,
-          message: true,
-          productId: true,
-          sentAt: true,
-          createdAt: true,
-        },
-      },
-      createdBy: {
-        select: {
-          id: true,
-          name: true,
-          role: true,
-        },
-      },
-      messages: {
-        select: {
-          id: true,
-          messageId: true,
-        },
-      },
-    },
+    include: broadcastIncludeShape(),
   });
 
-  return buildPublicBroadcast(created);
+  return {
+    ...buildPublicBroadcast(created),
+    targetingPreview: {
+      mode: targeting.mode,
+      branchId: targeting.branchId,
+      productId: targeting.productId || promotion?.productId || null,
+      manualCustomerCount: targeting.manualCustomerIds.length,
+      persisted: false,
+      note:
+        "Targeting is currently applied when sending. Add targeting columns later if you want saved broadcast segments.",
+    },
+  };
 }
 
-async function updateBroadcast({
-  tenantId,
-  broadcastId,
-  body,
-}) {
+async function updateBroadcast({ tenantId, broadcastId, body }) {
   await ensureTenantExists(tenantId);
 
   const existing = await getBroadcastOrThrow(tenantId, broadcastId);
 
   if (existing.status !== "DRAFT") {
-    throw new Error("ONLY_DRAFT_CAN_BE_EDITED");
+    throw appError("ONLY_DRAFT_CAN_BE_EDITED");
   }
 
   const nextTemplateName =
@@ -368,7 +445,7 @@ async function updateBroadcast({
       : existing.languageCode;
 
   if (!nextTemplateName) {
-    throw new Error("TEMPLATE_NAME_REQUIRED");
+    throw appError("TEMPLATE_NAME_REQUIRED");
   }
 
   let nextAccountId = existing.accountId;
@@ -380,12 +457,18 @@ async function updateBroadcast({
   let nextPromotionId = existing.promotionId || null;
   if (body?.promotionId !== undefined) {
     const cleanPromotionId = normalizeText(body.promotionId);
+
     if (!cleanPromotionId) {
       nextPromotionId = null;
     } else {
       const promotion = await getPromotionOrThrow(tenantId, cleanPromotionId);
       nextPromotionId = promotion.id;
     }
+  }
+
+  const targeting = normalizeTargeting(body || {});
+  if (targeting.mode === "BRANCH_CUSTOMERS" && targeting.branchId) {
+    await assertBranchBelongsToTenant(tenantId, targeting.branchId);
   }
 
   const updated = await prisma.whatsAppBroadcast.update({
@@ -396,42 +479,19 @@ async function updateBroadcast({
       templateName: nextTemplateName,
       languageCode: nextLanguageCode,
     },
-    include: {
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
-      promotion: {
-        select: {
-          id: true,
-          title: true,
-          message: true,
-          productId: true,
-          sentAt: true,
-          createdAt: true,
-        },
-      },
-      createdBy: {
-        select: {
-          id: true,
-          name: true,
-          role: true,
-        },
-      },
-      messages: {
-        select: {
-          id: true,
-          messageId: true,
-        },
-      },
-    },
+    include: broadcastIncludeShape(),
   });
 
-  return buildPublicBroadcast(updated);
+  return {
+    ...buildPublicBroadcast(updated),
+    targetingPreview: {
+      mode: targeting.mode,
+      branchId: targeting.branchId,
+      productId: targeting.productId || null,
+      manualCustomerCount: targeting.manualCustomerIds.length,
+      persisted: false,
+    },
+  };
 }
 
 async function queueBroadcast({ tenantId, broadcastId }) {
@@ -440,7 +500,7 @@ async function queueBroadcast({ tenantId, broadcastId }) {
   const existing = await getBroadcastOrThrow(tenantId, broadcastId);
 
   if (existing.status !== "DRAFT") {
-    throw new Error("ONLY_DRAFT_CAN_BE_QUEUED");
+    throw appError("ONLY_DRAFT_CAN_BE_QUEUED");
   }
 
   const updated = await prisma.whatsAppBroadcast.update({
@@ -449,49 +509,231 @@ async function queueBroadcast({ tenantId, broadcastId }) {
       status: "QUEUED",
       queuedAt: new Date(),
     },
-    include: {
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
-      promotion: {
-        select: {
-          id: true,
-          title: true,
-          message: true,
-          productId: true,
-          sentAt: true,
-          createdAt: true,
-        },
-      },
-      createdBy: {
-        select: {
-          id: true,
-          name: true,
-          role: true,
-        },
-      },
-      messages: {
-        select: {
-          id: true,
-          messageId: true,
-        },
-      },
-    },
+    include: broadcastIncludeShape(),
   });
 
   return buildPublicBroadcast(updated);
 }
 
-async function sendBroadcastNow({
-  tenantId,
-  broadcastId,
-  limit = 50,
-}) {
+async function getBranchCustomerIds({ tenantId, branchId, limit }) {
+  await assertBranchBelongsToTenant(tenantId, branchId);
+
+  const saleFields = getModelFields(prisma.sale);
+
+  if (typeof saleFields.branchId === "undefined") {
+    throw appError("SALE_BRANCH_NOT_AVAILABLE");
+  }
+
+  const rows = await prisma.sale.findMany({
+    where: {
+      tenantId,
+      branchId,
+      customerId: { not: null },
+      isDraft: false,
+      isCancelled: false,
+    },
+    select: {
+      customerId: true,
+      createdAt: true,
+    },
+    orderBy: [{ createdAt: "desc" }],
+    take: Math.min(1000, Math.max(limit * 4, limit)),
+  });
+
+  return [...new Set(rows.map((row) => row.customerId).filter(Boolean))].slice(0, limit);
+}
+
+async function getCreditCustomerIds({ tenantId, overdueOnly = false, limit }) {
+  const now = new Date();
+
+  const rows = await prisma.sale.findMany({
+    where: {
+      tenantId,
+      customerId: { not: null },
+      isDraft: false,
+      isCancelled: false,
+      saleType: "CREDIT",
+      balanceDue: { gt: 0 },
+      ...(overdueOnly ? { dueDate: { lt: now } } : {}),
+    },
+    select: {
+      customerId: true,
+      balanceDue: true,
+      dueDate: true,
+      createdAt: true,
+    },
+    orderBy: [{ createdAt: "desc" }],
+    take: Math.min(1000, Math.max(limit * 4, limit)),
+  });
+
+  return [...new Set(rows.map((row) => row.customerId).filter(Boolean))].slice(0, limit);
+}
+
+async function getProductBuyerCustomerIds({ tenantId, productId, limit }) {
+  if (!productId) throw appError("PRODUCT_ID_REQUIRED_FOR_TARGET");
+
+  const product = await prisma.product.findFirst({
+    where: {
+      id: String(productId),
+      tenantId,
+    },
+    select: {
+      id: true,
+    },
+  });
+
+  if (!product) throw appError("PRODUCT_NOT_FOUND");
+
+  const rows = await prisma.saleItem.findMany({
+    where: {
+      productId: product.id,
+      sale: {
+        tenantId,
+        customerId: { not: null },
+        isDraft: false,
+        isCancelled: false,
+      },
+    },
+    select: {
+      sale: {
+        select: {
+          customerId: true,
+          createdAt: true,
+        },
+      },
+    },
+    orderBy: [{ id: "desc" }],
+    take: Math.min(1000, Math.max(limit * 4, limit)),
+  });
+
+  return [...new Set(rows.map((row) => row.sale?.customerId).filter(Boolean))].slice(0, limit);
+}
+
+async function getRecipients({ tenantId, targeting, promotion, limit }) {
+  const customerFields = getModelFields(prisma.customer);
+  const take = clampLimit(limit, 50, 200);
+
+  let customerIds = [];
+
+  if (targeting.mode === "BRANCH_CUSTOMERS") {
+    if (!targeting.branchId) throw appError("BRANCH_REQUIRED");
+    customerIds = await getBranchCustomerIds({
+      tenantId,
+      branchId: targeting.branchId,
+      limit: take,
+    });
+  }
+
+  if (targeting.mode === "CREDIT_CUSTOMERS") {
+    customerIds = await getCreditCustomerIds({
+      tenantId,
+      overdueOnly: false,
+      limit: take,
+    });
+  }
+
+  if (targeting.mode === "OVERDUE_CREDIT_CUSTOMERS") {
+    customerIds = await getCreditCustomerIds({
+      tenantId,
+      overdueOnly: true,
+      limit: take,
+    });
+  }
+
+  if (targeting.mode === "PRODUCT_BUYERS") {
+    customerIds = await getProductBuyerCustomerIds({
+      tenantId,
+      productId: targeting.productId || promotion?.productId,
+      limit: take,
+    });
+  }
+
+  if (targeting.mode === "MANUAL_CUSTOMERS") {
+    customerIds = targeting.manualCustomerIds.slice(0, take);
+  }
+
+  const where =
+    targeting.mode === "ALL_OPTED_IN"
+      ? buildCustomerWhereBase(tenantId)
+      : {
+          ...buildCustomerWhereBase(tenantId),
+          id: { in: customerIds },
+        };
+
+  const recipients = await prisma.customer.findMany({
+    where,
+    select: customerSelectShape(),
+    orderBy:
+      typeof customerFields.createdAt !== "undefined"
+        ? [{ createdAt: "desc" }]
+        : [{ name: "asc" }],
+    take,
+  });
+
+  const seenPhones = new Set();
+  const cleanRecipients = [];
+
+  for (const customer of recipients) {
+    const phone = normalizePhone(customer.phone);
+    if (!phone) continue;
+    if (seenPhones.has(phone)) continue;
+
+    seenPhones.add(phone);
+    cleanRecipients.push({
+      id: customer.id,
+      name: customer.name || "Customer",
+      phone,
+    });
+  }
+
+  return cleanRecipients;
+}
+
+async function findOrCreateConversation({ tenantId, account, recipient }) {
+  let conversation = await prisma.whatsAppConversation.findFirst({
+    where: {
+      tenantId,
+      accountId: account.id,
+      phone: recipient.phone,
+    },
+    select: {
+      id: true,
+      customerId: true,
+    },
+    orderBy: [{ updatedAt: "desc" }],
+  });
+
+  if (!conversation) {
+    const conversationFields = getModelFields(prisma.whatsAppConversation);
+
+    conversation = await prisma.whatsAppConversation.create({
+      data: {
+        tenantId,
+        accountId: account.id,
+        customerId: recipient.id,
+        phone: recipient.phone,
+        status: "OPEN",
+        ...(typeof conversationFields.branchId !== "undefined" ? { branchId: null } : {}),
+      },
+      select: {
+        id: true,
+        customerId: true,
+      },
+    });
+  } else if (!conversation.customerId) {
+    await prisma.whatsAppConversation.update({
+      where: { id: conversation.id },
+      data: {
+        customerId: recipient.id,
+        updatedAt: new Date(),
+      },
+    });
+  }
+
+  return conversation;
+}
+
+async function sendBroadcastNow({ tenantId, broadcastId, limit = 50, targeting: targetingInput = null }) {
   await ensureTenantExists(tenantId);
 
   const broadcast = await prisma.whatsAppBroadcast.findFirst({
@@ -519,37 +761,29 @@ async function sendBroadcastNow({
   });
 
   if (!broadcast) {
-    throw new Error("BROADCAST_NOT_FOUND");
+    throw appError("BROADCAST_NOT_FOUND");
   }
 
   if (broadcast.status !== "DRAFT" && broadcast.status !== "QUEUED") {
-    throw new Error("ONLY_DRAFT_OR_QUEUED_CAN_BE_SENT");
+    throw appError("ONLY_DRAFT_OR_QUEUED_CAN_BE_SENT");
   }
 
   if (!broadcast.promotion) {
-    throw new Error("PROMOTION_REQUIRED_TO_SEND");
+    throw appError("PROMOTION_REQUIRED_TO_SEND");
   }
 
   const account = await getActiveAccountOrThrow(tenantId, broadcast.accountId);
 
-  const recipients = await prisma.customer.findMany({
-    where: {
-      tenantId,
-      isActive: true,
-      whatsappOptIn: true,
-      phone: { not: null },
-    },
-    select: {
-      id: true,
-      name: true,
-      phone: true,
-    },
-    orderBy: [{ createdAt: "desc" }],
-    take: Math.min(200, Math.max(1, toInt(limit, 50))),
+  const targeting = normalizeTargeting(targetingInput || {});
+  const recipients = await getRecipients({
+    tenantId,
+    targeting,
+    promotion: broadcast.promotion,
+    limit,
   });
 
   if (!recipients.length) {
-    throw new Error("NO_BROADCAST_RECIPIENTS");
+    throw appError("NO_BROADCAST_RECIPIENTS");
   }
 
   const sentConversationIds = new Set(
@@ -561,44 +795,28 @@ async function sendBroadcastNow({
   let attempted = 0;
   let delivered = 0;
   let failed = 0;
+  let skippedDuplicate = 0;
+
+  const failures = [];
 
   for (const recipient of recipients) {
-    const to = normalizePhone(recipient.phone);
-    if (!to) continue;
-
     attempted += 1;
 
     try {
-      let conversation = await prisma.whatsAppConversation.findFirst({
-        where: {
-          tenantId,
-          accountId: account.id,
-          phone: to,
-        },
-        select: { id: true },
-        orderBy: [{ updatedAt: "desc" }],
+      const conversation = await findOrCreateConversation({
+        tenantId,
+        account,
+        recipient,
       });
 
-      if (!conversation) {
-        conversation = await prisma.whatsAppConversation.create({
-          data: {
-            tenantId,
-            accountId: account.id,
-            customerId: recipient.id,
-            phone: to,
-            status: "OPEN",
-          },
-          select: { id: true },
-        });
-      }
-
       if (sentConversationIds.has(conversation.id)) {
+        skippedDuplicate += 1;
         continue;
       }
 
       const resp = await whatsappService.sendTemplate({
         account,
-        to,
+        to: recipient.phone,
         templateName: broadcast.templateName,
         languageCode: broadcast.languageCode,
         bodyParams: [
@@ -636,6 +854,12 @@ async function sendBroadcastNow({
     } catch (err) {
       console.error("sendBroadcastNow recipient send error:", err?.message || err);
       failed += 1;
+
+      failures.push({
+        customerId: recipient.id,
+        phone: recipient.phone,
+        message: err?.message || "Send failed",
+      });
     }
   }
 
@@ -649,39 +873,7 @@ async function sendBroadcastNow({
       ...(sentAt ? { sentAt } : {}),
       queuedAt: broadcast.queuedAt || new Date(),
     },
-    include: {
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
-      promotion: {
-        select: {
-          id: true,
-          title: true,
-          message: true,
-          productId: true,
-          sentAt: true,
-          createdAt: true,
-        },
-      },
-      createdBy: {
-        select: {
-          id: true,
-          name: true,
-          role: true,
-        },
-      },
-      messages: {
-        select: {
-          id: true,
-          messageId: true,
-        },
-      },
-    },
+    include: broadcastIncludeShape(),
   });
 
   if (delivered > 0 && broadcast.promotion && !broadcast.promotion.sentAt) {
@@ -694,9 +886,14 @@ async function sendBroadcastNow({
   return {
     broadcast: buildPublicBroadcast(updated),
     summary: {
+      targetMode: targeting.mode,
+      branchId: targeting.branchId || null,
+      productId: targeting.productId || broadcast.promotion?.productId || null,
       attempted,
       delivered,
       failed,
+      skippedDuplicate,
+      failurePreview: failures.slice(0, 10),
     },
   };
 }

@@ -9,7 +9,15 @@ const controller = require("./whatsapp.inbox.controller");
 const { WHATSAPP_WORKSPACE_ROLES } = require("./whatsapp.roles");
 
 /**
- * Locked access for WhatsApp workspace
+ * WhatsApp inbox workspace
+ *
+ * Customer experience:
+ * - one store WhatsApp number
+ *
+ * Internal Storvex rule:
+ * - conversations can be tenant-level
+ * - sale drafts/finalized WhatsApp sales must resolve to a branch
+ * - stock, drawer, payment, receipt, and audit trail must respect branch truth
  */
 router.use(
   authenticate,
@@ -18,9 +26,22 @@ router.use(
 );
 
 /**
- * Conversations
+ * Staff assignment
+ *
+ * GET /api/whatsapp/inbox/assignable-staff
  */
 router.get("/inbox/assignable-staff", controller.listAssignableStaff);
+
+/**
+ * Conversations
+ *
+ * GET    /api/whatsapp/inbox/conversations
+ * GET    /api/whatsapp/inbox/conversations/:id/messages
+ * POST   /api/whatsapp/inbox/conversations/:id/reply
+ * PATCH  /api/whatsapp/inbox/conversations/:id/status
+ * PATCH  /api/whatsapp/inbox/conversations/:id/assign
+ * PATCH  /api/whatsapp/inbox/conversations/:id/unassign
+ */
 router.get("/inbox/conversations", controller.listConversations);
 router.get("/inbox/conversations/:id/messages", controller.listMessages);
 router.post("/inbox/conversations/:id/reply", controller.reply);
@@ -29,11 +50,32 @@ router.patch("/inbox/conversations/:id/assign", controller.assignConversation);
 router.patch("/inbox/conversations/:id/unassign", controller.unassignConversation);
 
 /**
- * WhatsApp sale drafts
+ * Sale drafts from WhatsApp
+ *
+ * GET     /api/whatsapp/inbox/sale-drafts
+ * GET     /api/whatsapp/inbox/sale-drafts/:saleId
+ * POST    /api/whatsapp/inbox/conversations/:id/sale-draft
+ * PATCH   /api/whatsapp/inbox/sale-drafts/:saleId
+ * DELETE  /api/whatsapp/inbox/sale-drafts/:saleId
+ * POST    /api/whatsapp/inbox/sale-drafts/:saleId/finalize
  */
 router.get("/inbox/sale-drafts", controller.listSaleDrafts);
 router.get("/inbox/sale-drafts/:saleId", controller.getSaleDraft);
-router.post("/inbox/conversations/:id/create-sale-draft", controller.createSaleDraft);
+
+/**
+ * Preferred clean endpoint.
+ */
+router.post("/inbox/conversations/:id/sale-draft", controller.createSaleDraft);
+
+/**
+ * Backward-compatible endpoint.
+ * Keep this so any existing frontend/Postman tests do not break.
+ */
+router.post(
+  "/inbox/conversations/:id/create-sale-draft",
+  controller.createSaleDraft
+);
+
 router.patch("/inbox/sale-drafts/:saleId", controller.updateSaleDraft);
 router.delete("/inbox/sale-drafts/:saleId", controller.deleteSaleDraft);
 router.post("/inbox/sale-drafts/:saleId/finalize", controller.finalizeSaleDraft);

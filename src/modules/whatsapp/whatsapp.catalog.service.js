@@ -20,6 +20,7 @@ function escapeRegExp(value) {
 function formatMoneyRwf(n) {
   const x = Number(n);
   if (!Number.isFinite(x)) return String(n);
+
   return `${Math.round(x).toLocaleString("en-US")} RWF`;
 }
 
@@ -30,6 +31,24 @@ function normalizeSearchText(value) {
       .replace(/[^\p{L}\p{N}\s/-]/gu, " ")
       .replace(/[_]+/g, " ")
   );
+}
+
+function getModelFields(delegate) {
+  try {
+    return delegate?.fields || {};
+  } catch {
+    return {};
+  }
+}
+
+function modelHasField(delegate, fieldName) {
+  const fields = getModelFields(delegate);
+  return typeof fields[fieldName] !== "undefined";
+}
+
+function safeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 function tokenizeQuery(value) {
@@ -51,6 +70,14 @@ function tokenizeQuery(value) {
     "and",
     "phone",
     "please",
+    "how",
+    "much",
+    "do",
+    "you",
+    "have",
+    "mufite",
+    "igiciro",
+    "angahe",
   ]);
 
   return text
@@ -81,9 +108,9 @@ function extractBudgetFromText(text) {
   const raw = normalizeLower(text);
 
   const patterns = [
-    /\b(?:around|about|budget|under|below|max(?:imum)?|up to|near|within)\s*(\d+(?:[.,]\d+)?)\s*(k|m|rwf)?\b/i,
+    /\b(?:around|about|budget|under|below|max(?:imum)?|up to|near|within)\s*(\d+(?:[.,]\d+)?)\s*(k|m|rwf|frw)?\b/i,
     /\b(\d+(?:[.,]\d+)?)\s*(k|m)\b/i,
-    /\b(\d{5,8})\s*(rwf)?\b/i,
+    /\b(\d{5,8})\s*(rwf|frw)?\b/i,
   ];
 
   for (const rx of patterns) {
@@ -156,6 +183,7 @@ function detectBrandFromText(text) {
       if (brand === "tplink") return "TP-Link";
       if (brand === "hp") return "HP";
       if (brand === "wd") return "WD";
+
       return brand
         .split("-")
         .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
@@ -211,15 +239,27 @@ function buildCategoryWhere(category) {
     "screen protector": ["screen protector", "protector"],
   };
 
+  const productFields = getModelFields(prisma.product);
   const keywords = map[q] || [q];
 
   return {
-    OR: keywords.flatMap((kw) => [
-      { category: { contains: kw, mode: "insensitive" } },
-      { subcategory: { contains: kw, mode: "insensitive" } },
-      { name: { contains: kw, mode: "insensitive" } },
-      { brand: { contains: kw, mode: "insensitive" } },
-    ]),
+    OR: keywords.flatMap((kw) => {
+      const conditions = [{ name: { contains: kw, mode: "insensitive" } }];
+
+      if (typeof productFields.category !== "undefined") {
+        conditions.push({ category: { contains: kw, mode: "insensitive" } });
+      }
+
+      if (typeof productFields.subcategory !== "undefined") {
+        conditions.push({ subcategory: { contains: kw, mode: "insensitive" } });
+      }
+
+      if (typeof productFields.brand !== "undefined") {
+        conditions.push({ brand: { contains: kw, mode: "insensitive" } });
+      }
+
+      return conditions;
+    }),
   };
 }
 
@@ -231,6 +271,7 @@ function scoreProductAgainstQuery(product, queryTokens) {
     if (!token) continue;
 
     const exactWord = new RegExp(`\\b${escapeRegExp(token)}\\b`, "i");
+
     if (exactWord.test(hay)) {
       score += 8;
       continue;
@@ -244,32 +285,37 @@ function scoreProductAgainstQuery(product, queryTokens) {
   const fullName = normalizeLower(product?.name);
   const fullSku = normalizeLower(product?.sku);
   const fullBarcode = normalizeLower(product?.barcode);
+  const fullSerial = normalizeLower(product?.serial);
 
   const joinedQuery = queryTokens.join(" ").trim();
+
   if (joinedQuery) {
     if (fullName === joinedQuery) score += 10;
     if (fullSku === joinedQuery) score += 12;
     if (fullBarcode === joinedQuery) score += 12;
+    if (fullSerial === joinedQuery) score += 12;
     if (fullName.includes(joinedQuery)) score += 5;
   }
 
-  if (Number(product?.stockQty || 0) > 0) score += 1;
+  if (Number(product?.availableQty ?? product?.stockQty ?? 0) > 0) score += 1;
 
   return score;
 }
 
 function buildProductSelect() {
+  const productFields = getModelFields(prisma.product);
+
   return {
     id: true,
     name: true,
     sellPrice: true,
     stockQty: true,
-    brand: true,
-    category: true,
-    subcategory: true,
-    sku: true,
-    barcode: true,
-    serial: true,
+    ...(typeof productFields.brand !== "undefined" ? { brand: true } : {}),
+    ...(typeof productFields.category !== "undefined" ? { category: true } : {}),
+    ...(typeof productFields.subcategory !== "undefined" ? { subcategory: true } : {}),
+    ...(typeof productFields.sku !== "undefined" ? { sku: true } : {}),
+    ...(typeof productFields.barcode !== "undefined" ? { barcode: true } : {}),
+    ...(typeof productFields.serial !== "undefined" ? { serial: true } : {}),
   };
 }
 
@@ -281,7 +327,9 @@ function dedupeProducts(products) {
     const key =
       p?.id ||
       `${normalizeLower(p?.name)}|${normalizeLower(p?.sku)}|${normalizeLower(p?.barcode)}`;
+
     if (seen.has(key)) continue;
+
     seen.add(key);
     out.push(p);
   }
@@ -289,43 +337,146 @@ function dedupeProducts(products) {
   return out;
 }
 
-async function searchProducts({ tenantId, q, take = 3 }) {
-  const query = normalizeText(q);
-  if (!query || query.length < 2) return [];
+async function attachBranchQuantities({ tenantId, branchId, products }) {
+  if (!Array.isArray(products) || products.length === 0) return [];
 
-  const tokens = tokenizeQuery(query);
-  if (tokens.length === 0) return [];
+  if (!branchId || !prisma.branchInventory) {
+    return products.map((product) => ({
+      ...product,
+      branchQty: null,
+      availableQty: safeNumber(product.stockQty),
+      stockSource: "PRODUCT",
+    }));
+  }
 
-  const exactOr = [
-    { name: { contains: query, mode: "insensitive" } },
-    { category: { contains: query, mode: "insensitive" } },
-    { subcategory: { contains: query, mode: "insensitive" } },
-    { brand: { contains: query, mode: "insensitive" } },
-    { sku: { contains: query, mode: "insensitive" } },
-    { barcode: { contains: query, mode: "insensitive" } },
-    { serial: { contains: query, mode: "insensitive" } },
-  ];
+  const productIds = products.map((product) => product.id).filter(Boolean);
 
-  const tokenOr = tokens.flatMap((token) => [
-    { name: { contains: token, mode: "insensitive" } },
-    { brand: { contains: token, mode: "insensitive" } },
-    { category: { contains: token, mode: "insensitive" } },
-    { subcategory: { contains: token, mode: "insensitive" } },
-    { sku: { contains: token, mode: "insensitive" } },
-    { barcode: { contains: token, mode: "insensitive" } },
-  ]);
-
-  const products = await prisma.product.findMany({
+  const rows = await prisma.branchInventory.findMany({
     where: {
       tenantId,
-      isActive: true,
-      stockQty: { gt: 0 },
-      OR: [...exactOr, ...tokenOr],
+      branchId,
+      productId: { in: productIds },
     },
-    select: buildProductSelect(),
-    take: Math.max(20, Number(take) * 6 || 18),
+    select: {
+      productId: true,
+      qtyOnHand: true,
+    },
   });
 
+  const qtyByProductId = new Map(
+    rows.map((row) => [row.productId, safeNumber(row.qtyOnHand)])
+  );
+
+  return products.map((product) => {
+    const branchQty = qtyByProductId.has(product.id)
+      ? qtyByProductId.get(product.id)
+      : 0;
+
+    return {
+      ...product,
+      branchQty,
+      availableQty: branchQty,
+      stockSource: "BRANCH_INVENTORY",
+    };
+  });
+}
+
+function buildProductWhere({ tenantId, query = null, tokens = [], budget = null, brand = null, category = null }) {
+  const productFields = getModelFields(prisma.product);
+
+  const and = [
+    { tenantId },
+    ...(typeof productFields.isActive !== "undefined" ? [{ isActive: true }] : []),
+  ];
+
+  if (budget) {
+    and.push({
+      sellPrice: {
+        gte: Math.max(0, Math.round(budget * 0.6)),
+        lte: Math.round(budget * 1.15),
+      },
+    });
+  }
+
+  if (brand) {
+    const brandOr = [{ name: { contains: brand, mode: "insensitive" } }];
+
+    if (typeof productFields.brand !== "undefined") {
+      brandOr.push({ brand: { contains: brand, mode: "insensitive" } });
+    }
+
+    and.push({ OR: brandOr });
+  }
+
+  const categoryWhere = buildCategoryWhere(category);
+  if (categoryWhere) and.push(categoryWhere);
+
+  if (query) {
+    const exactOr = [{ name: { contains: query, mode: "insensitive" } }];
+
+    if (typeof productFields.category !== "undefined") {
+      exactOr.push({ category: { contains: query, mode: "insensitive" } });
+    }
+
+    if (typeof productFields.subcategory !== "undefined") {
+      exactOr.push({ subcategory: { contains: query, mode: "insensitive" } });
+    }
+
+    if (typeof productFields.brand !== "undefined") {
+      exactOr.push({ brand: { contains: query, mode: "insensitive" } });
+    }
+
+    if (typeof productFields.sku !== "undefined") {
+      exactOr.push({ sku: { contains: query, mode: "insensitive" } });
+    }
+
+    if (typeof productFields.barcode !== "undefined") {
+      exactOr.push({ barcode: { contains: query, mode: "insensitive" } });
+    }
+
+    if (typeof productFields.serial !== "undefined") {
+      exactOr.push({ serial: { contains: query, mode: "insensitive" } });
+    }
+
+    const tokenOr = tokens.flatMap((token) => {
+      const conditions = [{ name: { contains: token, mode: "insensitive" } }];
+
+      if (typeof productFields.brand !== "undefined") {
+        conditions.push({ brand: { contains: token, mode: "insensitive" } });
+      }
+
+      if (typeof productFields.category !== "undefined") {
+        conditions.push({ category: { contains: token, mode: "insensitive" } });
+      }
+
+      if (typeof productFields.subcategory !== "undefined") {
+        conditions.push({ subcategory: { contains: token, mode: "insensitive" } });
+      }
+
+      if (typeof productFields.sku !== "undefined") {
+        conditions.push({ sku: { contains: token, mode: "insensitive" } });
+      }
+
+      if (typeof productFields.barcode !== "undefined") {
+        conditions.push({ barcode: { contains: token, mode: "insensitive" } });
+      }
+
+      if (typeof productFields.serial !== "undefined") {
+        conditions.push({ serial: { contains: token, mode: "insensitive" } });
+      }
+
+      return conditions;
+    });
+
+    and.push({
+      OR: [...exactOr, ...tokenOr],
+    });
+  }
+
+  return { AND: and };
+}
+
+function sortAndLimitProducts({ products, tokens, take, budget = null }) {
   return dedupeProducts(products)
     .map((p) => ({
       ...p,
@@ -333,20 +484,71 @@ async function searchProducts({ tenantId, q, take = 3 }) {
     }))
     .sort((a, b) => {
       if (b._score !== a._score) return b._score - a._score;
-      if (Number(b.stockQty || 0) !== Number(a.stockQty || 0)) {
-        return Number(b.stockQty || 0) - Number(a.stockQty || 0);
+
+      if (budget) {
+        const da = Math.abs(Number(a.sellPrice || 0) - budget);
+        const db = Math.abs(Number(b.sellPrice || 0) - budget);
+        if (da !== db) return da - db;
       }
+
+      if (Number(b.availableQty || 0) !== Number(a.availableQty || 0)) {
+        return Number(b.availableQty || 0) - Number(a.availableQty || 0);
+      }
+
       if (Number(a.sellPrice || 0) !== Number(b.sellPrice || 0)) {
         return Number(a.sellPrice || 0) - Number(b.sellPrice || 0);
       }
+
       return String(a.name || "").localeCompare(String(b.name || ""));
     })
-    .filter((p) => p._score > 0)
+    .filter((p) => p._score > 0 || budget)
     .slice(0, take)
     .map(({ _score, ...rest }) => rest);
 }
 
-async function searchProductsByBudgetIntent({ tenantId, text, take = 3 }) {
+async function searchProducts({ tenantId, q, take = 3, branchId = null }) {
+  const query = normalizeText(q);
+  if (!query || query.length < 2) return [];
+
+  const tokens = tokenizeQuery(query);
+  if (tokens.length === 0) return [];
+
+  const productFields = getModelFields(prisma.product);
+  const limit = Math.max(1, Number(take) || 3);
+
+  const products = await prisma.product.findMany({
+    where: buildProductWhere({
+      tenantId,
+      query,
+      tokens,
+    }),
+    select: buildProductSelect(),
+    orderBy: [
+      { stockQty: "desc" },
+      { sellPrice: "asc" },
+      { name: "asc" },
+    ],
+    take: Math.max(20, limit * 6 || 18),
+  });
+
+  const withBranchQty = await attachBranchQuantities({
+    tenantId,
+    branchId,
+    products,
+  });
+
+  return sortAndLimitProducts({
+    products: withBranchQty,
+    tokens,
+    take: limit,
+  }).filter((p) => {
+    if (branchId && prisma.branchInventory) return Number(p.availableQty || 0) > 0;
+    if (typeof productFields.stockQty !== "undefined") return Number(p.stockQty || 0) > 0;
+    return true;
+  });
+}
+
+async function searchProductsByBudgetIntent({ tenantId, text, take = 3, branchId = null }) {
   const budget = extractBudgetFromText(text);
   const brand = detectBrandFromText(text);
   const category = detectCategoryFromText(text);
@@ -358,52 +560,37 @@ async function searchProductsByBudgetIntent({ tenantId, text, take = 3 }) {
     };
   }
 
-  const baseAnd = [{ tenantId }, { isActive: true }, { stockQty: { gt: 0 } }];
-
-  if (brand) {
-    baseAnd.push({
-      OR: [
-        { brand: { contains: brand, mode: "insensitive" } },
-        { name: { contains: brand, mode: "insensitive" } },
-      ],
-    });
-  }
-
-  const categoryWhere = buildCategoryWhere(category);
-  if (categoryWhere) baseAnd.push(categoryWhere);
+  const limit = Math.max(1, Number(take) || 3);
+  const tokens = tokenizeQuery([brand, category].filter(Boolean).join(" "));
 
   let strictProducts = [];
 
   if (budget) {
     strictProducts = await prisma.product.findMany({
-      where: {
-        AND: [
-          ...baseAnd,
-          {
-            sellPrice: {
-              gte: Math.max(0, Math.round(budget * 0.6)),
-              lte: Math.round(budget * 1.15),
-            },
-          },
-        ],
-      },
+      where: buildProductWhere({
+        tenantId,
+        budget,
+        brand,
+        category,
+      }),
       select: buildProductSelect(),
       take: 25,
     });
   }
 
   if (strictProducts.length > 0) {
-    const products = dedupeProducts(strictProducts)
-      .sort((a, b) => {
-        const da = Math.abs(Number(a.sellPrice || 0) - budget);
-        const db = Math.abs(Number(b.sellPrice || 0) - budget);
-        if (da !== db) return da - db;
-        if (Number(b.stockQty || 0) !== Number(a.stockQty || 0)) {
-          return Number(b.stockQty || 0) - Number(a.stockQty || 0);
-        }
-        return String(a.name || "").localeCompare(String(b.name || ""));
-      })
-      .slice(0, take);
+    const withBranchQty = await attachBranchQuantities({
+      tenantId,
+      branchId,
+      products: strictProducts,
+    });
+
+    const products = sortAndLimitProducts({
+      products: withBranchQty,
+      tokens,
+      take: limit,
+      budget,
+    }).filter((p) => Number(p.availableQty ?? p.stockQty ?? 0) > 0);
 
     return {
       products,
@@ -418,26 +605,27 @@ async function searchProductsByBudgetIntent({ tenantId, text, take = 3 }) {
   }
 
   const relaxedProducts = await prisma.product.findMany({
-    where: { AND: baseAnd },
+    where: buildProductWhere({
+      tenantId,
+      brand,
+      category,
+    }),
     select: buildProductSelect(),
     take: 30,
   });
 
-  const products = dedupeProducts(relaxedProducts)
-    .sort((a, b) => {
-      if (budget) {
-        const da = Math.abs(Number(a.sellPrice || 0) - budget);
-        const db = Math.abs(Number(b.sellPrice || 0) - budget);
-        if (da !== db) return da - db;
-      }
+  const withBranchQty = await attachBranchQuantities({
+    tenantId,
+    branchId,
+    products: relaxedProducts,
+  });
 
-      if (Number(b.stockQty || 0) !== Number(a.stockQty || 0)) {
-        return Number(b.stockQty || 0) - Number(a.stockQty || 0);
-      }
-
-      return String(a.name || "").localeCompare(String(b.name || ""));
-    })
-    .slice(0, take);
+  const products = sortAndLimitProducts({
+    products: withBranchQty,
+    tokens,
+    take: limit,
+    budget,
+  }).filter((p) => Number(p.availableQty ?? p.stockQty ?? 0) > 0);
 
   return {
     products,
@@ -451,8 +639,9 @@ async function searchProductsByBudgetIntent({ tenantId, text, take = 3 }) {
   };
 }
 
-async function findBestProductMatch({ tenantId, query }) {
+async function findBestProductMatch({ tenantId, query, branchId = null }) {
   const cleanQuery = normalizeText(query);
+
   if (!cleanQuery) {
     return { kind: "NONE", product: null, candidates: [] };
   }
@@ -461,6 +650,7 @@ async function findBestProductMatch({ tenantId, query }) {
     tenantId,
     q: cleanQuery,
     take: 6,
+    branchId,
   });
 
   if (!candidates.length) {
@@ -474,25 +664,24 @@ async function findBestProductMatch({ tenantId, query }) {
   const normalizedQuery = normalizeLower(cleanQuery);
   const tokens = tokenizeQuery(cleanQuery);
 
-  const exactName = candidates.find(
-    (p) => normalizeLower(p.name) === normalizedQuery
-  );
+  const exactName = candidates.find((p) => normalizeLower(p.name) === normalizedQuery);
   if (exactName) {
     return { kind: "ONE", product: exactName, candidates };
   }
 
-  const exactSku = candidates.find(
-    (p) => normalizeLower(p.sku) === normalizedQuery
-  );
+  const exactSku = candidates.find((p) => normalizeLower(p.sku) === normalizedQuery);
   if (exactSku) {
     return { kind: "ONE", product: exactSku, candidates };
   }
 
-  const exactBarcode = candidates.find(
-    (p) => normalizeLower(p.barcode) === normalizedQuery
-  );
+  const exactBarcode = candidates.find((p) => normalizeLower(p.barcode) === normalizedQuery);
   if (exactBarcode) {
     return { kind: "ONE", product: exactBarcode, candidates };
+  }
+
+  const exactSerial = candidates.find((p) => normalizeLower(p.serial) === normalizedQuery);
+  if (exactSerial) {
+    return { kind: "ONE", product: exactSerial, candidates };
   }
 
   const scored = candidates.map((p) => ({
@@ -530,16 +719,27 @@ function formatProductLine(p) {
   return pieces.join(" • ");
 }
 
+function availabilityLine(product) {
+  const qty = Number(product?.availableQty ?? product?.stockQty ?? 0);
+
+  if (qty <= 0) {
+    return "📦 Availability: our team will confirm";
+  }
+
+  return `📦 Available: ${Math.round(qty)}`;
+}
+
 function buildProductsReply({ businessName, q, products }) {
   if (!products || products.length === 0) {
     return (
       `❌ *${businessName}*\n` +
-      `I could not find "${q}" in stock right now.\n` +
+      `I could not find "${q}" available right now.\n` +
       `Reply with another model name, SKU, barcode, or brand.`
     );
   }
 
   const lines = [];
+
   lines.push(`✅ *${businessName}*`);
   lines.push(`Here are the closest matches for: "${q}"`);
   lines.push("");
@@ -548,11 +748,13 @@ function buildProductsReply({ businessName, q, products }) {
     lines.push(`📦 *${p.name}*`);
     if (formatProductLine(p)) lines.push(`${formatProductLine(p)}`);
     lines.push(`💰 Price: ${formatMoneyRwf(p.sellPrice)}`);
-    lines.push(`📦 In stock: ${p.stockQty}`);
+    lines.push(availabilityLine(p));
     lines.push("");
   }
 
   lines.push(`To reserve, reply: *BUY <exact product name>*`);
+  lines.push(`Our team will confirm pickup or delivery details.`);
+
   return lines.join("\n").trim();
 }
 
@@ -560,12 +762,13 @@ function buildBudgetProductsReply({ businessName, originalText, products, meta }
   if (!products || products.length === 0) {
     return (
       `❌ *${businessName}*\n` +
-      `I could not find a close in-stock match for "${originalText}".\n` +
+      `I could not find a close available match for "${originalText}".\n` +
       `Reply with a model name, exact brand, SKU, or barcode.`
     );
   }
 
   const lines = [];
+
   lines.push(`✅ *${businessName}*`);
 
   if (meta?.relaxed) {
@@ -576,6 +779,7 @@ function buildBudgetProductsReply({ businessName, originalText, products, meta }
   }
 
   const hints = [];
+
   if (meta?.brand) hints.push(`brand: ${meta.brand}`);
   if (meta?.category) hints.push(`type: ${meta.category}`);
   if (meta?.budget) hints.push(`budget: ${formatMoneyRwf(meta.budget)}`);
@@ -590,40 +794,50 @@ function buildBudgetProductsReply({ businessName, originalText, products, meta }
     lines.push(`📦 *${p.name}*`);
     if (formatProductLine(p)) lines.push(`${formatProductLine(p)}`);
     lines.push(`💰 Price: ${formatMoneyRwf(p.sellPrice)}`);
-    lines.push(`📦 In stock: ${p.stockQty}`);
+    lines.push(availabilityLine(p));
     lines.push("");
   }
 
   lines.push(`To reserve, reply: *BUY <exact product name>*`);
+  lines.push(`Our team will confirm pickup or delivery details.`);
+
   return lines.join("\n").trim();
 }
 
 function buildBuyCreatedReply({ businessName, product, quantity, draftId }) {
   const code = String(draftId || "").slice(-6).toUpperCase();
+  const qty = Math.max(1, Number(quantity || 1));
+  const total = Number(product?.sellPrice || 0) * qty;
 
   const lines = [];
+
   lines.push(`✅ *${businessName}*`);
-  lines.push(`Your draft order has been created.`);
+  lines.push(`Your order request has been prepared.`);
   lines.push("");
   lines.push(`📦 Product: *${product.name}*`);
-  lines.push(`🔢 Quantity: *${quantity}*`);
+  lines.push(`🔢 Quantity: *${qty}*`);
   lines.push(`💰 Unit price: ${formatMoneyRwf(product.sellPrice)}`);
   lines.push(`🧾 Draft code: *${code}*`);
+  lines.push(`Estimated total: *${formatMoneyRwf(total)}*`);
   lines.push("");
-  lines.push(`Our staff can now review and finalize your order.`);
+  lines.push(`Our staff will review and finalize your order.`);
+  lines.push(`To pay later, send: *PAY ${Math.round(total)} MOMO YOUR_REF #${code}*`);
 
   return lines.join("\n");
 }
 
 function buildBuyMultipleReply({ businessName, query, candidates }) {
   const lines = [];
+
   lines.push(`⚠️ *${businessName}*`);
   lines.push(`I found multiple matches for "${query}".`);
   lines.push(`Please reply with the exact product name:`);
   lines.push("");
 
   for (const p of candidates || []) {
-    lines.push(`• *${p.name}* — ${formatMoneyRwf(p.sellPrice)} — Stock ${p.stockQty}`);
+    lines.push(
+      `• *${p.name}* — ${formatMoneyRwf(p.sellPrice)} — ${availabilityLine(p).replace("📦 ", "")}`
+    );
   }
 
   return lines.join("\n");

@@ -22,6 +22,10 @@ function normalizeText(value) {
   return s || null;
 }
 
+function normalizeLower(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
 function collapseSpaces(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
@@ -34,8 +38,27 @@ function safeJsonParse(text) {
   }
 }
 
+function extractJsonObject(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+
+  const direct = safeJsonParse(raw);
+  if (direct) return direct;
+
+  const firstBrace = raw.indexOf("{");
+  const lastBrace = raw.lastIndexOf("}");
+
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    return null;
+  }
+
+  const sliced = raw.slice(firstBrace, lastBrace + 1);
+  return safeJsonParse(sliced);
+}
+
 function clampStringArray(arr, max = 8) {
   if (!Array.isArray(arr)) return [];
+
   return arr
     .map((x) => normalizeText(x))
     .filter(Boolean)
@@ -44,40 +67,155 @@ function clampStringArray(arr, max = 8) {
 
 function clampConfidence(value) {
   const n = Number(value);
+
   if (!Number.isFinite(n)) return 0;
   if (n < 0) return 0;
   if (n > 1) return 1;
+
   return n;
 }
 
 function cleanSearchQuery(value) {
   const text = collapseSpaces(
     String(value || "")
-      .replace(/[^\p{L}\p{N}\s/+.-]/gu, " ")
-      .replace(/\b(price|stock|available|availability|how much|cost|buy|order|please|need|want)\b/gi, " ")
+      .replace(/[^\p{L}\p{N}\s/+._-]/gu, " ")
+      .replace(
+        /\b(price|stock|available|availability|how much|cost|buy|order|reserve|book|please|pls|need|want|do you have|have you got|murafite|mufite|igiciro|angahe|ndashaka|nkeneye|ndayishaka)\b/gi,
+        " "
+      )
+      .replace(/\s+/g, " ")
   );
 
   return text && text.length >= 2 ? text : null;
 }
 
+function normalizeKnownBrand(value) {
+  const raw = normalizeLower(value);
+  if (!raw) return null;
+
+  const map = {
+    iphone: "Apple",
+    apple: "Apple",
+    samsung: "Samsung",
+    tecno: "Tecno",
+    infinix: "Infinix",
+    itel: "Itel",
+    nokia: "Nokia",
+    xiaomi: "Xiaomi",
+    redmi: "Redmi",
+    oppo: "Oppo",
+    vivo: "Vivo",
+    huawei: "Huawei",
+    pixel: "Google",
+    google: "Google",
+    hp: "HP",
+    dell: "Dell",
+    lenovo: "Lenovo",
+    asus: "Asus",
+    acer: "Acer",
+    msi: "MSI",
+    macbook: "Apple",
+    canon: "Canon",
+    epson: "Epson",
+    brother: "Brother",
+    logitech: "Logitech",
+    anker: "Anker",
+    oraimo: "Oraimo",
+    jbl: "JBL",
+    sony: "Sony",
+    bose: "Bose",
+    sandisk: "SanDisk",
+    kingston: "Kingston",
+    seagate: "Seagate",
+    wd: "WD",
+    tplink: "TP-Link",
+    "tp-link": "TP-Link",
+    mikrotik: "MikroTik",
+  };
+
+  return map[raw] || normalizeText(value);
+}
+
+function normalizeCategory(value) {
+  const raw = normalizeLower(value);
+  if (!raw) return null;
+
+  if (/\b(phone|smartphone|mobile|telephone|iphone|galaxy)\b/i.test(raw)) return "phone";
+  if (/\b(laptop|computer|notebook|pc|macbook)\b/i.test(raw)) return "laptop";
+  if (/\b(charger|adapter)\b/i.test(raw)) return "charger";
+  if (/\b(cable|usb|type c|type-c|usb-c|lightning)\b/i.test(raw)) return "cable";
+  if (/\b(airpods|earbuds|earphones|headphones|pods|headset)\b/i.test(raw)) return "audio";
+  if (/\b(speaker|bluetooth speaker)\b/i.test(raw)) return "speaker";
+  if (/\b(power bank|powerbank)\b/i.test(raw)) return "power bank";
+  if (/\b(watch|smartwatch)\b/i.test(raw)) return "watch";
+  if (/\b(mouse)\b/i.test(raw)) return "mouse";
+  if (/\b(keyboard)\b/i.test(raw)) return "keyboard";
+  if (/\b(router|modem|wifi|wi-fi)\b/i.test(raw)) return "network";
+  if (/\b(printer)\b/i.test(raw)) return "printer";
+  if (/\b(flash|usb drive|memory card|ssd|hard drive|hdd)\b/i.test(raw)) return "storage";
+  if (/\b(case|cover)\b/i.test(raw)) return "case";
+  if (/\b(screen protector|protector)\b/i.test(raw)) return "screen protector";
+
+  return normalizeText(value);
+}
+
+function inferQueryFromParts(data, fallbackText) {
+  const parts = [
+    data.brand,
+    data.model,
+    data.storage,
+    data.color,
+    data.condition,
+    data.productType,
+    data.category,
+  ]
+    .map(normalizeText)
+    .filter(Boolean);
+
+  const built = cleanSearchQuery(parts.join(" "));
+  if (built) return built;
+
+  return cleanSearchQuery(fallbackText);
+}
+
 function normalizeAiExtraction(raw, fallbackText = null) {
   const data = raw && typeof raw === "object" ? raw : {};
 
+  const brand = normalizeKnownBrand(data.brand);
+  const category = normalizeCategory(data.category);
+  const productType = normalizeText(data.productType);
+  const model = normalizeText(data.model);
+  const storage = normalizeText(data.storage);
+  const color = normalizeText(data.color);
+  const condition = normalizeText(data.condition);
+
   const normalizedQuery =
     cleanSearchQuery(data.normalizedQuery) ||
-    cleanSearchQuery(data.model) ||
-    cleanSearchQuery(data.productType) ||
-    cleanSearchQuery(fallbackText);
+    cleanSearchQuery(model) ||
+    cleanSearchQuery([brand, model, storage].filter(Boolean).join(" ")) ||
+    cleanSearchQuery(productType) ||
+    inferQueryFromParts(
+      {
+        brand,
+        category,
+        productType,
+        model,
+        storage,
+        color,
+        condition,
+      },
+      fallbackText
+    );
 
   return {
     normalizedQuery,
-    brand: normalizeText(data.brand),
-    category: normalizeText(data.category),
-    productType: normalizeText(data.productType),
-    model: normalizeText(data.model),
-    storage: normalizeText(data.storage),
-    color: normalizeText(data.color),
-    condition: normalizeText(data.condition),
+    brand,
+    category,
+    productType,
+    model,
+    storage,
+    color,
+    condition,
     accessories: clampStringArray(data.accessories),
     alternatives: clampStringArray(data.alternatives),
     confidence: clampConfidence(data.confidence),
@@ -114,6 +252,7 @@ async function extractProductIntent({ messageText }) {
   }
 
   let openai;
+
   try {
     openai = getClient();
   } catch (err) {
@@ -123,19 +262,31 @@ async function extractProductIntent({ messageText }) {
   const system = `
 You extract shopping intent from a customer's WhatsApp message for a retail inventory system.
 
-Your job:
-- understand what product the customer most likely means
-- rewrite that into a short database-friendly search query
-- do not invent stock, price, or availability
-- do not invent exact model details if the message is unclear
-- prefer a concise normalized search phrase useful for inventory lookup
+Business context:
+- The store may sell phones, laptops, accessories, chargers, cables, audio devices, routers, printers, storage, and electronics.
+- The customer may write in English, French, simple Kinyarwanda, or mixed wording.
+- Your output is used only for product lookup.
+- Do not invent price, stock, branch, payment status, or availability.
+- Do not expose internal branches to the customer.
+- Do not create an order.
+- Do not assume exact model details if unclear.
 
-Rules:
-- return JSON only
-- do not include markdown
-- keep normalizedQuery short and practical
+Your job:
+- identify the product the customer likely means
+- rewrite it into a short database-friendly search query
+- keep useful model words such as A14, S23, iPhone 13, Type-C, 128GB, HP, Dell, charger
 - if unclear, set needsHumanReview to true
 - confidence must be between 0 and 1
+
+Kinyarwanda examples:
+- "mufite iphone 13?" means product query for iPhone 13
+- "igiciro cya type c charger" means price query for Type-C charger
+- "ndashaka samsung" means customer wants Samsung product
+- "nkeneye chargeur" means customer needs charger
+
+Return JSON only.
+Do not include markdown.
+Do not include explanations outside JSON.
 
 Return exactly this JSON shape:
 {
@@ -174,7 +325,7 @@ Extract only what is reasonably supported by the message.
     });
 
     const outputText = response.output_text || "";
-    const parsed = safeJsonParse(outputText);
+    const parsed = extractJsonObject(outputText);
 
     if (!parsed) {
       return buildFallbackExtraction(text, "AI returned non-JSON output");
@@ -198,6 +349,7 @@ function shouldUseAiFallback({ text, deterministicQuery, searchResultsCount }) {
   const cleanDeterministic = cleanSearchQuery(deterministicQuery);
 
   if (!cleanText) return false;
+
   if (Number(searchResultsCount || 0) > 0) return false;
 
   if (!cleanDeterministic) return true;
@@ -207,6 +359,15 @@ function shouldUseAiFallback({ text, deterministicQuery, searchResultsCount }) {
 
   if (rawLower === deterministicLower) return false;
 
+  const hasHumanLanguage =
+    /\b(mufite|murafite|igiciro|angahe|ndashaka|nkeneye|ndayishaka|nabona|combien|bonjour)\b/i.test(
+      cleanText
+    );
+
+  const hasManyWords = cleanText.split(/\s+/).filter(Boolean).length >= 3;
+
+  if (hasHumanLanguage) return true;
+  if (hasManyWords) return true;
   if (cleanText.length >= 4) return true;
 
   return false;
@@ -215,4 +376,8 @@ function shouldUseAiFallback({ text, deterministicQuery, searchResultsCount }) {
 module.exports = {
   extractProductIntent,
   shouldUseAiFallback,
+
+  // helpful for safe testing later
+  cleanSearchQuery,
+  normalizeAiExtraction,
 };

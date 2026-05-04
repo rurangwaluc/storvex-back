@@ -55,9 +55,28 @@ function normalizeSaleType(value) {
 }
 
 function normalizePaymentMethod(value) {
-  const v = String(value || "CASH").toUpperCase();
-  if (v === "MOMO" || v === "BANK" || v === "OTHER" || v === "CASH") return v;
-  return "CASH";
+  const v = String(value || "MOMO").toUpperCase();
+
+  if (v === "MOMO" || v === "MOBILE_MONEY" || v === "MTN_MOMO") return "MOMO";
+  if (v === "BANK" || v === "BANK_TRANSFER" || v === "TRANSFER") return "BANK";
+  if (v === "CARD" || v === "VISA" || v === "MASTERCARD") return "CARD";
+  if (v === "CASH") return "CASH";
+  if (v === "OTHER") return "OTHER";
+
+  return "MOMO";
+}
+
+function getModelFields(delegate) {
+  try {
+    return delegate?.fields || {};
+  } catch {
+    return {};
+  }
+}
+
+function modelHasField(delegate, fieldName) {
+  const fields = getModelFields(delegate);
+  return typeof fields[fieldName] !== "undefined";
 }
 
 function verifySignature(headerValue, rawBodyBuffer) {
@@ -121,12 +140,12 @@ function extractInboundMessages(payload) {
           type === "text"
             ? msg?.text?.body || null
             : type === "button"
-            ? msg?.button?.text || null
-            : type === "interactive"
-            ? msg?.interactive?.button_reply?.title ||
-              msg?.interactive?.list_reply?.title ||
-              null
-            : null;
+              ? msg?.button?.text || null
+              : type === "interactive"
+                ? msg?.interactive?.button_reply?.title ||
+                  msg?.interactive?.list_reply?.title ||
+                  null
+                : null;
 
         out.push({
           waId: waId || msg?.from || null,
@@ -295,6 +314,7 @@ function buildPayReply({ businessName, amount, method, reference, updatedSale })
   const due = updatedSale?.dueDate
     ? new Date(updatedSale.dueDate).toISOString().slice(0, 10)
     : "N/A";
+
   const bal = updatedSale?.balanceDue ?? 0;
   const code = saleCodeFromId(updatedSale?.id);
 
@@ -320,13 +340,119 @@ function buildPayReply({ businessName, amount, method, reference, updatedSale })
   return lines.join("\n");
 }
 
+function buildBranchPendingReply({ businessName, query }) {
+  const lines = [];
+  lines.push(`✅ *${businessName}*`);
+  lines.push(`We received your request${query ? ` for *${query}*` : ""}.`);
+  lines.push(`Our team will confirm availability and prepare your order shortly.`);
+  lines.push("");
+  lines.push(`You do not need to choose a branch. We will handle it internally.`);
+  return lines.join("\n");
+}
+
+async function getMainBranchId(tenantId) {
+  if (!tenantId || !prisma.branch) return null;
+
+  const main = await prisma.branch.findFirst({
+    where: {
+      tenantId,
+      status: "ACTIVE",
+      isMain: true,
+    },
+    select: { id: true },
+  });
+
+  if (main?.id) return main.id;
+
+  const first = await prisma.branch.findFirst({
+    where: {
+      tenantId,
+      status: "ACTIVE",
+    },
+    orderBy: [{ isMain: "desc" }, { createdAt: "asc" }],
+    select: { id: true },
+  });
+
+  return first?.id || null;
+}
+
+async function resolveConversationBranchId(convo) {
+  if (convo?.branchId) return convo.branchId;
+  return null;
+}
+
+async function attachConversationBranchIfPossible(tx, { tenantId, conversationId, branchId }) {
+  if (!tenantId || !conversationId || !branchId) return;
+  if (!modelHasField(tx.whatsAppConversation, "branchId")) return;
+
+  await tx.whatsAppConversation.updateMany({
+    where: {
+      id: String(conversationId),
+      tenantId,
+    },
+    data: {
+      branchId,
+      updatedAt: new Date(),
+    },
+  });
+}
+
+async function getBranchStockMap(tx, { tenantId, branchId, productIds }) {
+  if (!tx.branchInventory || !branchId) return null;
+
+  const rows = await tx.branchInventory.findMany({
+    where: {
+      tenantId,
+      branchId,
+      productId: {
+        in: productIds,
+      },
+    },
+    select: {
+      productId: true,
+      qtyOnHand: true,
+    },
+  });
+
+  return new Map(rows.map((row) => [row.productId, Number(row.qtyOnHand || 0)]));
+}
+
+async function assertProductAvailableForBranch(tx, { tenantId, branchId, product, quantity }) {
+  if (!product?.id) throw appError("PRODUCT_NOT_FOUND");
+
+  const qty = Number(quantity || 0);
+  if (!Number.isFinite(qty) || qty <= 0) throw appError("INVALID_QUANTITY");
+
+  const stockMap = await getBranchStockMap(tx, {
+    tenantId,
+    branchId,
+    productIds: [product.id],
+  });
+
+  const available =
+    stockMap instanceof Map ? Number(stockMap.get(product.id) || 0) : Number(product.stockQty || 0);
+
+  if (available < qty) {
+    throw appError("INSUFFICIENT_BRANCH_STOCK", {
+      productId: product.id,
+      productName: product.name,
+      available,
+      needed: qty,
+    });
+  }
+
+  return { available, usingBranchInventory: stockMap instanceof Map };
+}
+
 async function findOutstandingSaleForPay({ tenantId, customerPhone, saleCode }) {
   const phone = String(customerPhone || "").replace(/[^\d]/g, "");
+
   if (!tenantId || !phone) {
     return { ok: false, code: "INVALID_ARGS" };
   }
 
   const now = new Date();
+  const saleFields = getModelFields(prisma.sale);
 
   const outstanding = await prisma.sale.findMany({
     where: {
@@ -340,6 +466,7 @@ async function findOutstandingSaleForPay({ tenantId, customerPhone, saleCode }) 
     orderBy: [{ createdAt: "asc" }],
     select: {
       id: true,
+      ...(typeof saleFields.branchId !== "undefined" ? { branchId: true } : {}),
       total: true,
       amountPaid: true,
       balanceDue: true,
@@ -414,6 +541,9 @@ async function applyPaymentToSale({
 
   try {
     return await prisma.$transaction(async (tx) => {
+      const saleFields = getModelFields(tx.sale);
+      const paymentFields = getModelFields(tx.salePayment);
+
       const sale = await tx.sale.findFirst({
         where: {
           id: saleId,
@@ -423,6 +553,7 @@ async function applyPaymentToSale({
         },
         select: {
           id: true,
+          ...(typeof saleFields.branchId !== "undefined" ? { branchId: true } : {}),
           total: true,
           amountPaid: true,
           balanceDue: true,
@@ -447,12 +578,22 @@ async function applyPaymentToSale({
         data: {
           saleId: sale.id,
           tenantId,
+          ...(typeof paymentFields.branchId !== "undefined" && sale.branchId
+            ? { branchId: sale.branchId }
+            : {}),
           receivedById: receivedByUserId || null,
           amount: payAmount,
           method: normalizedMethod,
           note,
         },
-        select: { id: true, amount: true, method: true, createdAt: true, note: true },
+        select: {
+          id: true,
+          amount: true,
+          method: true,
+          createdAt: true,
+          note: true,
+          ...(typeof paymentFields.branchId !== "undefined" ? { branchId: true } : {}),
+        },
       });
 
       const newPaid = Number(sale.amountPaid) + payAmount;
@@ -476,6 +617,7 @@ async function applyPaymentToSale({
         },
         select: {
           id: true,
+          ...(typeof saleFields.branchId !== "undefined" ? { branchId: true } : {}),
           total: true,
           amountPaid: true,
           balanceDue: true,
@@ -492,6 +634,7 @@ async function applyPaymentToSale({
         action: "WHATSAPP_PAYMENT_RECORDED",
         metadata: {
           saleId: sale.id,
+          branchId: sale.branchId || null,
           amount: payAmount,
           method: normalizedMethod,
           reference,
@@ -505,6 +648,7 @@ async function applyPaymentToSale({
     if (err && err.code === "P2002") {
       return { ok: false, code: "DUP_REFERENCE" };
     }
+
     throw err;
   }
 }
@@ -545,9 +689,16 @@ async function createOrUpdateWhatsAppDraftFromBuy({
   conversationId,
   customerId,
   cashierId,
+  branchId,
   product,
   quantity,
 }) {
+  if (!branchId) {
+    throw appError("BRANCH_REQUIRED_FOR_WHATSAPP_DRAFT");
+  }
+
+  const saleFields = getModelFields(prisma.sale);
+
   const existingDraft = await prisma.sale.findFirst({
     where: {
       tenantId,
@@ -555,16 +706,25 @@ async function createOrUpdateWhatsAppDraftFromBuy({
       isDraft: true,
       draftSource: "WHATSAPP",
       isCancelled: false,
+      ...(typeof saleFields.branchId !== "undefined" ? { branchId } : {}),
     },
     orderBy: { createdAt: "desc" },
     select: {
       id: true,
       saleType: true,
       dueDate: true,
+      ...(typeof saleFields.branchId !== "undefined" ? { branchId: true } : {}),
     },
   });
 
   return prisma.$transaction(async (tx) => {
+    await assertProductAvailableForBranch(tx, {
+      tenantId,
+      branchId,
+      product,
+      quantity,
+    });
+
     if (existingDraft) {
       const existingItem = await tx.saleItem.findFirst({
         where: {
@@ -623,6 +783,12 @@ async function createOrUpdateWhatsAppDraftFromBuy({
         },
       });
 
+      await attachConversationBranchIfPossible(tx, {
+        tenantId,
+        conversationId,
+        branchId,
+      });
+
       await createAuditLogSafe({
         tenantId,
         userId: cashierId || null,
@@ -633,6 +799,7 @@ async function createOrUpdateWhatsAppDraftFromBuy({
           source: "WHATSAPP",
           conversationId,
           customerId,
+          branchId,
           productId: product.id,
           quantityAdded: quantity,
         },
@@ -655,6 +822,7 @@ async function createOrUpdateWhatsAppDraftFromBuy({
         tenantId,
         cashierId,
         customerId: customerId || null,
+        ...(typeof getModelFields(tx.sale).branchId !== "undefined" ? { branchId } : {}),
         total,
         saleType: normalizeSaleType("CREDIT"),
         amountPaid: 0,
@@ -681,6 +849,12 @@ async function createOrUpdateWhatsAppDraftFromBuy({
         where: { id: conversationId },
         data: { customerId: customerId || null },
       });
+
+      await attachConversationBranchIfPossible(tx, {
+        tenantId,
+        conversationId,
+        branchId,
+      });
     }
 
     await createAuditLogSafe({
@@ -693,6 +867,7 @@ async function createOrUpdateWhatsAppDraftFromBuy({
         source: "WHATSAPP",
         conversationId,
         customerId,
+        branchId,
         productId: product.id,
         quantity,
       },
@@ -848,11 +1023,7 @@ async function resolveBusinessName(tenantId, account) {
     select: { name: true },
   });
 
-  return (
-    normalizeText(account?.businessName) ||
-    normalizeText(tenant?.name) ||
-    "our store"
-  );
+  return normalizeText(account?.businessName) || normalizeText(tenant?.name) || "our store";
 }
 
 async function resolveConversationAndCustomer({ tenantId, accountId, from }) {
@@ -868,6 +1039,8 @@ async function resolveConversationAndCustomer({ tenantId, accountId, from }) {
     select: { id: true },
   });
 
+  const conversationFields = getModelFields(prisma.whatsAppConversation);
+
   let convo = await prisma.whatsAppConversation.findFirst({
     where: {
       tenantId,
@@ -878,6 +1051,7 @@ async function resolveConversationAndCustomer({ tenantId, accountId, from }) {
     select: {
       id: true,
       assignedToId: true,
+      ...(typeof conversationFields.branchId !== "undefined" ? { branchId: true } : {}),
     },
     orderBy: { updatedAt: "desc" },
   });
@@ -890,10 +1064,12 @@ async function resolveConversationAndCustomer({ tenantId, accountId, from }) {
         customerId: customer.id,
         phone: from,
         status: "OPEN",
+        ...(typeof conversationFields.branchId !== "undefined" ? { branchId: null } : {}),
       },
       select: {
         id: true,
         assignedToId: true,
+        ...(typeof conversationFields.branchId !== "undefined" ? { branchId: true } : {}),
       },
     });
 
@@ -906,6 +1082,8 @@ async function resolveConversationAndCustomer({ tenantId, accountId, from }) {
         phone: from,
         accountId,
         source: "WEBHOOK",
+        branchId: null,
+        branchRule: "Customer sees one store WhatsApp number. Branch is assigned internally.",
       },
     });
   }
@@ -962,6 +1140,7 @@ async function handlePayIntent({ tenantId, account, convo, from, businessName, p
 
   if (dup) {
     const reply = `⚠️ *${businessName}*\nThat payment reference was already recorded.\nRef: ${reference}`;
+
     await safeSendAndLog({
       account,
       tenantId,
@@ -970,6 +1149,7 @@ async function handlePayIntent({ tenantId, account, convo, from, businessName, p
       text: reply,
       auditAction: "WHATSAPP_AUTO_REPLY_SENT",
     });
+
     await bumpConvo(convo.id);
     return;
   }
@@ -987,7 +1167,7 @@ async function handlePayIntent({ tenantId, account, convo, from, businessName, p
       reply =
         `❌ *${businessName}*\n` +
         `I cannot find an unpaid order for this number.\n` +
-        `Ask for a product first, then staff can create a draft or sale.`;
+        `Ask for a product first, then staff can prepare the order.`;
     } else if (target.code === "SALE_CODE_NOT_FOUND") {
       reply =
         `❌ *${businessName}*\n` +
@@ -1003,6 +1183,7 @@ async function handlePayIntent({ tenantId, account, convo, from, businessName, p
       text: reply,
       auditAction: "WHATSAPP_AUTO_REPLY_SENT",
     });
+
     await bumpConvo(convo.id);
     return;
   }
@@ -1019,6 +1200,7 @@ async function handlePayIntent({ tenantId, account, convo, from, businessName, p
 
     if (!applied.ok) {
       const reply = `❌ *${businessName}*\nPayment failed. Please try again.`;
+
       await safeSendAndLog({
         account,
         tenantId,
@@ -1027,6 +1209,7 @@ async function handlePayIntent({ tenantId, account, convo, from, businessName, p
         text: reply,
         auditAction: "WHATSAPP_AUTO_REPLY_SENT",
       });
+
       await bumpConvo(convo.id);
       return;
     }
@@ -1062,6 +1245,7 @@ async function handlePayIntent({ tenantId, account, convo, from, businessName, p
         metadata: {
           reason: "SALE_FULLY_PAID",
           saleId: target.sale.id,
+          branchId: applied.updatedSale.branchId || target.sale.branchId || null,
         },
       });
     }
@@ -1071,6 +1255,7 @@ async function handlePayIntent({ tenantId, account, convo, from, businessName, p
     console.error("WHATSAPP: applyPaymentToSale error:", err);
 
     const reply = `❌ *${businessName}*\nPayment failed. Please try again.`;
+
     await safeSendAndLog({
       account,
       tenantId,
@@ -1079,6 +1264,7 @@ async function handlePayIntent({ tenantId, account, convo, from, businessName, p
       text: reply,
       auditAction: "WHATSAPP_AUTO_REPLY_SENT",
     });
+
     await bumpConvo(convo.id);
   }
 }
@@ -1111,6 +1297,7 @@ async function handleBuyIntent({
         text: reply,
         auditAction: "WHATSAPP_AUTO_REPLY_SENT",
       });
+
       await bumpConvo(convo.id);
       return;
     }
@@ -1130,17 +1317,19 @@ async function handleBuyIntent({
         text: reply,
         auditAction: "WHATSAPP_AUTO_REPLY_SENT",
       });
+
       await bumpConvo(convo.id);
       return;
     }
 
     const product = match.product;
+    const branchId = await resolveConversationBranchId(convo);
 
-    if (Number(product.stockQty || 0) < quantity) {
-      const reply =
-        `❌ *${businessName}*\n` +
-        `Requested quantity is higher than available stock.\n` +
-        `Available: *${product.stockQty}*`;
+    if (!branchId) {
+      const reply = buildBranchPendingReply({
+        businessName,
+        query,
+      });
 
       await safeSendAndLog({
         account,
@@ -1148,8 +1337,25 @@ async function handleBuyIntent({
         convoId: convo.id,
         to: from,
         text: reply,
-        auditAction: "WHATSAPP_AUTO_REPLY_SENT",
+        auditAction: "WHATSAPP_BRANCH_PENDING_REPLY_SENT",
       });
+
+      await createAuditLogSafe({
+        tenantId,
+        entity: "WHATSAPP_CONVERSATION",
+        entityId: convo.id,
+        action: "WHATSAPP_BUY_WAITING_BRANCH",
+        metadata: {
+          source: "WEBHOOK",
+          customerId: customer.id,
+          phone: from,
+          productId: product.id,
+          productName: product.name,
+          quantity,
+          branchRequired: true,
+        },
+      });
+
       await bumpConvo(convo.id);
       return;
     }
@@ -1164,6 +1370,7 @@ async function handleBuyIntent({
       conversationId: convo.id,
       customerId: customer.id,
       cashierId,
+      branchId,
       product,
       quantity,
     });
@@ -1188,11 +1395,23 @@ async function handleBuyIntent({
   } catch (err) {
     console.error("WHATSAPP: BUY flow error:", err);
 
-    const reply =
+    let reply = `❌ *${businessName}*\nI could not create the order request right now. Please try again.`;
+
+    if (
       err?.message === "NO_ACTIVE_STAFF_FOR_WHATSAPP_DRAFT" ||
       err?.code === "NO_ACTIVE_STAFF_FOR_WHATSAPP_DRAFT"
-        ? `❌ *${businessName}*\nI found the product, but I cannot create the draft because no active staff account is available for this store.`
-        : `❌ *${businessName}*\nI could not create the draft right now. Please try again.`;
+    ) {
+      reply =
+        `❌ *${businessName}*\n` +
+        `I found the product, but I cannot create the draft because no active staff account is available for this store.`;
+    }
+
+    if (err?.code === "INSUFFICIENT_BRANCH_STOCK") {
+      reply =
+        `❌ *${businessName}*\n` +
+        `Requested quantity is higher than available stock.\n` +
+        `Available: *${err.available}*`;
+    }
 
     await safeSendAndLog({
       account,
@@ -1202,6 +1421,7 @@ async function handleBuyIntent({
       text: reply,
       auditAction: "WHATSAPP_AUTO_REPLY_SENT",
     });
+
     await bumpConvo(convo.id);
   }
 }
@@ -1217,6 +1437,7 @@ async function handleProductQueryIntent({
 }) {
   if (!directQuery) {
     const reply = buildWelcomeReply({ businessName });
+
     await safeSendAndLog({
       account,
       tenantId,
@@ -1225,6 +1446,7 @@ async function handleProductQueryIntent({
       text: reply,
       auditAction: "WHATSAPP_WELCOME_SENT",
     });
+
     await bumpConvo(convo.id);
     return;
   }
@@ -1261,6 +1483,7 @@ async function handleProductQueryIntent({
       text: reply,
       auditAction: "WHATSAPP_PRODUCT_REPLY_SENT",
     });
+
     await bumpConvo(convo.id);
     return;
   }
@@ -1279,6 +1502,7 @@ async function handleProductQueryIntent({
     text: reply,
     auditAction: "WHATSAPP_AUTO_REPLY_SENT",
   });
+
   await bumpConvo(convo.id);
 }
 
@@ -1295,6 +1519,7 @@ async function handleGreetingOrUnknownIntent({
 
   if (outboundCount === 0) {
     const welcome = buildWelcomeReply({ businessName });
+
     await safeSendAndLog({
       account,
       tenantId,
@@ -1324,6 +1549,7 @@ async function processWebhookPayload({ headers, rawBody, body }) {
   }
 
   const phoneNumberId = extractPhoneNumberId(body);
+
   if (!phoneNumberId) {
     console.error("WHATSAPP: missing metadata.phone_number_id.");
     return;
@@ -1356,6 +1582,7 @@ async function handleInboundWebhook({ account, payload, inbound }) {
   for (const message of inbound) {
     const text = normalizeText(message?.text) || "";
     const from = normalizePhone(message?.waId || message?.from);
+
     if (!from) continue;
 
     try {

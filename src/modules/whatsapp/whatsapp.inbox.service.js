@@ -15,7 +15,6 @@ function normalizeId(value) {
   return s || null;
 }
 
-
 function normalizeText(value) {
   const s = String(value || "").trim();
   return s || null;
@@ -42,7 +41,13 @@ function normalizeSaleType(value) {
 
 function normalizePaymentMethod(value) {
   const v = String(value || "CASH").toUpperCase();
-  if (v === "CASH" || v === "MOMO" || v === "BANK" || v === "OTHER") return v;
+
+  if (v === "CASH") return "CASH";
+  if (v === "MOMO" || v === "MOBILE_MONEY" || v === "MTN_MOMO") return "MOMO";
+  if (v === "BANK" || v === "BANK_TRANSFER" || v === "TRANSFER") return "BANK";
+  if (v === "CARD" || v === "VISA" || v === "MASTERCARD") return "CARD";
+  if (v === "OTHER") return "OTHER";
+
   return "CASH";
 }
 
@@ -64,16 +69,27 @@ function toInt(value, fallback = NaN) {
 
 function safeDate(value) {
   if (!value) return null;
+
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
 function getModelFields(delegate) {
-  return delegate?.fields || {};
+  try {
+    return delegate?.fields || {};
+  } catch {
+    return {};
+  }
+}
+
+function modelHasField(delegate, fieldName) {
+  const fields = getModelFields(delegate);
+  return typeof fields[fieldName] !== "undefined";
 }
 
 function buildCustomerSelectShape(delegate = prisma.customer) {
   const fields = getModelFields(delegate);
+
   return {
     id: true,
     name: true,
@@ -116,6 +132,7 @@ function buildDraftSaleSelectShape(delegate = prisma.sale) {
     tenantId: true,
     cashierId: true,
     customerId: true,
+    ...(typeof saleFields.branchId !== "undefined" ? { branchId: true } : {}),
     total: true,
     saleType: true,
     amountPaid: true,
@@ -138,6 +155,43 @@ function buildDraftSaleSelectShape(delegate = prisma.sale) {
     items: {
       orderBy: [{ id: "asc" }],
       select: buildDraftItemSelectShape(),
+    },
+  };
+}
+
+function buildConversationSelectShape(delegate = prisma.whatsAppConversation) {
+  const conversationFields = getModelFields(delegate);
+
+  return {
+    id: true,
+    tenantId: true,
+    accountId: true,
+    customerId: true,
+    phone: true,
+    status: true,
+    assignedToId: true,
+    createdAt: true,
+    updatedAt: true,
+    ...(typeof conversationFields.branchId !== "undefined" ? { branchId: true } : {}),
+    account: {
+      select: {
+        id: true,
+        phoneNumber: true,
+        businessName: true,
+        isActive: true,
+      },
+    },
+    customer: {
+      select: buildCustomerSelectShape(),
+    },
+    assignedTo: {
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        isActive: true,
+      },
     },
   };
 }
@@ -185,7 +239,368 @@ async function createAuditLogTx(
   }
 }
 
-async function getOpenCashSessionId(tx, tenantId) {
+async function tableColumnExists(tableName, columnName) {
+  const rows = await prisma.$queryRaw`
+    select 1 as ok
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = ${String(tableName)}
+      and column_name = ${String(columnName)}
+    limit 1
+  `;
+
+  return Boolean(rows?.[0]?.ok);
+}
+
+async function getMainBranchId(db, tenantId) {
+  if (!tenantId || !db.branch) return null;
+
+  const main = await db.branch.findFirst({
+    where: {
+      tenantId,
+      status: "ACTIVE",
+      isMain: true,
+    },
+    select: {
+      id: true,
+    },
+  });
+
+  if (main?.id) return main.id;
+
+  const first = await db.branch.findFirst({
+    where: {
+      tenantId,
+      status: "ACTIVE",
+    },
+    orderBy: [{ isMain: "desc" }, { createdAt: "asc" }],
+    select: {
+      id: true,
+    },
+  });
+
+  return first?.id || null;
+}
+
+async function getUserBranchContext(db, { tenantId, userId }) {
+  if (!tenantId || !userId || !db.user) {
+    return {
+      branchId: null,
+      role: null,
+      canViewAllBranches: false,
+      allowedBranchIds: [],
+    };
+  }
+
+  const userFields = getModelFields(db.user);
+
+  const user = await db.user.findFirst({
+    where: {
+      id: String(userId),
+      tenantId,
+      isActive: true,
+    },
+    select: {
+      id: true,
+      role: true,
+      ...(typeof userFields.branchId !== "undefined" ? { branchId: true } : {}),
+      ...(typeof userFields.defaultBranchId !== "undefined" ? { defaultBranchId: true } : {}),
+      ...(typeof userFields.activeBranchId !== "undefined" ? { activeBranchId: true } : {}),
+      ...(typeof userFields.canViewAllBranches !== "undefined"
+        ? { canViewAllBranches: true }
+        : {}),
+    },
+  });
+
+  if (!user) {
+    return {
+      branchId: null,
+      role: null,
+      canViewAllBranches: false,
+      allowedBranchIds: [],
+    };
+  }
+
+  const role = String(user.role || "").toUpperCase();
+
+  const branchId =
+    normalizeId(user.activeBranchId) ||
+    normalizeId(user.branchId) ||
+    normalizeId(user.defaultBranchId) ||
+    null;
+
+  const canViewAllBranches =
+    Boolean(user.canViewAllBranches) || role === "OWNER" || role === "MANAGER";
+
+  return {
+    branchId,
+    role,
+    canViewAllBranches,
+    allowedBranchIds: branchId ? [branchId] : [],
+  };
+}
+
+async function assertBranchBelongsToTenant(db, { tenantId, branchId }) {
+  if (!tenantId || !branchId) throw appError("BRANCH_REQUIRED");
+
+  const branch = await db.branch.findFirst({
+    where: {
+      id: String(branchId),
+      tenantId,
+      status: "ACTIVE",
+    },
+    select: {
+      id: true,
+      name: true,
+      code: true,
+      isMain: true,
+      status: true,
+    },
+  });
+
+  if (!branch) throw appError("BRANCH_NOT_FOUND");
+
+  return branch;
+}
+
+async function assertUserCanUseBranch(db, { tenantId, userId, branchId }) {
+  const branch = await assertBranchBelongsToTenant(db, { tenantId, branchId });
+  const access = await getUserBranchContext(db, { tenantId, userId });
+
+  if (access.canViewAllBranches) {
+    return branch;
+  }
+
+  if (access.branchId && access.branchId === branch.id) {
+    return branch;
+  }
+
+  throw appError("BRANCH_ACCESS_DENIED");
+}
+
+async function resolveBusinessBranch(
+  db,
+  { tenantId, userId, requestedBranchId, conversation, sale }
+) {
+  const conversationFields = getModelFields(db.whatsAppConversation);
+  const saleFields = getModelFields(db.sale);
+
+  const fromRequest = normalizeId(requestedBranchId);
+
+  const fromSale =
+    typeof saleFields.branchId !== "undefined" ? normalizeId(sale?.branchId) : null;
+
+  const fromConversation =
+    typeof conversationFields.branchId !== "undefined"
+      ? normalizeId(conversation?.branchId)
+      : null;
+
+  const userContext = await getUserBranchContext(db, { tenantId, userId });
+
+  const branchId =
+    fromRequest ||
+    fromSale ||
+    fromConversation ||
+    userContext.branchId ||
+    (await getMainBranchId(db, tenantId));
+
+  if (!branchId) throw appError("BRANCH_REQUIRED");
+
+  const branch = await assertUserCanUseBranch(db, {
+    tenantId,
+    userId,
+    branchId,
+  });
+
+  return branch;
+}
+
+async function buildConversationBranchWhere({ tenantId, userId }) {
+  const conversationFields = getModelFields(prisma.whatsAppConversation);
+
+  if (typeof conversationFields.branchId === "undefined") {
+    return { tenantId };
+  }
+
+  const access = await getUserBranchContext(prisma, { tenantId, userId });
+
+  if (access.canViewAllBranches) {
+    return { tenantId };
+  }
+
+  if (!access.branchId) {
+    return {
+      tenantId,
+      branchId: null,
+    };
+  }
+
+  return {
+    tenantId,
+    OR: [{ branchId: access.branchId }, { branchId: null }],
+  };
+}
+
+async function attachConversationBranchIfPossible(tx, { tenantId, conversationId, branchId }) {
+  if (!conversationId || !branchId) return;
+
+  if (!modelHasField(tx.whatsAppConversation, "branchId")) {
+    return;
+  }
+
+  await tx.whatsAppConversation.updateMany({
+    where: {
+      id: String(conversationId),
+      tenantId,
+    },
+    data: {
+      branchId,
+      updatedAt: new Date(),
+    },
+  });
+}
+
+async function getBranchStockRowsTx(tx, { tenantId, branchId, productIds }) {
+  if (!tx.branchInventory || !branchId) return null;
+
+  const rows = await tx.branchInventory.findMany({
+    where: {
+      tenantId,
+      branchId,
+      productId: {
+        in: productIds,
+      },
+    },
+    select: {
+      productId: true,
+      qtyOnHand: true,
+    },
+  });
+
+  return new Map(rows.map((row) => [row.productId, Number(row.qtyOnHand || 0)]));
+}
+
+async function assertBranchStockAvailableTx(tx, { tenantId, branchId, items }) {
+  const productIds = [...new Set(items.map((item) => String(item.productId)))];
+
+  const products = await tx.product.findMany({
+    where: {
+      tenantId,
+      id: { in: productIds },
+      isActive: true,
+    },
+    select: {
+      id: true,
+      name: true,
+      sellPrice: true,
+      stockQty: true,
+      sku: true,
+      serial: true,
+    },
+  });
+
+  const productById = new Map(products.map((product) => [product.id, product]));
+
+  for (const item of items) {
+    const productId = String(item.productId);
+    if (!productById.has(productId)) throw appError("PRODUCT_NOT_FOUND");
+  }
+
+  const branchStock = await getBranchStockRowsTx(tx, {
+    tenantId,
+    branchId,
+    productIds,
+  });
+
+  for (const item of items) {
+    const product = productById.get(String(item.productId));
+    const needed = Number(item.quantity || 0);
+
+    const available =
+      branchStock instanceof Map
+        ? Number(branchStock.get(product.id) || 0)
+        : Number(product.stockQty || 0);
+
+    if (available < needed) {
+      throw appError("INSUFFICIENT_STOCK", {
+        productId: product.id,
+        productName: product.name,
+        available,
+        needed,
+      });
+    }
+  }
+
+  return {
+    productById,
+    usingBranchInventory: branchStock instanceof Map,
+  };
+}
+
+async function decrementBranchStockTx(tx, { tenantId, branchId, items }) {
+  for (const item of items) {
+    const productId = String(item.productId);
+    const qty = Number(item.quantity || 0);
+
+    if (tx.branchInventory && branchId) {
+      const updated = await tx.branchInventory.updateMany({
+        where: {
+          tenantId,
+          branchId,
+          productId,
+          qtyOnHand: { gte: qty },
+        },
+        data: {
+          qtyOnHand: {
+            decrement: qty,
+          },
+        },
+      });
+
+      if (!updated || updated.count !== 1) {
+        throw appError("INSUFFICIENT_STOCK");
+      }
+
+      continue;
+    }
+
+    const updated = await tx.product.updateMany({
+      where: {
+        id: productId,
+        tenantId,
+        isActive: true,
+        stockQty: { gte: qty },
+      },
+      data: {
+        stockQty: {
+          decrement: qty,
+        },
+      },
+    });
+
+    if (!updated || updated.count !== 1) {
+      throw appError("INSUFFICIENT_STOCK");
+    }
+  }
+}
+
+async function getOpenCashSessionId(tx, tenantId, branchId = null) {
+  const hasBranchId = await tableColumnExists("cash_sessions", "branch_id");
+
+  if (hasBranchId && branchId) {
+    const rows = await tx.$queryRaw`
+      select id
+      from public.cash_sessions
+      where tenant_id = ${String(tenantId)}::uuid
+        and branch_id = ${String(branchId)}::uuid
+        and closed_at is null
+      order by opened_at desc
+      limit 1
+    `;
+
+    return rows?.[0]?.id || null;
+  }
+
   const rows = await tx.$queryRaw`
     select id
     from public.cash_sessions
@@ -194,16 +609,39 @@ async function getOpenCashSessionId(tx, tenantId) {
     order by opened_at desc
     limit 1
   `;
+
   return rows?.[0]?.id || null;
 }
 
 async function insertCashMovementIfPossible(
   tx,
-  { tenantId, userId, sessionId, type, reason, amount, note }
+  { tenantId, branchId = null, userId, sessionId, type, reason, amount, note }
 ) {
   if (!sessionId) return null;
 
   const amountBigInt = BigInt(Math.round(Number(amount || 0)));
+  const hasBranchId = await tableColumnExists("cash_movements", "branch_id");
+
+  if (hasBranchId && branchId) {
+    const rows = await tx.$queryRaw`
+      insert into public.cash_movements
+        (tenant_id, branch_id, session_id, type, reason, amount, note, created_by)
+      values
+        (
+          ${String(tenantId)}::uuid,
+          ${String(branchId)}::uuid,
+          ${String(sessionId)}::uuid,
+          ${String(type)}::cash_movement_type,
+          ${String(reason)}::cash_movement_reason,
+          ${amountBigInt},
+          ${note},
+          ${userId ? String(userId) : null}::uuid
+        )
+      returning id, type, reason, amount, note, created_at, created_by
+    `;
+
+    return rows?.[0] || null;
+  }
 
   const rows = await tx.$queryRaw`
     insert into public.cash_movements
@@ -231,6 +669,7 @@ async function tenantBlocksCashSales(db, tenantId) {
     where id = ${String(tenantId)}::text
     limit 1
   `;
+
   const v = rows?.[0]?.cash_drawer_block_cash_sales;
   return v == null ? true : Boolean(v);
 }
@@ -245,6 +684,7 @@ function mapConversationListItem(conversation) {
     assignedToId: conversation.assignedToId,
     accountId: conversation.accountId,
     customerId: conversation.customerId,
+    branchId: conversation.branchId || null,
     updatedAt: conversation.updatedAt,
     createdAt: conversation.createdAt,
     customer: conversation.customer || null,
@@ -266,40 +706,15 @@ function mapConversationListItem(conversation) {
   };
 }
 
-async function listConversations({ tenantId }) {
+async function listConversations({ tenantId, userId = null }) {
+  const where = await buildConversationBranchWhere({ tenantId, userId });
+
   const conversations = await prisma.whatsAppConversation.findMany({
-    where: { tenantId },
+    where,
     orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
     take: 50,
     select: {
-      id: true,
-      phone: true,
-      status: true,
-      assignedToId: true,
-      accountId: true,
-      customerId: true,
-      updatedAt: true,
-      createdAt: true,
-      customer: {
-        select: buildCustomerSelectShape(),
-      },
-      assignedTo: {
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          role: true,
-          isActive: true,
-        },
-      },
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
+      ...buildConversationSelectShape(prisma.whatsAppConversation),
       messages: {
         orderBy: { createdAt: "desc" },
         take: 1,
@@ -325,39 +740,15 @@ async function listConversations({ tenantId }) {
   return conversations.map(mapConversationListItem);
 }
 
-async function listMessages({ tenantId, conversationId }) {
+async function listMessages({ tenantId, conversationId, userId = null }) {
+  const baseWhere = await buildConversationBranchWhere({ tenantId, userId });
+
   const convo = await prisma.whatsAppConversation.findFirst({
-    where: { id: conversationId, tenantId },
-    select: {
-      id: true,
-      phone: true,
-      status: true,
-      assignedToId: true,
-      accountId: true,
-      customerId: true,
-      updatedAt: true,
-      createdAt: true,
-      customer: {
-        select: buildCustomerSelectShape(),
-      },
-      assignedTo: {
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          role: true,
-          isActive: true,
-        },
-      },
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
+    where: {
+      ...baseWhere,
+      id: conversationId,
     },
+    select: buildConversationSelectShape(prisma.whatsAppConversation),
   });
 
   if (!convo) throw appError("NOT_FOUND");
@@ -384,12 +775,18 @@ async function reply({ tenantId, conversationId, userId, text }) {
   const cleanText = normalizeText(text);
   if (!cleanText) throw appError("TEXT_REQUIRED");
 
+  const baseWhere = await buildConversationBranchWhere({ tenantId, userId });
+
   const convo = await prisma.whatsAppConversation.findFirst({
-    where: { id: conversationId, tenantId },
+    where: {
+      ...baseWhere,
+      id: conversationId,
+    },
     select: {
       id: true,
       phone: true,
       accountId: true,
+      ...(modelHasField(prisma.whatsAppConversation, "branchId") ? { branchId: true } : {}),
     },
   });
 
@@ -450,6 +847,7 @@ async function reply({ tenantId, conversationId, userId, text }) {
       metadata: {
         conversationId: convo.id,
         accountId: account.id,
+        branchId: convo.branchId || null,
         phone: convo.phone,
         textLength: cleanText.length,
         providerMessageId: metaMsgId,
@@ -464,9 +862,13 @@ async function reply({ tenantId, conversationId, userId, text }) {
 
 async function updateStatus({ tenantId, conversationId, status, userId = null }) {
   const normalizedStatus = normalizeConversationStatus(status);
+  const baseWhere = await buildConversationBranchWhere({ tenantId, userId });
 
   const convo = await prisma.whatsAppConversation.findFirst({
-    where: { id: conversationId, tenantId },
+    where: {
+      ...baseWhere,
+      id: conversationId,
+    },
     select: { id: true, status: true },
   });
 
@@ -663,6 +1065,7 @@ async function recomputeDraftTotalsTx(tx, tenantId, saleId) {
   if (!sale) throw appError("SALE_NOT_FOUND");
 
   let total = 0;
+
   for (const item of sale.items || []) {
     total += Number(item.price || 0) * Number(item.quantity || 0);
   }
@@ -687,34 +1090,67 @@ async function recomputeDraftTotalsTx(tx, tenantId, saleId) {
   return getSaleDraftTx(tx, tenantId, saleId);
 }
 
-async function listSaleDrafts({ tenantId }) {
+async function listSaleDrafts({ tenantId, userId = null, branchId = null }) {
   const saleFields = getModelFields(prisma.sale);
+  const access = await getUserBranchContext(prisma, { tenantId, userId });
+
+  const where = {
+    tenantId,
+    ...(typeof saleFields.isDraft !== "undefined" ? { isDraft: true } : {}),
+    ...(typeof saleFields.draftSource !== "undefined" ? { draftSource: "WHATSAPP" } : {}),
+    isCancelled: false,
+  };
+
+  if (typeof saleFields.branchId !== "undefined") {
+    const requestedBranchId = normalizeId(branchId);
+
+    if (requestedBranchId) {
+      await assertUserCanUseBranch(prisma, { tenantId, userId, branchId: requestedBranchId });
+      where.branchId = requestedBranchId;
+    } else if (!access.canViewAllBranches && access.branchId) {
+      where.branchId = access.branchId;
+    } else if (!access.canViewAllBranches && !access.branchId) {
+      where.branchId = null;
+    }
+  }
 
   return prisma.sale.findMany({
-    where: {
-      tenantId,
-      ...(typeof saleFields.isDraft !== "undefined" ? { isDraft: true } : {}),
-      ...(typeof saleFields.draftSource !== "undefined" ? { draftSource: "WHATSAPP" } : {}),
-      isCancelled: false,
-    },
+    where,
     orderBy: { createdAt: "desc" },
     select: buildDraftSaleSelectShape(prisma.sale),
   });
 }
 
-async function getSaleDraft({ tenantId, saleId }) {
-  return getSaleDraftTx(prisma, tenantId, saleId);
+async function getSaleDraft({ tenantId, saleId, userId = null }) {
+  const draft = await getSaleDraftTx(prisma, tenantId, saleId);
+
+  if (draft.branchId) {
+    await assertUserCanUseBranch(prisma, {
+      tenantId,
+      userId,
+      branchId: draft.branchId,
+    });
+  }
+
+  return draft;
 }
 
 async function createSaleDraft({ tenantId, conversationId, userId, body }) {
+  const conversationFields = getModelFields(prisma.whatsAppConversation);
+  const baseWhere = await buildConversationBranchWhere({ tenantId, userId });
+
   const convo = await prisma.whatsAppConversation.findFirst({
-    where: { id: conversationId, tenantId },
+    where: {
+      ...baseWhere,
+      id: conversationId,
+    },
     select: {
       id: true,
       phone: true,
       customerId: true,
       assignedToId: true,
       tenantId: true,
+      ...(typeof conversationFields.branchId !== "undefined" ? { branchId: true } : {}),
       customer: {
         select: buildCustomerSelectShape(),
       },
@@ -728,13 +1164,23 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
 
   for (const item of items) {
     if (!item?.productId) throw appError("PRODUCT_ID_REQUIRED");
+
     const qty = toInt(item.quantity, NaN);
     if (!Number.isInteger(qty) || qty <= 0) throw appError("INVALID_QUANTITY");
   }
 
   const requestedSaleType = normalizeSaleType(body?.saleType || "CREDIT");
   const parsedDueDate = body?.dueDate ? safeDate(body.dueDate) : null;
+
   if (body?.dueDate && !parsedDueDate) throw appError("INVALID_DUE_DATE");
+
+  const branch = await resolveBusinessBranch(prisma, {
+    tenantId,
+    userId,
+    requestedBranchId: body?.branchId,
+    conversation: convo,
+    sale: null,
+  });
 
   return prisma.$transaction(async (tx) => {
     const resolvedCustomerId = await resolveOrCreateCustomerTx(tx, tenantId, {
@@ -750,49 +1196,40 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
       });
     }
 
-    const productIds = items.map((i) => String(i.productId));
-    const products = await tx.product.findMany({
-      where: {
-        tenantId,
-        id: { in: productIds },
-        isActive: true,
-      },
-      select: {
-        id: true,
-        name: true,
-        sellPrice: true,
-        stockQty: true,
-        sku: true,
-        serial: true,
-      },
+    await attachConversationBranchIfPossible(tx, {
+      tenantId,
+      conversationId: convo.id,
+      branchId: branch.id,
     });
 
-    const byId = new Map(products.map((p) => [p.id, p]));
+    const normalizedRequestItems = items.map((item) => ({
+      productId: String(item.productId),
+      quantity: toInt(item.quantity),
+      unitPrice: toNumber(item.unitPrice, NaN),
+    }));
 
-    for (const item of items) {
-      const pid = String(item.productId);
-      if (!byId.has(pid)) throw appError("PRODUCT_NOT_FOUND");
-    }
+    const { productById } = await assertBranchStockAvailableTx(tx, {
+      tenantId,
+      branchId: branch.id,
+      items: normalizedRequestItems,
+    });
 
     let total = 0;
     const normalizedItems = [];
 
-    for (const item of items) {
-      const pid = String(item.productId);
-      const qty = toInt(item.quantity);
-      const product = byId.get(pid);
+    for (const item of normalizedRequestItems) {
+      const product = productById.get(item.productId);
 
-      const unitPriceRaw = toNumber(item.unitPrice, NaN);
       const unitPrice =
-        Number.isFinite(unitPriceRaw) && unitPriceRaw > 0
-          ? unitPriceRaw
+        Number.isFinite(item.unitPrice) && item.unitPrice > 0
+          ? item.unitPrice
           : Number(product.sellPrice || 0);
 
-      total += unitPrice * qty;
+      total += unitPrice * item.quantity;
 
       normalizedItems.push({
-        productId: pid,
-        quantity: qty,
+        productId: item.productId,
+        quantity: item.quantity,
         unitPrice,
       });
     }
@@ -812,6 +1249,7 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
         tenantId,
         cashierId: draftCashierId,
         customerId: resolvedCustomerId || null,
+        ...(typeof saleFields.branchId !== "undefined" ? { branchId: branch.id } : {}),
         total,
         saleType: requestedSaleType,
         amountPaid: 0,
@@ -847,6 +1285,8 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
       metadata: {
         source: "WHATSAPP",
         conversationId: convo.id,
+        branchId: branch.id,
+        branchName: branch.name,
         itemCount: normalizedItems.length,
         saleType: requestedSaleType,
         total,
@@ -855,7 +1295,12 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
     });
 
     const draft = await getSaleDraftTx(tx, tenantId, sale.id);
-    return { created: true, draft };
+
+    return {
+      created: true,
+      draft,
+      branch,
+    };
   });
 }
 
@@ -876,10 +1321,27 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
       customerId: true,
       saleType: true,
       dueDate: true,
+      conversationId: true,
+      ...(typeof saleFields.branchId !== "undefined" ? { branchId: true } : {}),
+      conversation: {
+        select: {
+          id: true,
+          phone: true,
+          ...(modelHasField(prisma.whatsAppConversation, "branchId") ? { branchId: true } : {}),
+        },
+      },
     },
   });
 
   if (!draft) throw appError("SALE_DRAFT_NOT_FOUND");
+
+  const branch = await resolveBusinessBranch(prisma, {
+    tenantId,
+    userId,
+    requestedBranchId: body?.branchId,
+    conversation: draft.conversation || null,
+    sale: draft,
+  });
 
   return prisma.$transaction(async (tx) => {
     let resolvedCustomerId = draft.customerId || null;
@@ -892,7 +1354,9 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
       });
     }
 
-    const patch = {};
+    const patch = {
+      ...(typeof getModelFields(tx.sale).branchId !== "undefined" ? { branchId: branch.id } : {}),
+    };
 
     if (body?.saleType !== undefined) {
       patch.saleType = normalizeSaleType(body.saleType);
@@ -912,6 +1376,12 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
       patch.customerId = resolvedCustomerId || null;
     }
 
+    await attachConversationBranchIfPossible(tx, {
+      tenantId,
+      conversationId: draft.conversationId,
+      branchId: branch.id,
+    });
+
     if (Object.keys(patch).length > 0) {
       await tx.sale.update({
         where: { id: draft.id },
@@ -925,54 +1395,40 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
 
       for (const item of items) {
         if (!item?.productId) throw appError("PRODUCT_ID_REQUIRED");
+
         const qty = toInt(item.quantity, NaN);
         if (!Number.isInteger(qty) || qty <= 0) throw appError("INVALID_QUANTITY");
       }
 
-      const productIds = items.map((i) => String(i.productId));
-      const products = await tx.product.findMany({
-        where: {
-          tenantId,
-          id: { in: productIds },
-          isActive: true,
-        },
-        select: {
-          id: true,
-          name: true,
-          sellPrice: true,
-          stockQty: true,
-          sku: true,
-          serial: true,
-        },
+      const normalizedItems = items.map((item) => ({
+        productId: String(item.productId),
+        quantity: toInt(item.quantity),
+        unitPrice: toNumber(item.unitPrice, NaN),
+      }));
+
+      const { productById } = await assertBranchStockAvailableTx(tx, {
+        tenantId,
+        branchId: branch.id,
+        items: normalizedItems,
       });
-
-      const byId = new Map(products.map((p) => [p.id, p]));
-
-      for (const item of items) {
-        const pid = String(item.productId);
-        if (!byId.has(pid)) throw appError("PRODUCT_NOT_FOUND");
-      }
 
       await tx.saleItem.deleteMany({
         where: { saleId: draft.id },
       });
 
-      for (const item of items) {
-        const pid = String(item.productId);
-        const qty = toInt(item.quantity);
-        const product = byId.get(pid);
+      for (const item of normalizedItems) {
+        const product = productById.get(item.productId);
 
-        const unitPriceRaw = toNumber(item.unitPrice, NaN);
         const unitPrice =
-          Number.isFinite(unitPriceRaw) && unitPriceRaw > 0
-            ? unitPriceRaw
+          Number.isFinite(item.unitPrice) && item.unitPrice > 0
+            ? item.unitPrice
             : Number(product.sellPrice || 0);
 
         await tx.saleItem.create({
           data: {
             saleId: draft.id,
-            productId: pid,
-            quantity: qty,
+            productId: item.productId,
+            quantity: item.quantity,
             price: unitPrice,
           },
         });
@@ -989,6 +1445,8 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
       action: "WHATSAPP_SALE_DRAFT_UPDATED",
       metadata: {
         source: "WHATSAPP",
+        branchId: branch.id,
+        branchName: branch.name,
         hasItemsPatch: body?.items !== undefined,
         hasCustomerPatch: Boolean(body?.customerId || body?.customer),
         hasSaleTypePatch: body?.saleType !== undefined,
@@ -996,7 +1454,11 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
       },
     });
 
-    return { updated: true, draft: recomputed };
+    return {
+      updated: true,
+      draft: recomputed,
+      branch,
+    };
   });
 }
 
@@ -1014,10 +1476,19 @@ async function deleteSaleDraft({ tenantId, saleId, userId = null }) {
     select: {
       id: true,
       conversationId: true,
+      ...(typeof saleFields.branchId !== "undefined" ? { branchId: true } : {}),
     },
   });
 
   if (!draft) throw appError("SALE_DRAFT_NOT_FOUND");
+
+  if (draft.branchId) {
+    await assertUserCanUseBranch(prisma, {
+      tenantId,
+      userId,
+      branchId: draft.branchId,
+    });
+  }
 
   await prisma.$transaction(async (tx) => {
     await tx.saleItem.deleteMany({
@@ -1037,6 +1508,7 @@ async function deleteSaleDraft({ tenantId, saleId, userId = null }) {
       metadata: {
         source: "WHATSAPP",
         conversationId: draft.conversationId || null,
+        branchId: draft.branchId || null,
       },
     });
   });
@@ -1058,11 +1530,19 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
     select: {
       id: true,
       tenantId: true,
+      ...(typeof saleFields.branchId !== "undefined" ? { branchId: true } : {}),
       total: true,
       saleType: true,
       dueDate: true,
       customerId: true,
       conversationId: true,
+      conversation: {
+        select: {
+          id: true,
+          phone: true,
+          ...(modelHasField(prisma.whatsAppConversation, "branchId") ? { branchId: true } : {}),
+        },
+      },
       items: {
         orderBy: [{ id: "asc" }],
         select: {
@@ -1077,6 +1557,14 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
 
   if (!draft) throw appError("SALE_DRAFT_NOT_FOUND");
   if (!draft.items || draft.items.length === 0) throw appError("NO_ITEMS");
+
+  const branch = await resolveBusinessBranch(prisma, {
+    tenantId,
+    userId,
+    requestedBranchId: body?.branchId,
+    conversation: draft.conversation || null,
+    sale: draft,
+  });
 
   const finalSaleType = normalizeSaleType(body?.saleType || draft.saleType || "CREDIT");
   const method = normalizePaymentMethod(body?.paymentMethod || body?.method || "CASH");
@@ -1093,40 +1581,53 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
   }
 
   const requestedPaid = Math.max(0, toNumber(body?.amountPaid, 0));
+
   const initialPaid =
-    finalSaleType === "CASH" ? Number(draft.total) : Math.min(requestedPaid, Number(draft.total));
+    finalSaleType === "CASH"
+      ? Number(draft.total)
+      : Math.min(requestedPaid, Number(draft.total));
 
   if (finalSaleType === "CREDIT" && initialPaid > Number(draft.total) + 0.000001) {
     throw appError("PAYMENT_EXCEEDS_TOTAL");
   }
 
-  if (finalSaleType === "CASH") {
+  if (finalSaleType === "CASH" || method === "CASH") {
     const blockCashSales = await tenantBlocksCashSales(prisma, tenantId);
+
     if (blockCashSales) {
-      const openSessionId = await getOpenCashSessionId(prisma, tenantId);
+      const openSessionId = await getOpenCashSessionId(prisma, tenantId, branch.id);
+
       if (!openSessionId) {
         throw appError("CASH_DRAWER_CLOSED", { code: "CASH_DRAWER_CLOSED" });
       }
     }
   }
 
-  const productIds = draft.items.map((it) => it.productId);
-  const products = await prisma.product.findMany({
-    where: { tenantId, id: { in: productIds }, isActive: true },
-    select: { id: true, name: true, stockQty: true },
-  });
+  const stockItems = draft.items.map((item) => ({
+    productId: item.productId,
+    quantity: Number(item.quantity || 0),
+  }));
 
-  const byId = new Map(products.map((p) => [p.id, p]));
-
-  for (const it of draft.items) {
-    const p = byId.get(it.productId);
-    if (!p || Number(p.stockQty || 0) < Number(it.quantity || 0)) {
-      throw appError("INSUFFICIENT_STOCK");
-    }
-  }
-
-  return prisma.$transaction(
+  const result = await prisma.$transaction(
     async (tx) => {
+      await assertBranchStockAvailableTx(tx, {
+        tenantId,
+        branchId: branch.id,
+        items: stockItems,
+      });
+
+      await decrementBranchStockTx(tx, {
+        tenantId,
+        branchId: branch.id,
+        items: stockItems,
+      });
+
+      await attachConversationBranchIfPossible(tx, {
+        tenantId,
+        conversationId: draft.conversationId,
+        branchId: branch.id,
+      });
+
       let resolvedCustomerId = draft.customerId || null;
 
       if (body?.customerId || body?.customer) {
@@ -1137,23 +1638,8 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
         });
       }
 
-      for (const it of draft.items) {
-        const updated = await tx.product.updateMany({
-          where: {
-            id: it.productId,
-            tenantId,
-            isActive: true,
-            stockQty: { gte: it.quantity },
-          },
-          data: { stockQty: { decrement: it.quantity } },
-        });
-
-        if (!updated || updated.count !== 1) {
-          throw appError("INSUFFICIENT_STOCK");
-        }
-      }
-
       const finalizedAt = new Date();
+
       const doc = await reserveSaleDocumentNumbersTx(tx, {
         tenantId,
         createdAt: finalizedAt,
@@ -1170,6 +1656,7 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
         where: { id: draft.id },
         data: {
           customerId: resolvedCustomerId || null,
+          ...(typeof getModelFields(tx.sale).branchId !== "undefined" ? { branchId: branch.id } : {}),
           saleType: finalSaleType,
           amountPaid: initialPaid,
           balanceDue,
@@ -1187,6 +1674,7 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
         },
         select: {
           id: true,
+          ...(typeof getModelFields(tx.sale).branchId !== "undefined" ? { branchId: true } : {}),
           saleType: true,
           total: true,
           amountPaid: true,
@@ -1213,26 +1701,39 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
 
       if (initialPaid > 0) {
         const noteBase = normalizeText(body?.note);
+
         const safeNote = noteBase
           ? `${noteBase} • ${draft.id} • ${Date.now()}`
           : `WhatsApp payment • ${draft.id} • ${Date.now()}`;
+
+        const paymentFields = getModelFields(tx.salePayment);
 
         payment = await tx.salePayment.create({
           data: {
             saleId: draft.id,
             tenantId,
+            ...(typeof paymentFields.branchId !== "undefined" ? { branchId: branch.id } : {}),
             receivedById: userId || null,
             amount: initialPaid,
             method,
             note: safeNote,
           },
-          select: { id: true, amount: true, method: true, createdAt: true, note: true },
+          select: {
+            id: true,
+            amount: true,
+            method: true,
+            createdAt: true,
+            note: true,
+            ...(typeof paymentFields.branchId !== "undefined" ? { branchId: true } : {}),
+          },
         });
 
         if (method === "CASH") {
-          const openSessionId = await getOpenCashSessionId(tx, tenantId);
+          const openSessionId = await getOpenCashSessionId(tx, tenantId, branch.id);
+
           movement = await insertCashMovementIfPossible(tx, {
             tenantId,
+            branchId: branch.id,
             userId,
             sessionId: openSessionId,
             type: "IN",
@@ -1255,6 +1756,8 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
         metadata: {
           source: "WHATSAPP",
           conversationId: draft.conversationId || null,
+          branchId: branch.id,
+          branchName: branch.name,
           saleType: finalSaleType,
           total: draft.total,
           amountPaid: initialPaid,
@@ -1268,6 +1771,7 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
       return {
         finalized: true,
         sale: updatedSale,
+        branch,
         payment,
         cashMovement: movement
           ? {
@@ -1287,16 +1791,9 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
       timeout: 20000,
     }
   );
-}
 
-const ASSIGNABLE_USER_ROLES = [
-  "OWNER",
-  "MANAGER",
-  "CASHIER",
-  "SELLER",
-  "STOREKEEPER",
-  "TECHNICIAN",
-];
+  return result;
+}
 
 function normalizeConversationPublic(conversation) {
   if (!conversation) return null;
@@ -1306,6 +1803,7 @@ function normalizeConversationPublic(conversation) {
     tenantId: conversation.tenantId,
     accountId: conversation.accountId,
     customerId: conversation.customerId,
+    branchId: conversation.branchId || null,
     phone: conversation.phone,
     status: conversation.status,
     assignedToId: conversation.assignedToId || null,
@@ -1341,8 +1839,7 @@ function normalizeConversationPublic(conversation) {
 
 /**
  * Do not write unsupported enum values into auditLog.action.
- * Your Prisma AuditAction enum does not currently include the custom
- * WhatsApp assignment action names, so we skip them safely for now.
+ * Your Prisma AuditAction enum may not include custom WhatsApp assignment action names yet.
  */
 async function createAuditLogSafe({
   tenantId,
@@ -1355,59 +1852,31 @@ async function createAuditLogSafe({
   try {
     if (!action) return;
 
-    // Skip unsupported custom action enums for now.
-    // This avoids Prisma validation crashes until AuditAction is extended.
-    return;
+    await createAuditLogTx(prisma, {
+      tenantId,
+      userId,
+      entity,
+      entityId,
+      action,
+      metadata,
+    });
   } catch (err) {
     console.error("WHATSAPP inbox audit log error:", err?.message || err);
   }
 }
 
-async function getConversationForTenant({ tenantId, conversationId }) {
+async function getConversationForTenant({ tenantId, conversationId, userId = null }) {
   const id = normalizeId(conversationId);
   if (!tenantId || !id) throw appError("INVALID_ARGS");
 
+  const baseWhere = await buildConversationBranchWhere({ tenantId, userId });
+
   const conversation = await prisma.whatsAppConversation.findFirst({
     where: {
+      ...baseWhere,
       id,
-      tenantId,
     },
-    select: {
-      id: true,
-      tenantId: true,
-      accountId: true,
-      customerId: true,
-      phone: true,
-      status: true,
-      assignedToId: true,
-      createdAt: true,
-      updatedAt: true,
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
-      customer: {
-        select: {
-          id: true,
-          name: true,
-          phone: true,
-          email: true,
-        },
-      },
-      assignedTo: {
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          role: true,
-          isActive: true,
-        },
-      },
-    },
+    select: buildConversationSelectShape(prisma.whatsAppConversation),
   });
 
   if (!conversation) {
@@ -1483,6 +1952,7 @@ async function assignConversation({
   actorUserId,
 }) {
   const cleanAssignedToId = normalizeId(assignedToId);
+
   if (!cleanAssignedToId) {
     throw appError("ASSIGNED_TO_REQUIRED");
   }
@@ -1490,6 +1960,7 @@ async function assignConversation({
   const conversation = await getConversationForTenant({
     tenantId,
     conversationId,
+    userId: actorUserId,
   });
 
   const assignee = await resolveAssignableUser({
@@ -1503,42 +1974,7 @@ async function assignConversation({
       assignedToId: assignee.id,
       updatedAt: new Date(),
     },
-    select: {
-      id: true,
-      tenantId: true,
-      accountId: true,
-      customerId: true,
-      phone: true,
-      status: true,
-      assignedToId: true,
-      createdAt: true,
-      updatedAt: true,
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
-      customer: {
-        select: {
-          id: true,
-          name: true,
-          phone: true,
-          email: true,
-        },
-      },
-      assignedTo: {
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          role: true,
-          isActive: true,
-        },
-      },
-    },
+    select: buildConversationSelectShape(prisma.whatsAppConversation),
   });
 
   await createAuditLogSafe({
@@ -1551,6 +1987,7 @@ async function assignConversation({
       previousAssignedToId: conversation.assignedToId || null,
       nextAssignedToId: assignee.id,
       phone: conversation.phone,
+      branchId: conversation.branchId || null,
     },
   });
 
@@ -1567,6 +2004,7 @@ async function unassignConversation({
   const conversation = await getConversationForTenant({
     tenantId,
     conversationId,
+    userId: actorUserId,
   });
 
   const updated = await prisma.whatsAppConversation.update({
@@ -1575,42 +2013,7 @@ async function unassignConversation({
       assignedToId: null,
       updatedAt: new Date(),
     },
-    select: {
-      id: true,
-      tenantId: true,
-      accountId: true,
-      customerId: true,
-      phone: true,
-      status: true,
-      assignedToId: true,
-      createdAt: true,
-      updatedAt: true,
-      account: {
-        select: {
-          id: true,
-          phoneNumber: true,
-          businessName: true,
-          isActive: true,
-        },
-      },
-      customer: {
-        select: {
-          id: true,
-          name: true,
-          phone: true,
-          email: true,
-        },
-      },
-      assignedTo: {
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          role: true,
-          isActive: true,
-        },
-      },
-    },
+    select: buildConversationSelectShape(prisma.whatsAppConversation),
   });
 
   await createAuditLogSafe({
@@ -1622,6 +2025,7 @@ async function unassignConversation({
     metadata: {
       previousAssignedToId: conversation.assignedToId || null,
       phone: conversation.phone,
+      branchId: conversation.branchId || null,
     },
   });
 
@@ -1629,7 +2033,6 @@ async function unassignConversation({
     conversation: normalizeConversationPublic(updated),
   };
 }
-
 
 module.exports = {
   listConversations,
