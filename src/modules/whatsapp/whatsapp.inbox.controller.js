@@ -107,7 +107,8 @@ function mapServiceError(err, res, fallbackMessage) {
 
   if (code === "CASH_DRAWER_CLOSED") {
     return res.status(409).json({
-      message: "Cash drawer is closed. Open this branch drawer before finalizing a cash WhatsApp sale.",
+      message:
+        "Cash drawer is closed. Open this branch drawer before finalizing a cash WhatsApp sale.",
       code: "CASH_DRAWER_CLOSED",
     });
   }
@@ -202,6 +203,28 @@ async function listMessages(req, res) {
   } catch (err) {
     console.error("listMessages error:", err);
     return mapServiceError(err, res, "Failed to list messages");
+  }
+}
+
+async function markConversationRead(req, res) {
+  try {
+    const tenantId = getTenantId(req);
+    const userId = getUserId(req);
+    const { id } = req.params;
+
+    const result = await service.markConversationRead({
+      tenantId,
+      userId,
+      conversationId: id,
+    });
+
+    return res.json({
+      ok: true,
+      ...result,
+    });
+  } catch (err) {
+    console.error("markConversationRead error:", err);
+    return mapServiceError(err, res, "Failed to mark conversation as read");
   }
 }
 
@@ -484,6 +507,7 @@ async function unassignConversation(req, res) {
 module.exports = {
   listConversations,
   listMessages,
+  markConversationRead,
   reply,
   updateStatus,
   listAssignableStaff,

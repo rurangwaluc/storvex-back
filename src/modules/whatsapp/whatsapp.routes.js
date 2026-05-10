@@ -21,8 +21,8 @@ const promotionRoutes = require("./whatsapp.promotions.routes");
  * POST /api/whatsapp/webhook
  *
  * Protected workspace routes:
- * /api/whatsapp/accounts/...
  * /api/whatsapp/inbox/...
+ * /api/whatsapp/accounts/...
  * /api/whatsapp/broadcasts/...
  * /api/whatsapp/promotions/...
  */
@@ -31,21 +31,24 @@ const promotionRoutes = require("./whatsapp.promotions.routes");
  * Public Meta webhook routes.
  *
  * These MUST remain unauthenticated because Meta calls them directly.
- * Do not add authenticate/requireTenant/requireRole here.
  */
 router.get("/webhook", webhookController.verifyWebhook);
 router.post("/webhook", webhookController.receiveWebhook);
 
 /**
- * Protected child routers.
+ * IMPORTANT:
+ * Mount inbox first.
  *
- * Each child router applies its own:
- * - authenticate
- * - requireTenant
- * - requireRole
+ * Some child routers apply role middleware at router level.
+ * If owner-only routers are mounted before inbox, they can reject
+ * /inbox requests before inboxRoutes gets a chance to handle them.
+ */
+router.use("/", inboxRoutes);
+
+/**
+ * Owner/manager WhatsApp management routes.
  */
 router.use("/", accountRoutes);
-router.use("/", inboxRoutes);
 router.use("/", broadcastRoutes);
 router.use("/", promotionRoutes);
 

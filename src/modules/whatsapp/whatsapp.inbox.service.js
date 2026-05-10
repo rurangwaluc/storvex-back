@@ -1,3 +1,4 @@
+const { Prisma } = require("@prisma/client");
 const prisma = require("../../config/database");
 const whatsappService = require("./whatsapp.service");
 const { reserveSaleDocumentNumbersTx } = require("../documents/documentNumber.service");
@@ -252,6 +253,148 @@ async function tableColumnExists(tableName, columnName) {
   return Boolean(rows?.[0]?.ok);
 }
 
+let readStateTableChecked = false;
+let readStateTableExists = false;
+
+async function hasWhatsAppReadStateTable() {
+  if (readStateTableChecked) return readStateTableExists;
+
+  const rows = await prisma.$queryRaw`
+    select to_regclass('public."WhatsAppConversationReadState"')::text as table_name
+  `;
+
+  readStateTableExists = Boolean(rows?.[0]?.table_name);
+  readStateTableChecked = true;
+
+  return readStateTableExists;
+}
+
+async function attachUnreadCountsToConversations({ tenantId, userId, conversations }) {
+  if (!tenantId || !userId || !Array.isArray(conversations) || conversations.length === 0) {
+    return conversations;
+  }
+
+  const tableExists = await hasWhatsAppReadStateTable();
+  if (!tableExists) {
+    return conversations.map((conversation) => ({
+      ...conversation,
+      unreadCount:
+        conversation.latestMessage?.direction === "INBOUND"
+          ? Math.max(1, Number(conversation.messageCount || 1))
+          : 0,
+    }));
+  }
+
+  const conversationIds = conversations.map((conversation) => String(conversation.id)).filter(Boolean);
+
+  if (!conversationIds.length) {
+    return conversations.map((conversation) => ({
+      ...conversation,
+      unreadCount: 0,
+    }));
+  }
+
+  const rows = await prisma.$queryRaw`
+    select
+      c."id"::text as "conversationId",
+      count(m."id")::int as "unreadCount"
+    from public."WhatsAppConversation" c
+    left join public."WhatsAppConversationReadState" rs
+      on rs."tenantId" = c."tenantId"
+      and rs."conversationId" = c."id"
+      and rs."userId"::text = ${String(userId)}
+    join public."WhatsAppMessage" m
+      on m."tenantId" = c."tenantId"
+      and m."conversationId" = c."id"
+      and m."direction" = 'INBOUND'
+      and (
+        rs."lastReadAt" is null
+        or m."createdAt" > rs."lastReadAt"
+      )
+    where c."tenantId"::text = ${String(tenantId)}
+      and c."id"::text in (${Prisma.join(conversationIds)})
+    group by c."id"
+  `;
+
+  const unreadByConversationId = new Map(
+    (rows || []).map((row) => [
+      String(row.conversationId),
+      Number(row.unreadCount || 0),
+    ])
+  );
+
+  return conversations.map((conversation) => ({
+    ...conversation,
+    unreadCount: unreadByConversationId.get(String(conversation.id)) || 0,
+  }));
+}
+
+async function upsertConversationReadState({ tenantId, conversationId, userId }) {
+  if (!tenantId || !conversationId || !userId) {
+    return null;
+  }
+
+  const tableExists = await hasWhatsAppReadStateTable();
+  if (!tableExists) return null;
+
+  const latestRows = await prisma.$queryRaw`
+    select
+      m."id"::text as "id",
+      m."createdAt" as "createdAt"
+    from public."WhatsAppMessage" m
+    where m."tenantId"::text = ${String(tenantId)}
+      and m."conversationId"::text = ${String(conversationId)}
+    order by m."createdAt" desc, m."id" desc
+    limit 1
+  `;
+
+  const latestMessage = latestRows?.[0] || null;
+  const latestMessageId = latestMessage?.id || null;
+  const readAt = latestMessage?.createdAt || new Date();
+
+  const rows = await prisma.$queryRaw`
+    insert into public."WhatsAppConversationReadState"
+      (
+        "tenantId",
+        "conversationId",
+        "userId",
+        "lastReadAt",
+        "lastReadMessageId"
+      )
+    select
+      c."tenantId",
+      c."id",
+      u."id",
+      ${readAt}::timestamptz,
+      lm."id"
+    from public."WhatsAppConversation" c
+    join public."User" u
+      on u."tenantId"::text = ${String(tenantId)}
+      and u."id"::text = ${String(userId)}
+    left join public."WhatsAppMessage" lm
+      on lm."tenantId" = c."tenantId"
+      and lm."conversationId" = c."id"
+      and lm."id"::text = ${String(latestMessageId || "__NO_MESSAGE__")}
+    where c."tenantId"::text = ${String(tenantId)}
+      and c."id"::text = ${String(conversationId)}
+    on conflict ("tenantId", "conversationId", "userId")
+    do update set
+      "lastReadAt" = excluded."lastReadAt",
+      "lastReadMessageId" = excluded."lastReadMessageId",
+      "updatedAt" = now()
+    returning
+      "id"::text as "id",
+      "tenantId"::text as "tenantId",
+      "conversationId"::text as "conversationId",
+      "userId"::text as "userId",
+      "lastReadAt",
+      "lastReadMessageId"::text as "lastReadMessageId",
+      "updatedAt"
+  `;
+
+  return rows?.[0] || null;
+}
+
 async function getMainBranchId(db, tenantId) {
   if (!tenantId || !db.branch) return null;
 
@@ -417,27 +560,44 @@ async function resolveBusinessBranch(
 
 async function buildConversationBranchWhere({ tenantId, userId }) {
   const conversationFields = getModelFields(prisma.whatsAppConversation);
+  const cleanUserId = normalizeId(userId);
 
   if (typeof conversationFields.branchId === "undefined") {
-    return { tenantId };
+    if (!cleanUserId) return { tenantId };
+
+    return {
+      tenantId,
+      OR: [
+        { assignedToId: cleanUserId },
+        { assignedToId: null },
+      ],
+    };
   }
 
-  const access = await getUserBranchContext(prisma, { tenantId, userId });
+  const access = await getUserBranchContext(prisma, {
+    tenantId,
+    userId: cleanUserId,
+  });
 
   if (access.canViewAllBranches) {
     return { tenantId };
   }
 
-  if (!access.branchId) {
-    return {
-      tenantId,
-      branchId: null,
-    };
+  const visibility = [];
+
+  if (cleanUserId) {
+    visibility.push({ assignedToId: cleanUserId });
   }
+
+  if (access.branchId) {
+    visibility.push({ branchId: access.branchId });
+  }
+
+  visibility.push({ branchId: null });
 
   return {
     tenantId,
-    OR: [{ branchId: access.branchId }, { branchId: null }],
+    OR: visibility,
   };
 }
 
@@ -737,7 +897,13 @@ async function listConversations({ tenantId, userId = null }) {
     },
   });
 
-  return conversations.map(mapConversationListItem);
+  const mapped = conversations.map(mapConversationListItem);
+
+  return attachUnreadCountsToConversations({
+    tenantId,
+    userId,
+    conversations: mapped,
+  });
 }
 
 async function listMessages({ tenantId, conversationId, userId = null }) {
@@ -767,6 +933,18 @@ async function listMessages({ tenantId, conversationId, userId = null }) {
       sentById: true,
     },
   });
+
+  if (userId) {
+    try {
+      await upsertConversationReadState({
+        tenantId,
+        conversationId,
+        userId,
+      });
+    } catch (err) {
+      console.error("WhatsApp mark read from listMessages failed:", err?.message || err);
+    }
+  }
 
   return { conversationId, conversation: convo, messages };
 }
@@ -856,6 +1034,18 @@ async function reply({ tenantId, conversationId, userId, text }) {
 
     return saved;
   });
+
+  if (userId) {
+    try {
+      await upsertConversationReadState({
+        tenantId,
+        conversationId: convo.id,
+        userId,
+      });
+    } catch (err) {
+      console.error("WhatsApp mark read after reply failed:", err?.message || err);
+    }
+  }
 
   return { sent: true, message: result };
 }
@@ -2034,9 +2224,35 @@ async function unassignConversation({
   };
 }
 
+async function markConversationRead({ tenantId, conversationId, userId }) {
+  if (!tenantId || !conversationId || !userId) {
+    throw appError("INVALID_ARGS");
+  }
+
+  const conversation = await getConversationForTenant({
+    tenantId,
+    conversationId,
+    userId,
+  });
+
+  const readState = await upsertConversationReadState({
+    tenantId,
+    conversationId: conversation.id,
+    userId,
+  });
+
+  return {
+    ok: true,
+    conversationId: conversation.id,
+    readState,
+    unreadCount: 0,
+  };
+}
+
 module.exports = {
   listConversations,
   listMessages,
+  markConversationRead,
   reply,
   updateStatus,
   listSaleDrafts,
