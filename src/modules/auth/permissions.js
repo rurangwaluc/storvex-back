@@ -1,5 +1,18 @@
 // backend/src/modules/auth/permissions.js
 // Single source of truth for permission policy.
+//
+// Policy principle:
+// OWNER controls the tenant.
+// MANAGER helps run operations.
+// Staff roles only access the work needed for their job.
+//
+// Do not give MANAGER owner-grade powers such as:
+// - editing store settings
+// - creating/editing/deactivating members
+// - resetting passwords
+// - managing branches
+// - billing control
+// - full audit control
 
 const PERMISSIONS = {
   // Dashboard
@@ -16,7 +29,7 @@ const PERMISSIONS = {
   BRANCHES_EDIT: "BRANCHES_EDIT",
   BRANCHES_ARCHIVE: "BRANCHES_ARCHIVE",
 
-  // Members (staff)
+  // Members / staff
   MEMBERS_VIEW: "MEMBERS_VIEW",
   MEMBERS_CREATE: "MEMBERS_CREATE",
   MEMBERS_EDIT: "MEMBERS_EDIT",
@@ -92,20 +105,15 @@ const ROLE_PERMISSIONS = {
   MANAGER: new Set([
     PERMISSIONS.DASHBOARD_VIEW,
 
+    // Manager may view settings and role policy, but cannot mutate owner-grade settings.
     PERMISSIONS.SETTINGS_VIEW,
-    PERMISSIONS.SETTINGS_EDIT_GENERAL,
     PERMISSIONS.SETTINGS_VIEW_ROLES,
 
+    // Manager may see branches, but cannot create/edit/archive branches.
     PERMISSIONS.BRANCHES_VIEW,
-    PERMISSIONS.BRANCHES_CREATE,
-    PERMISSIONS.BRANCHES_EDIT,
-    PERMISSIONS.BRANCHES_ARCHIVE,
 
+    // Manager may view staff, but cannot create/edit/deactivate/reset passwords.
     PERMISSIONS.MEMBERS_VIEW,
-    PERMISSIONS.MEMBERS_CREATE,
-    PERMISSIONS.MEMBERS_EDIT,
-    PERMISSIONS.MEMBERS_DEACTIVATE,
-    PERMISSIONS.MEMBERS_RESET_PASSWORD,
 
     PERMISSIONS.POS_VIEW,
     PERMISSIONS.POS_CREATE_SALE,
@@ -153,9 +161,6 @@ const ROLE_PERMISSIONS = {
     PERMISSIONS.INTERSTORE_PAY,
     PERMISSIONS.INTERSTORE_PAYMENT_ADD,
     PERMISSIONS.INTERSTORE_AUDIT_VIEW,
-
-    PERMISSIONS.AUDIT_VIEW,
-    PERMISSIONS.BILLING_VIEW,
   ]),
 
   CASHIER: new Set([

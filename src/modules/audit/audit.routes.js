@@ -9,12 +9,20 @@ const {
   listAuditLogs,
   getAuditLogById,
   getAuditLogStats,
+  getAuditBranches,
 } = require("./audit.controller");
 
-router.use(authenticate, requireTenant, requireRole("OWNER"));
+/**
+ * Multi-branch audit access:
+ * - OWNER can see tenant-wide audit logs.
+ * - MANAGER can see audit logs only for assigned branches.
+ * - Service layer enforces branch visibility.
+ */
+router.use(authenticate, requireTenant, requireRole("OWNER", "MANAGER"));
 
 router.get("/", listAuditLogs);
 router.get("/stats", getAuditLogStats);
+router.get("/branches", getAuditBranches);
 router.get("/:id", getAuditLogById);
 
 module.exports = router;

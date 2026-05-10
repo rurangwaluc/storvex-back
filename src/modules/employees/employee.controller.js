@@ -1,16 +1,17 @@
-// src/modules/employees/employee.controller.js
+// backend/src/modules/employees/employee.controller.js
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const prisma = require("../../config/database");
 
 const ALLOWED_ROLES = new Set([
-  "OWNER",
   "MANAGER",
   "CASHIER",
   "SELLER",
   "STOREKEEPER",
   "TECHNICIAN",
 ]);
+
+const SYSTEM_ROLES = new Set(["OWNER", "PLATFORM_ADMIN"]);
 
 function cleanString(value) {
   const s = String(value || "").trim();
@@ -44,23 +45,11 @@ function normalizePhone(value) {
 }
 
 function requireTenantId(req) {
-  const tenantId = cleanString(req.user?.tenantId || req.tenantId);
-  return tenantId || null;
+  return cleanString(req.user?.tenantId || req.tenantId);
 }
 
-function publicEmployee(user) {
-  if (!user) return null;
-
-  return {
-    id: user.id,
-    tenantId: user.tenantId,
-    name: user.name || "",
-    email: user.email || "",
-    phone: user.phone || "",
-    role: user.role,
-    isActive: Boolean(user.isActive),
-    createdAt: user.createdAt || null,
-  };
+function getActorUserId(req) {
+  return cleanString(req.user?.userId || req.user?.id);
 }
 
 function seatMetaFromReq(req) {
@@ -78,7 +67,9 @@ function validateRoleOrThrow(role) {
   const normalized = normalizeRole(role);
 
   if (!ALLOWED_ROLES.has(normalized)) {
-    const err = new Error("Invalid role");
+    const err = new Error(
+      "Invalid role. Staff role must be MANAGER, CASHIER, SELLER, STOREKEEPER, or TECHNICIAN"
+    );
     err.status = 400;
     throw err;
   }
@@ -98,6 +89,126 @@ function validatePasswordOrThrow(password, fieldName = "password") {
   return raw;
 }
 
+function normalizeBranchIds(value) {
+  if (!Array.isArray(value)) return [];
+
+  const seen = new Set();
+  const ids = [];
+
+  for (const item of value) {
+    const id = cleanString(item);
+    if (!id || seen.has(id)) continue;
+
+    seen.add(id);
+    ids.push(id);
+  }
+
+  return ids;
+}
+
+function serializeBranchAssignment(assignment) {
+  if (!assignment) return null;
+
+  return {
+    id: assignment.id,
+    tenantId: assignment.tenantId,
+    userId: assignment.userId,
+    branchId: assignment.branchId,
+    isDefault: Boolean(assignment.isDefault),
+    canOperate: assignment.canOperate !== false,
+    canViewReports: Boolean(assignment.canViewReports),
+    branch: assignment.branch
+      ? {
+          id: assignment.branch.id,
+          tenantId: assignment.branch.tenantId,
+          name: assignment.branch.name,
+          code: assignment.branch.code,
+          type: assignment.branch.type,
+          status: assignment.branch.status,
+          phone: assignment.branch.phone || null,
+          email: assignment.branch.email || null,
+          countryCode: assignment.branch.countryCode || "RW",
+          district: assignment.branch.district || null,
+          sector: assignment.branch.sector || null,
+          address: assignment.branch.address || null,
+          isMain: Boolean(assignment.branch.isMain),
+        }
+      : null,
+  };
+}
+
+function publicEmployee(user) {
+  if (!user) return null;
+
+  const branchAssignments = Array.isArray(user.branchAssignments)
+    ? user.branchAssignments.map(serializeBranchAssignment).filter(Boolean)
+    : [];
+
+  const branches = branchAssignments
+    .map((assignment) => ({
+      ...(assignment.branch || {}),
+      isDefault: Boolean(assignment.isDefault),
+      canOperate: Boolean(assignment.canOperate),
+      canViewReports: Boolean(assignment.canViewReports),
+    }))
+    .filter((branch) => branch?.id);
+
+  return {
+    id: user.id,
+    tenantId: user.tenantId,
+    name: user.name || "",
+    email: user.email || "",
+    phone: user.phone || "",
+    role: user.role,
+    isActive: Boolean(user.isActive),
+    createdAt: user.createdAt || null,
+    branchAssignments,
+    branches,
+  };
+}
+
+function employeeSelect() {
+  return {
+    id: true,
+    tenantId: true,
+    name: true,
+    email: true,
+    phone: true,
+    role: true,
+    isActive: true,
+    createdAt: true,
+    branchAssignments: {
+      orderBy: [{ isDefault: "desc" }, { createdAt: "asc" }],
+      select: {
+        id: true,
+        tenantId: true,
+        userId: true,
+        branchId: true,
+        isDefault: true,
+        canOperate: true,
+        canViewReports: true,
+        branch: {
+          select: {
+            id: true,
+            tenantId: true,
+            name: true,
+            code: true,
+            type: true,
+            status: true,
+            phone: true,
+            email: true,
+            countryCode: true,
+            district: true,
+            sector: true,
+            address: true,
+            isMain: true,
+          },
+        },
+      },
+    },
+  };
+}
+
 async function getEmployeeOrThrow(tenantId, employeeId) {
   const employee = await prisma.user.findFirst({
     where: {
@@ -105,14 +216,7 @@ async function getEmployeeOrThrow(tenantId, employeeId) {
       tenantId,
     },
     select: {
-      id: true,
-      tenantId: true,
-      name: true,
-      email: true,
-      phone: true,
-      role: true,
-      isActive: true,
-      createdAt: true,
+      ...employeeSelect(),
       password: true,
     },
   });
@@ -126,44 +230,26 @@ async function getEmployeeOrThrow(tenantId, employeeId) {
   return employee;
 }
 
-async function ensureSingleOwnerRule(tenantId, nextRole, employeeIdToIgnore = null) {
-  if (nextRole !== "OWNER") return;
+function ensureProtectedAccountIsNotMutated(existing, nextRole, nextIsActive) {
+  const existingRole = normalizeRole(existing?.role);
 
-  const existingOwner = await prisma.user.findFirst({
-    where: {
-      tenantId,
-      role: "OWNER",
-      ...(employeeIdToIgnore ? { id: { not: employeeIdToIgnore } } : {}),
-    },
-    select: { id: true },
-  });
+  if (!SYSTEM_ROLES.has(existingRole)) return;
 
-  if (existingOwner) {
-    const err = new Error("This tenant already has an owner account");
-    err.status = 400;
-    throw err;
-  }
-}
-
-function ensureNotDangerousOwnerMutation(existing, nextRole, nextIsActive) {
-  const isOwner = normalizeRole(existing?.role) === "OWNER";
-  if (!isOwner) return;
-
-  if (nextRole && normalizeRole(nextRole) !== "OWNER") {
-    const err = new Error("Owner role cannot be changed");
+  if (nextRole && normalizeRole(nextRole) !== existingRole) {
+    const err = new Error(`${existingRole} role cannot be changed`);
     err.status = 400;
     throw err;
   }
 
   if (typeof nextIsActive === "boolean" && nextIsActive === false) {
-    const err = new Error("Owner account cannot be deactivated");
+    const err = new Error(`${existingRole} account cannot be deactivated`);
     err.status = 400;
     throw err;
   }
 }
 
 function ensureNotSelfDangerousMutation(req, existing, nextRole, nextIsActive) {
-  const authUserId = cleanString(req.user?.id);
+  const authUserId = getActorUserId(req);
   if (!authUserId || authUserId !== existing.id) return;
 
   if (nextRole && normalizeRole(nextRole) !== normalizeRole(existing.role)) {
@@ -177,6 +263,186 @@ function ensureNotSelfDangerousMutation(req, existing, nextRole, nextIsActive) {
     err.status = 400;
     throw err;
   }
+}
+
+function ensureCanResetPassword(req, existing) {
+  const actorUserId = getActorUserId(req);
+  const existingRole = normalizeRole(existing?.role);
+
+  if (actorUserId && actorUserId === existing.id) {
+    const err = new Error("Use the account password-change flow to reset your own password");
+    err.status = 400;
+    throw err;
+  }
+
+  if (SYSTEM_ROLES.has(existingRole)) {
+    const err = new Error(`${existingRole} password cannot be reset from staff management`);
+    err.status = 400;
+    throw err;
+  }
+}
+
+async function getTenantBranches(tenantId) {
+  return prisma.branch.findMany({
+    where: {
+      tenantId,
+      status: "ACTIVE",
+    },
+    orderBy: [{ isMain: "desc" }, { createdAt: "asc" }],
+    select: {
+      id: true,
+      tenantId: true,
+      isMain: true,
+    },
+  });
+}
+
+async function getDefaultBranchForTenant(tenantId) {
+  const branch = await prisma.branch.findFirst({
+    where: {
+      tenantId,
+      status: "ACTIVE",
+    },
+    orderBy: [{ isMain: "desc" }, { createdAt: "asc" }],
+    select: {
+      id: true,
+    },
+  });
+
+  return branch?.id || null;
+}
+
+async function assertBranchesBelongToTenant(tenantId, branchIds) {
+  const cleanIds = normalizeBranchIds(branchIds);
+
+  if (!cleanIds.length) return [];
+
+  const found = await prisma.branch.findMany({
+    where: {
+      tenantId,
+      id: { in: cleanIds },
+      status: "ACTIVE",
+    },
+    select: {
+      id: true,
+    },
+  });
+
+  const foundIds = new Set(found.map((branch) => branch.id));
+
+  const missing = cleanIds.filter((id) => !foundIds.has(id));
+  if (missing.length) {
+    const err = new Error("One or more selected branches are invalid");
+    err.status = 400;
+    err.code = "INVALID_BRANCH_SELECTION";
+    throw err;
+  }
+
+  return cleanIds;
+}
+
+async function replaceUserBranchAssignmentsTx(tx, { tenantId, userId, branchIds, defaultBranchId }) {
+  const selectedBranchIds = normalizeBranchIds(branchIds);
+
+  await tx.userBranchAssignment.deleteMany({
+    where: {
+      tenantId,
+      userId,
+    },
+  });
+
+  if (!selectedBranchIds.length) return;
+
+  const cleanDefaultBranchId =
+    cleanString(defaultBranchId) && selectedBranchIds.includes(cleanString(defaultBranchId))
+      ? cleanString(defaultBranchId)
+      : selectedBranchIds[0];
+
+  await tx.userBranchAssignment.createMany({
+    data: selectedBranchIds.map((branchId) => ({
+      tenantId,
+      userId,
+      branchId,
+      isDefault: branchId === cleanDefaultBranchId,
+      canOperate: true,
+      canViewReports: true,
+    })),
+    skipDuplicates: true,
+  });
+}
+
+async function resolveBranchAssignmentInput({ tenantId, role, payload, existingEmployee = null }) {
+  const body = payload || {};
+  const requestedBranchIds = normalizeBranchIds(body.branchIds);
+  const requestedDefaultBranchId = cleanString(body.defaultBranchId);
+  const canViewAllBranches = normalizeBoolean(body.canViewAllBranches) === true;
+
+  if (canViewAllBranches) {
+    const branches = await getTenantBranches(tenantId);
+    const branchIds = branches.map((branch) => branch.id);
+    const mainBranchId = branches.find((branch) => branch.isMain)?.id || branchIds[0] || null;
+
+    return {
+      shouldUpdateAssignments: true,
+      branchIds,
+      defaultBranchId: mainBranchId,
+    };
+  }
+
+  if (role === "OWNER") {
+    const branches = await getTenantBranches(tenantId);
+    const branchIds = branches.map((branch) => branch.id);
+    const mainBranchId = branches.find((branch) => branch.isMain)?.id || branchIds[0] || null;
+
+    return {
+      shouldUpdateAssignments: true,
+      branchIds,
+      defaultBranchId: mainBranchId,
+    };
+  }
+
+  if ("branchIds" in body || "defaultBranchId" in body) {
+    const branchIds = await assertBranchesBelongToTenant(tenantId, requestedBranchIds);
+
+    if (branchIds.length === 0) {
+      const fallbackBranchId = await getDefaultBranchForTenant(tenantId);
+
+      return {
+        shouldUpdateAssignments: true,
+        branchIds: fallbackBranchId ? [fallbackBranchId] : [],
+        defaultBranchId: fallbackBranchId,
+      };
+    }
+
+    if (requestedDefaultBranchId && !branchIds.includes(requestedDefaultBranchId)) {
+      const err = new Error("Default branch must be one of the selected branches");
+      err.status = 400;
+      err.code = "INVALID_DEFAULT_BRANCH";
+      throw err;
+    }
+
+    return {
+      shouldUpdateAssignments: true,
+      branchIds,
+      defaultBranchId: requestedDefaultBranchId || branchIds[0],
+    };
+  }
+
+  if (existingEmployee) {
+    return {
+      shouldUpdateAssignments: false,
+      branchIds: [],
+      defaultBranchId: null,
+    };
+  }
+
+  const fallbackBranchId = await getDefaultBranchForTenant(tenantId);
+
+  return {
+    shouldUpdateAssignments: true,
+    branchIds: fallbackBranchId ? [fallbackBranchId] : [],
+    defaultBranchId: fallbackBranchId,
+  };
 }
 
 async function listEmployees(req, res) {
@@ -212,16 +478,7 @@ async function listEmployees(req, res) {
 
     const users = await prisma.user.findMany({
       where,
-      select: {
-        id: true,
-        tenantId: true,
-        name: true,
-        email: true,
-        phone: true,
-        role: true,
-        isActive: true,
-        createdAt: true,
-      },
+      select: employeeSelect(),
       orderBy: [{ role: "asc" }, { createdAt: "asc" }],
     });
 
@@ -258,30 +515,45 @@ async function createEmployee(req, res) {
       return res.status(400).json({ message: "email is required" });
     }
 
-    await ensureSingleOwnerRule(tenantId, role);
+    const assignmentInput = await resolveBranchAssignmentInput({
+      tenantId,
+      role,
+      payload: req.body || {},
+    });
 
     const hashedPassword = await hashPassword(password);
 
-    const created = await prisma.user.create({
-      data: {
+    const created = await prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: {
+          tenantId,
+          name,
+          email,
+          phone,
+          role,
+          isActive: true,
+          password: hashedPassword,
+        },
+        select: {
+          id: true,
+          tenantId: true,
+        },
+      });
+
+      await replaceUserBranchAssignmentsTx(tx, {
         tenantId,
-        name,
-        email,
-        phone,
-        role,
-        isActive: true,
-        password: hashedPassword,
-      },
-      select: {
-        id: true,
-        tenantId: true,
-        name: true,
-        email: true,
-        phone: true,
-        role: true,
-        isActive: true,
-        createdAt: true,
-      },
+        userId: user.id,
+        branchIds: assignmentInput.branchIds,
+        defaultBranchId: assignmentInput.defaultBranchId,
+      });
+
+      return tx.user.findFirst({
+        where: {
+          id: user.id,
+          tenantId,
+        },
+        select: employeeSelect(),
+      });
     });
 
     return res.status(201).json({
@@ -334,12 +606,17 @@ async function updateEmployee(req, res) {
       return res.status(400).json({ message: "isActive must be boolean" });
     }
 
-    ensureNotDangerousOwnerMutation(existing, role, isActive);
+    ensureProtectedAccountIsNotMutated(existing, role, isActive);
     ensureNotSelfDangerousMutation(req, existing, role, isActive);
 
-    if (role) {
-      await ensureSingleOwnerRule(tenantId, role, existing.id);
-    }
+    const nextRole = role || existing.role;
+
+    const assignmentInput = await resolveBranchAssignmentInput({
+      tenantId,
+      role: nextRole,
+      payload: req.body || {},
+      existingEmployee: existing,
+    });
 
     const data = {};
     if (name !== undefined) data.name = name;
@@ -348,19 +625,33 @@ async function updateEmployee(req, res) {
     if (role !== undefined) data.role = role;
     if (typeof isActive === "boolean") data.isActive = isActive;
 
-    const updated = await prisma.user.update({
-      where: { id: existing.id },
-      data,
-      select: {
-        id: true,
-        tenantId: true,
-        name: true,
-        email: true,
-        phone: true,
-        role: true,
-        isActive: true,
-        createdAt: true,
-      },
+    if (req.body?.password) {
+      data.password = await hashPassword(validatePasswordOrThrow(req.body.password));
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: existing.id },
+        data,
+        select: { id: true },
+      });
+
+      if (assignmentInput.shouldUpdateAssignments) {
+        await replaceUserBranchAssignmentsTx(tx, {
+          tenantId,
+          userId: existing.id,
+          branchIds: assignmentInput.branchIds,
+          defaultBranchId: assignmentInput.defaultBranchId,
+        });
+      }
+
+      return tx.user.findFirst({
+        where: {
+          id: existing.id,
+          tenantId,
+        },
+        select: employeeSelect(),
+      });
     });
 
     return res.json({
@@ -407,22 +698,13 @@ async function setEmployeeActiveStatus(req, res) {
 
     const existing = await getEmployeeOrThrow(tenantId, employeeId);
 
-    ensureNotDangerousOwnerMutation(existing, existing.role, isActive);
+    ensureProtectedAccountIsNotMutated(existing, existing.role, isActive);
     ensureNotSelfDangerousMutation(req, existing, existing.role, isActive);
 
     const updated = await prisma.user.update({
       where: { id: existing.id },
       data: { isActive },
-      select: {
-        id: true,
-        tenantId: true,
-        name: true,
-        email: true,
-        phone: true,
-        role: true,
-        isActive: true,
-        createdAt: true,
-      },
+      select: employeeSelect(),
     });
 
     return res.json({
@@ -455,9 +737,13 @@ async function resetEmployeePassword(req, res) {
 
     const existing = await getEmployeeOrThrow(tenantId, employeeId);
 
+    ensureCanResetPassword(req, existing);
+
     let nextPassword = cleanString(req.body?.password || req.body?.newPassword);
-    if (!nextPassword && req.body?.generate === true) {
-      nextPassword = crypto.randomBytes(4).toString("hex");
+    const generated = req.body?.generate === true;
+
+    if (!nextPassword && generated) {
+      nextPassword = crypto.randomBytes(5).toString("hex");
     }
 
     if (!nextPassword) {
@@ -473,13 +759,14 @@ async function resetEmployeePassword(req, res) {
     await prisma.user.update({
       where: { id: existing.id },
       data: { password: hashedPassword },
+      select: { id: true },
     });
 
     return res.json({
       updated: true,
       message: "Password reset successful",
       employeeId: existing.id,
-      generatedPassword: req.body?.generate === true ? nextPassword : undefined,
+      generatedPassword: generated ? nextPassword : undefined,
     });
   } catch (err) {
     console.error("resetEmployeePassword error:", err);
@@ -503,14 +790,15 @@ async function deleteEmployee(req, res) {
     }
 
     const existing = await getEmployeeOrThrow(tenantId, employeeId);
+    const existingRole = normalizeRole(existing.role);
 
-    if (normalizeRole(existing.role) === "OWNER") {
+    if (SYSTEM_ROLES.has(existingRole)) {
       return res.status(400).json({
-        message: "Owner account cannot be deleted",
+        message: `${existingRole} account cannot be deleted`,
       });
     }
 
-    if (cleanString(req.user?.id) === existing.id) {
+    if (getActorUserId(req) === existing.id) {
       return res.status(400).json({
         message: "You cannot delete your own account",
       });
@@ -521,16 +809,7 @@ async function deleteEmployee(req, res) {
       data: {
         isActive: false,
       },
-      select: {
-        id: true,
-        tenantId: true,
-        name: true,
-        email: true,
-        phone: true,
-        role: true,
-        isActive: true,
-        createdAt: true,
-      },
+      select: employeeSelect(),
     });
 
     return res.json({
