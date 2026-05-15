@@ -1,23 +1,32 @@
+// src/modules/suppliers/suppliers.controller.js
+const { Prisma } = require("@prisma/client");
 const prisma = require("../../config/database");
 
-// small helpers
-function cleanString(x) {
-  const s = x == null ? "" : String(x).trim();
+function cleanString(value) {
+  const s = value == null ? "" : String(value).trim();
   return s || null;
 }
 
-function toInt(x, fallback = NaN) {
-  const n = Number(x);
+function cleanStringStrict(value) {
+  return String(value || "").trim();
+}
+
+function toInt(value, fallback = NaN) {
+  const n = Number(value);
   return Number.isFinite(n) ? Math.floor(n) : fallback;
 }
 
-function toMoney(x, fallback = NaN) {
-  const n = typeof x === "string" ? Number(x.trim()) : Number(x);
+function toMoney(value, fallback = NaN) {
+  const n = typeof value === "string" ? Number(value.trim()) : Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
 
 function getTenantId(req) {
-  return req.user?.tenantId || null;
+  return req.user?.tenantId || req.tenantId || null;
+}
+
+function getUserId(req) {
+  return req.user?.userId || req.user?.id || null;
 }
 
 function getActiveBranchId(req) {
@@ -28,54 +37,213 @@ function canViewAllBranches(req) {
   return Boolean(req.user?.canViewAllBranches);
 }
 
+function getAllowedBranchIds(req) {
+  return Array.isArray(req.user?.allowedBranchIds) ? req.user.allowedBranchIds.filter(Boolean) : [];
+}
+
+function modelHasField(modelName, fieldName) {
+  const model = Prisma.dmmf?.datamodel?.models?.find((item) => item.name === modelName);
+  return Boolean(model?.fields?.some((field) => field.name === fieldName));
+}
+
+function modelExists(modelName) {
+  return Boolean(Prisma.dmmf?.datamodel?.models?.some((item) => item.name === modelName));
+}
+
+const HAS_SUPPLIER_SUPPLY_BRANCH = modelHasField("SupplierSupply", "branchId");
+const HAS_BRANCH_INVENTORY = modelExists("BranchInventory");
+const HAS_STOCK_ADJUSTMENT_BRANCH = modelHasField("StockAdjustment", "branchId");
+
+const ID_TYPES = new Set(["NATIONAL_ID", "PASSPORT"]);
+const SUPPLIER_SOURCE_TYPES = new Set(["BOUGHT", "GIFT", "TRADE_IN", "CONSIGNMENT", "OTHER"]);
+const SUPPLY_SOURCE_TYPES = new Set(["BOUGHT", "GIFT", "TRADE_IN", "CONSIGNMENT", "OTHER"]);
+
+function normalizeIdType(value) {
+  const x = cleanStringStrict(value).toUpperCase();
+  return ID_TYPES.has(x) ? x : null;
+}
+
+function normalizeSupplierSourceType(value) {
+  const x = cleanStringStrict(value).toUpperCase();
+  return SUPPLIER_SOURCE_TYPES.has(x) ? x : "OTHER";
+}
+
+function normalizeSupplySourceType(value) {
+  const x = cleanStringStrict(value).toUpperCase();
+  return SUPPLY_SOURCE_TYPES.has(x) ? x : "OTHER";
+}
+
+function serializeBranch(branch) {
+  if (!branch) return null;
+
+  return {
+    id: branch.id,
+    name: branch.name || "",
+    code: branch.code || "",
+    status: branch.status || "",
+    isMain: Boolean(branch.isMain),
+  };
+}
+
+function serializeSupplier(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    tenantId: row.tenantId,
+    name: row.name,
+    idType: row.idType,
+    idNumber: row.idNumber,
+    phone: row.phone || null,
+    email: row.email || null,
+    address: row.address || null,
+    notes: row.notes || null,
+    isActive: Boolean(row.isActive),
+    companyName: row.companyName || null,
+    taxId: row.taxId || null,
+    sourceType: row.sourceType || "OTHER",
+    sourceDetails: row.sourceDetails || null,
+    verifiedAt: row.verifiedAt || null,
+    createdAt: row.createdAt || null,
+    updatedAt: row.updatedAt || null,
+  };
+}
+
+function serializeSupply(row) {
+  const items = Array.isArray(row?.SupplierSupplyItem) ? row.SupplierSupplyItem : [];
+
+  const totalCost = items.reduce(
+    (sum, item) => sum + Number(item.buyPrice || 0) * Number(item.quantity || 0),
+    0
+  );
+
+  const totalSell = items.reduce(
+    (sum, item) => sum + Number(item.sellPrice || 0) * Number(item.quantity || 0),
+    0
+  );
+
+  return {
+    id: row.id,
+    tenantId: row.tenantId,
+    supplierId: row.supplierId,
+    branchId: row.branchId || null,
+    branch: serializeBranch(row.branch),
+    sourceType: row.sourceType || "OTHER",
+    sourceDetails: row.sourceDetails || null,
+    documentRef: row.documentRef || null,
+    notes: row.notes || null,
+    createdAt: row.createdAt || null,
+    itemsCount: items.length,
+    totalCost,
+    totalSell,
+    items: items.map((item) => ({
+      id: item.id,
+      productId: item.productId || null,
+      productName: item.productName,
+      category: item.category || null,
+      subcategory: item.subcategory || null,
+      subcategoryOther: item.subcategoryOther || null,
+      brand: item.brand || null,
+      serial: item.serial || null,
+      quantity: Number(item.quantity || 0),
+      buyPrice: Number(item.buyPrice || 0),
+      sellPrice: Number(item.sellPrice || 0),
+      notes: item.notes || null,
+    })),
+  };
+}
+
+function branchScopePayload(scope) {
+  return {
+    mode: scope?.mode || "SINGLE_BRANCH",
+    branchId: scope?.branchId || null,
+    canViewAllBranches: Boolean(scope?.canViewAllBranches),
+    allowedBranchIds: Array.isArray(scope?.allowedBranchIds) ? scope.allowedBranchIds : [],
+  };
+}
+
+function throwBranchError(code) {
+  const err = new Error(code);
+  err.code = code;
+  throw err;
+}
+
 function resolveSupplierBranchScope(req) {
   const requestedBranchId =
-    cleanString(req.query?.branchId) ||
-    cleanString(req.headers["x-branch-id"]) ||
-    null;
+    cleanString(req.query?.branchId) || cleanString(req.headers["x-branch-id"]) || null;
 
   const allBranchesRequested =
-    String(req.query?.allBranches || "")
-      .trim()
-      .toLowerCase() === "true";
+    cleanStringStrict(req.query?.allBranches).toLowerCase() === "true";
 
-  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
-    ? req.user.allowedBranchIds
-    : [];
+  const allowedBranchIds = getAllowedBranchIds(req);
+  const canSeeAll = canViewAllBranches(req);
 
   if (allBranchesRequested) {
-    if (!canViewAllBranches(req)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
-      throw e;
-    }
+    if (!canSeeAll) throwBranchError("BRANCH_ACCESS_DENIED");
 
     return {
       mode: "ALL_BRANCHES",
       branchId: null,
+      canViewAllBranches: true,
       allowedBranchIds,
     };
   }
 
   if (requestedBranchId) {
-    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
-      throw e;
+    if (!canSeeAll && !allowedBranchIds.includes(requestedBranchId)) {
+      throwBranchError("BRANCH_ACCESS_DENIED");
     }
 
     return {
       mode: "SINGLE_BRANCH",
       branchId: requestedBranchId,
+      canViewAllBranches: canSeeAll,
+      allowedBranchIds,
+    };
+  }
+
+  const activeBranchId = getActiveBranchId(req);
+
+  if (activeBranchId) {
+    if (!canSeeAll && !allowedBranchIds.includes(activeBranchId)) {
+      throwBranchError("BRANCH_ACCESS_DENIED");
+    }
+
+    return {
+      mode: "SINGLE_BRANCH",
+      branchId: activeBranchId,
+      canViewAllBranches: canSeeAll,
+      allowedBranchIds,
+    };
+  }
+
+  if (canSeeAll) {
+    return {
+      mode: "ALL_BRANCHES",
+      branchId: null,
+      canViewAllBranches: true,
       allowedBranchIds,
     };
   }
 
   return {
-    mode: "SINGLE_BRANCH",
-    branchId: getActiveBranchId(req),
+    mode: "NO_BRANCH",
+    branchId: null,
+    canViewAllBranches: false,
     allowedBranchIds,
   };
+}
+
+function supplyBranchWhere(scope) {
+  if (!HAS_SUPPLIER_SUPPLY_BRANCH) return {};
+
+  if (scope?.mode === "ALL_BRANCHES") return {};
+
+  if (scope?.mode === "SINGLE_BRANCH" && scope?.branchId) {
+    return { branchId: scope.branchId };
+  }
+
+  return { branchId: "__NO_BRANCH_ACCESS__" };
 }
 
 async function ensureWritableBranchAccessOrThrow(req) {
@@ -83,19 +251,13 @@ async function ensureWritableBranchAccessOrThrow(req) {
   const branchId = getActiveBranchId(req);
 
   if (!tenantId || !branchId) {
-    const e = new Error("BRANCH_REQUIRED");
-    e.code = "BRANCH_REQUIRED";
-    throw e;
+    throwBranchError("BRANCH_REQUIRED");
   }
 
-  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
-    ? req.user.allowedBranchIds
-    : [];
+  const allowedBranchIds = getAllowedBranchIds(req);
 
-  if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(branchId)) {
-    const e = new Error("BRANCH_ACCESS_DENIED");
-    e.code = "BRANCH_ACCESS_DENIED";
-    throw e;
+  if (!canViewAllBranches(req) && !allowedBranchIds.includes(branchId)) {
+    throwBranchError("BRANCH_ACCESS_DENIED");
   }
 
   const branch = await prisma.branch.findFirst({
@@ -116,95 +278,87 @@ async function ensureWritableBranchAccessOrThrow(req) {
     },
   });
 
-  if (!branch) {
-    const e = new Error("BRANCH_NOT_FOUND");
-    e.code = "BRANCH_NOT_FOUND";
-    throw e;
-  }
-
-  if (branch.status !== "ACTIVE") {
-    const e = new Error("BRANCH_NOT_ACTIVE");
-    e.code = "BRANCH_NOT_ACTIVE";
-    throw e;
-  }
+  if (!branch) throwBranchError("BRANCH_NOT_FOUND");
+  if (branch.status !== "ACTIVE") throwBranchError("BRANCH_NOT_ACTIVE");
 
   return branch;
 }
 
-async function createOrSetBranchInventoryIfPossible(tx, { tenantId, branchId, productId, qtyOnHand }) {
-  if (!branchId || !tx.branchInventory || typeof tx.branchInventory.upsert !== "function") {
-    return null;
-  }
+async function incrementBranchInventoryIfPossible(tx, { tenantId, branchId, productId, quantity }) {
+  if (!HAS_BRANCH_INVENTORY || !tx.branchInventory || !branchId || !productId) return null;
 
-  const compositeWhere =
-    tx.branchInventory.fields &&
-    typeof tx.branchInventory.fields.branchId !== "undefined"
-      ? {
-          tenantId_branchId_productId: {
-            tenantId,
-            branchId,
-            productId,
-          },
-        }
-      : null;
+  const existing = await tx.branchInventory.findFirst({
+    where: {
+      tenantId,
+      branchId,
+      productId,
+    },
+    select: {
+      id: true,
+      qtyOnHand: true,
+    },
+  });
 
-  if (!compositeWhere) {
-    const existing = await tx.branchInventory.findFirst({
-      where: { tenantId, branchId, productId },
-      select: { id: true },
-    });
-
-    if (existing) {
-      return tx.branchInventory.update({
-        where: { id: existing.id },
-        data: { qtyOnHand },
-      });
-    }
-
-    return tx.branchInventory.create({
+  if (existing) {
+    return tx.branchInventory.update({
+      where: { id: existing.id },
       data: {
-        tenantId,
-        branchId,
-        productId,
-        qtyOnHand,
+        qtyOnHand: Number(existing.qtyOnHand || 0) + Number(quantity || 0),
       },
     });
   }
 
-  return tx.branchInventory.upsert({
-    where: compositeWhere,
-    update: { qtyOnHand },
-    create: {
+  return tx.branchInventory.create({
+    data: {
       tenantId,
       branchId,
       productId,
-      qtyOnHand,
+      qtyOnHand: Number(quantity || 0),
     },
   });
 }
 
-const ID_TYPES = new Set(["NATIONAL_ID", "PASSPORT"]);
-const SUPPLIER_SOURCE_TYPES = new Set(["BOUGHT", "GIFT", "TRADE_IN", "CONSIGNMENT", "OTHER"]);
-const SUPPLY_SOURCE_TYPES = new Set(["BOUGHT", "GIFT", "TRADE_IN", "CONSIGNMENT", "OTHER"]);
+function handleBranchError(res, err) {
+  const code = String(err?.code || err?.message || "");
 
-function normalizeIdType(v) {
-  const x = String(v || "").trim().toUpperCase();
-  return ID_TYPES.has(x) ? x : null;
+  if (code === "BRANCH_REQUIRED") {
+    return res.status(400).json({
+      message: "No active branch selected",
+      code: "BRANCH_REQUIRED",
+    });
+  }
+
+  if (code === "BRANCH_ACCESS_DENIED") {
+    return res.status(403).json({
+      message: "Branch access denied",
+      code: "BRANCH_ACCESS_DENIED",
+    });
+  }
+
+  if (code === "BRANCH_NOT_FOUND") {
+    return res.status(404).json({
+      message: "Branch not found",
+      code: "BRANCH_NOT_FOUND",
+    });
+  }
+
+  if (code === "BRANCH_NOT_ACTIVE") {
+    return res.status(409).json({
+      message: "Selected branch is not active",
+      code: "BRANCH_NOT_ACTIVE",
+    });
+  }
+
+  return null;
 }
 
-function normalizeSupplierSourceType(v) {
-  const x = String(v || "").trim().toUpperCase();
-  return SUPPLIER_SOURCE_TYPES.has(x) ? x : "OTHER";
+function isDuplicateError(err) {
+  const code = String(err?.code || "");
+  const msg = String(err?.message || "").toLowerCase();
+
+  return code === "P2002" || msg.includes("unique") || msg.includes("duplicate");
 }
 
-function normalizeSupplySourceType(v) {
-  const x = String(v || "").trim().toUpperCase();
-  return SUPPLY_SOURCE_TYPES.has(x) ? x : "OTHER";
-}
-
-// -----------------------
-// GET /api/suppliers
-// -----------------------
 async function listSuppliers(req, res) {
   try {
     const tenantId = getTenantId(req);
@@ -212,9 +366,12 @@ async function listSuppliers(req, res) {
 
     const q = cleanString(req.query.q);
     const activeRaw = cleanString(req.query.active);
-    const active = activeRaw == null ? true : String(activeRaw).toLowerCase() === "true";
+    const active = activeRaw == null ? true : cleanStringStrict(activeRaw).toLowerCase() === "true";
 
-    const where = { tenantId, isActive: active };
+    const where = {
+      tenantId,
+      isActive: active,
+    };
 
     if (q) {
       where.OR = [
@@ -231,28 +388,35 @@ async function listSuppliers(req, res) {
       take: 200,
       select: {
         id: true,
+        tenantId: true,
         name: true,
         idType: true,
         idNumber: true,
         phone: true,
+        email: true,
+        address: true,
+        notes: true,
         isActive: true,
         companyName: true,
+        taxId: true,
         sourceType: true,
+        sourceDetails: true,
         verifiedAt: true,
         createdAt: true,
+        updatedAt: true,
       },
     });
 
-    return res.json({ suppliers: rows, count: rows.length });
+    return res.json({
+      suppliers: rows.map(serializeSupplier),
+      count: rows.length,
+    });
   } catch (err) {
     console.error("listSuppliers error:", err);
     return res.status(500).json({ message: "Failed to load suppliers" });
   }
 }
 
-// -----------------------
-// POST /api/suppliers
-// -----------------------
 async function createSupplier(req, res) {
   try {
     const tenantId = getTenantId(req);
@@ -262,48 +426,59 @@ async function createSupplier(req, res) {
     const idType = normalizeIdType(req.body.idType);
     const idNumber = cleanString(req.body.idNumber);
 
-    if (!name) return res.status(400).json({ message: "name is required" });
-    if (!idType) {
-      return res.status(400).json({ message: "idType must be NATIONAL_ID or PASSPORT" });
-    }
-    if (!idNumber) return res.status(400).json({ message: "idNumber is required" });
+    if (!name) return res.status(400).json({ message: "Supplier name is required" });
 
-    const data = {
-      tenantId,
-      name,
-      idType,
-      idNumber,
-      phone: cleanString(req.body.phone),
-      email: cleanString(req.body.email),
-      address: cleanString(req.body.address),
-      notes: cleanString(req.body.notes),
-      companyName: cleanString(req.body.companyName),
-      taxId: cleanString(req.body.taxId),
-      sourceType: normalizeSupplierSourceType(req.body.sourceType),
-      sourceDetails: cleanString(req.body.sourceDetails),
-      isActive: true,
-    };
+    if (!idType) {
+      return res.status(400).json({ message: "ID type must be National ID or Passport" });
+    }
+
+    if (!idNumber) {
+      return res.status(400).json({ message: "ID number is required" });
+    }
 
     const created = await prisma.supplier.create({
-      data,
+      data: {
+        tenantId,
+        name,
+        idType,
+        idNumber,
+        phone: cleanString(req.body.phone),
+        email: cleanString(req.body.email),
+        address: cleanString(req.body.address),
+        notes: cleanString(req.body.notes),
+        companyName: cleanString(req.body.companyName),
+        taxId: cleanString(req.body.taxId),
+        sourceType: normalizeSupplierSourceType(req.body.sourceType),
+        sourceDetails: cleanString(req.body.sourceDetails),
+        isActive: true,
+      },
       select: {
         id: true,
+        tenantId: true,
         name: true,
         idType: true,
         idNumber: true,
         phone: true,
-        companyName: true,
-        sourceType: true,
-        verifiedAt: true,
+        email: true,
+        address: true,
+        notes: true,
         isActive: true,
+        companyName: true,
+        taxId: true,
+        sourceType: true,
+        sourceDetails: true,
+        verifiedAt: true,
         createdAt: true,
+        updatedAt: true,
       },
     });
 
-    return res.status(201).json({ created: true, supplier: created });
+    return res.status(201).json({
+      created: true,
+      supplier: serializeSupplier(created),
+    });
   } catch (err) {
-    const msg = String(err?.message || "");
-    if (msg.toLowerCase().includes("unique") || msg.toLowerCase().includes("duplicate")) {
+    if (isDuplicateError(err)) {
       return res.status(400).json({
         message: "This ID is already used for another supplier in this store.",
       });
@@ -314,19 +489,18 @@ async function createSupplier(req, res) {
   }
 }
 
-// -----------------------
-// GET /api/suppliers/:id
-// -----------------------
 async function getSupplier(req, res) {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
-    const id = String(req.params.id || "");
+    const id = cleanStringStrict(req.params.id);
+
     const supplier = await prisma.supplier.findFirst({
       where: { id, tenantId },
       select: {
         id: true,
+        tenantId: true,
         name: true,
         idType: true,
         idNumber: true,
@@ -334,63 +508,66 @@ async function getSupplier(req, res) {
         email: true,
         address: true,
         notes: true,
+        isActive: true,
         companyName: true,
         taxId: true,
         sourceType: true,
         sourceDetails: true,
         verifiedAt: true,
-        isActive: true,
         createdAt: true,
         updatedAt: true,
       },
     });
 
     if (!supplier) return res.status(404).json({ message: "Supplier not found" });
-    return res.json(supplier);
+
+    return res.json(serializeSupplier(supplier));
   } catch (err) {
     console.error("getSupplier error:", err);
     return res.status(500).json({ message: "Failed to load supplier" });
   }
 }
 
-// -----------------------
-// PUT /api/suppliers/:id
-// -----------------------
 async function updateSupplier(req, res) {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
-    const id = String(req.params.id || "");
+    const id = cleanStringStrict(req.params.id);
     const data = {};
 
-    if (req.body.name != null) data.name = cleanString(req.body.name);
-    if (req.body.phone != null) data.phone = cleanString(req.body.phone);
-    if (req.body.email != null) data.email = cleanString(req.body.email);
-    if (req.body.address != null) data.address = cleanString(req.body.address);
-    if (req.body.notes != null) data.notes = cleanString(req.body.notes);
-    if (req.body.companyName != null) data.companyName = cleanString(req.body.companyName);
-    if (req.body.taxId != null) data.taxId = cleanString(req.body.taxId);
+    if (req.body.name != null) {
+      const name = cleanString(req.body.name);
+      if (!name) return res.status(400).json({ message: "Supplier name cannot be empty" });
+      data.name = name;
+    }
 
-    if (req.body.idType != null) {
-      const t = normalizeIdType(req.body.idType);
-      if (!t) {
-        return res.status(400).json({ message: "idType must be NATIONAL_ID or PASSPORT" });
+    if (req.body.phone !== undefined) data.phone = cleanString(req.body.phone);
+    if (req.body.email !== undefined) data.email = cleanString(req.body.email);
+    if (req.body.address !== undefined) data.address = cleanString(req.body.address);
+    if (req.body.notes !== undefined) data.notes = cleanString(req.body.notes);
+    if (req.body.companyName !== undefined) data.companyName = cleanString(req.body.companyName);
+    if (req.body.taxId !== undefined) data.taxId = cleanString(req.body.taxId);
+
+    if (req.body.idType !== undefined) {
+      const idType = normalizeIdType(req.body.idType);
+      if (!idType) {
+        return res.status(400).json({ message: "ID type must be National ID or Passport" });
       }
-      data.idType = t;
+      data.idType = idType;
     }
 
-    if (req.body.idNumber != null) {
-      const n = cleanString(req.body.idNumber);
-      if (!n) return res.status(400).json({ message: "idNumber cannot be empty" });
-      data.idNumber = n;
+    if (req.body.idNumber !== undefined) {
+      const idNumber = cleanString(req.body.idNumber);
+      if (!idNumber) return res.status(400).json({ message: "ID number cannot be empty" });
+      data.idNumber = idNumber;
     }
 
-    if (req.body.sourceType != null) {
+    if (req.body.sourceType !== undefined) {
       data.sourceType = normalizeSupplierSourceType(req.body.sourceType);
     }
 
-    if (req.body.sourceDetails != null) {
+    if (req.body.sourceDetails !== undefined) {
       data.sourceDetails = cleanString(req.body.sourceDetails);
     }
 
@@ -407,12 +584,30 @@ async function updateSupplier(req, res) {
 
     const updated = await prisma.supplier.findFirst({
       where: { id, tenantId },
+      select: {
+        id: true,
+        tenantId: true,
+        name: true,
+        idType: true,
+        idNumber: true,
+        phone: true,
+        email: true,
+        address: true,
+        notes: true,
+        isActive: true,
+        companyName: true,
+        taxId: true,
+        sourceType: true,
+        sourceDetails: true,
+        verifiedAt: true,
+        createdAt: true,
+        updatedAt: true,
+      },
     });
 
-    return res.json(updated);
+    return res.json(serializeSupplier(updated));
   } catch (err) {
-    const msg = String(err?.message || "");
-    if (msg.toLowerCase().includes("unique") || msg.toLowerCase().includes("duplicate")) {
+    if (isDuplicateError(err)) {
       return res.status(400).json({
         message: "This ID is already used for another supplier in this store.",
       });
@@ -423,21 +618,19 @@ async function updateSupplier(req, res) {
   }
 }
 
-// -----------------------
-// PATCH /api/suppliers/:id/activate
-// -----------------------
 async function activateSupplier(req, res) {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
-    const id = String(req.params.id || "");
-    const r = await prisma.supplier.updateMany({
+    const id = cleanStringStrict(req.params.id);
+
+    const result = await prisma.supplier.updateMany({
       where: { id, tenantId, isActive: false },
       data: { isActive: true },
     });
 
-    if (r.count === 0) {
+    if (result.count === 0) {
       return res.status(404).json({ message: "Supplier not found or already active" });
     }
 
@@ -448,21 +641,19 @@ async function activateSupplier(req, res) {
   }
 }
 
-// -----------------------
-// PATCH /api/suppliers/:id/deactivate
-// -----------------------
 async function deactivateSupplier(req, res) {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
-    const id = String(req.params.id || "");
-    const r = await prisma.supplier.updateMany({
+    const id = cleanStringStrict(req.params.id);
+
+    const result = await prisma.supplier.updateMany({
       where: { id, tenantId, isActive: true },
       data: { isActive: false },
     });
 
-    if (r.count === 0) {
+    if (result.count === 0) {
       return res.status(404).json({ message: "Supplier not found or already inactive" });
     }
 
@@ -473,29 +664,37 @@ async function deactivateSupplier(req, res) {
   }
 }
 
-// -----------------------
-// GET /api/suppliers/:id/supplies
-// -----------------------
 async function listSupplies(req, res) {
   try {
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
+    const supplierId = cleanStringStrict(req.params.id);
     const scope = resolveSupplierBranchScope(req);
-    const supplierId = String(req.params.id || "");
+
+    const supplier = await prisma.supplier.findFirst({
+      where: { id: supplierId, tenantId },
+      select: { id: true },
+    });
+
+    if (!supplier) return res.status(404).json({ message: "Supplier not found" });
+
     const rows = await prisma.supplierSupply.findMany({
       where: {
         tenantId,
         supplierId,
-        ...(scope.mode === "SINGLE_BRANCH" && scope.branchId ? { branchId: scope.branchId } : {}),
+        ...supplyBranchWhere(scope),
       },
       orderBy: [{ createdAt: "desc" }],
       take: 100,
       select: {
         id: true,
+        tenantId: true,
         branchId: true,
+        supplierId: true,
         createdAt: true,
         sourceType: true,
+        sourceDetails: true,
         documentRef: true,
         notes: true,
         branch: {
@@ -512,78 +711,69 @@ async function listSupplies(req, res) {
             id: true,
             productId: true,
             productName: true,
+            category: true,
+            subcategory: true,
+            subcategoryOther: true,
+            brand: true,
+            serial: true,
             quantity: true,
             buyPrice: true,
             sellPrice: true,
-            serial: true,
+            notes: true,
           },
         },
       },
     });
 
-    const supplies = rows.map((s) => {
-      const items = s.SupplierSupplyItem || [];
-      const totalCost = items.reduce(
-        (sum, it) => sum + Number(it.buyPrice || 0) * Number(it.quantity || 0),
-        0
-      );
-      const totalSell = items.reduce(
-        (sum, it) => sum + Number(it.sellPrice || 0) * Number(it.quantity || 0),
-        0
-      );
+    const supplies = rows.map(serializeSupply);
 
-      return {
-        ...s,
-        totalCost,
-        totalSell,
-        itemsCount: items.length,
-      };
+    return res.json({
+      supplies,
+      count: supplies.length,
+      branchScope: branchScopePayload(scope),
     });
-
-    return res.json({ supplies, count: supplies.length, branchScope: scope });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    const handled = handleBranchError(res, err);
+    if (handled) return handled;
 
     console.error("listSupplies error:", err);
     return res.status(500).json({ message: "Failed to load supplies" });
   }
 }
 
-// -----------------------
-// POST /api/suppliers/:id/supplies
-// -----------------------
 async function createSupply(req, res) {
   try {
     const tenantId = getTenantId(req);
-    const userId = req.user?.userId || req.user?.id || null;
+    const userId = getUserId(req);
+
     if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
     const activeBranch = await ensureWritableBranchAccessOrThrow(req);
-    const supplierId = String(req.params.id || "");
+    const supplierId = cleanStringStrict(req.params.id);
     const items = Array.isArray(req.body.items) ? req.body.items : [];
-    if (!items.length) return res.status(400).json({ message: "items are required" });
 
-    const alsoUpdateStock = String(req.body.alsoUpdateStock || "true").toLowerCase() !== "false";
+    if (!items.length) return res.status(400).json({ message: "At least one supply item is required" });
 
-    for (const it of items) {
-      const productName = cleanString(it.productName);
-      const qty = toInt(it.quantity, NaN);
-      const buy = toMoney(it.buyPrice, NaN);
-      const sell = toMoney(it.sellPrice, NaN);
+    const alsoUpdateStock = cleanStringStrict(req.body.alsoUpdateStock || "true").toLowerCase() !== "false";
 
-      if (!productName) {
-        return res.status(400).json({ message: "Each item must have productName" });
+    for (const item of items) {
+      const productName = cleanString(item.productName);
+      const quantity = toInt(item.quantity, NaN);
+      const buyPrice = toMoney(item.buyPrice, NaN);
+      const sellPrice = toMoney(item.sellPrice, NaN);
+
+      if (!productName) return res.status(400).json({ message: "Each item must have product name" });
+
+      if (!Number.isInteger(quantity) || quantity <= 0) {
+        return res.status(400).json({ message: "Each item quantity must be more than 0" });
       }
-      if (!Number.isInteger(qty) || qty <= 0) {
-        return res.status(400).json({ message: "quantity must be > 0" });
+
+      if (!Number.isFinite(buyPrice) || buyPrice < 0) {
+        return res.status(400).json({ message: "Each item buy price must be 0 or more" });
       }
-      if (!Number.isFinite(buy) || buy < 0) {
-        return res.status(400).json({ message: "buyPrice must be 0 or more" });
-      }
-      if (!Number.isFinite(sell) || sell < 0) {
-        return res.status(400).json({ message: "sellPrice must be 0 or more" });
+
+      if (!Number.isFinite(sellPrice) || sellPrice < 0) {
+        return res.status(400).json({ message: "Each item sell price must be 0 or more" });
       }
     }
 
@@ -595,162 +785,140 @@ async function createSupply(req, res) {
 
       if (!supplier) throw new Error("SUPPLIER_NOT_FOUND");
 
-      const supplyCreateData = {
-        tenantId,
-        supplierId,
-        sourceType: normalizeSupplySourceType(req.body.sourceType),
-        sourceDetails: cleanString(req.body.sourceDetails),
-        documentRef: cleanString(req.body.documentRef),
-        notes: cleanString(req.body.notes),
-      };
-
-      if (typeof tx.supplierSupply.fields?.branchId !== "undefined") {
-        supplyCreateData.branchId = activeBranch.id;
-      }
-
       const supply = await tx.supplierSupply.create({
-        data: supplyCreateData,
+        data: {
+          tenantId,
+          supplierId,
+          branchId: HAS_SUPPLIER_SUPPLY_BRANCH ? activeBranch.id : undefined,
+          sourceType: normalizeSupplySourceType(req.body.sourceType),
+          sourceDetails: cleanString(req.body.sourceDetails),
+          documentRef: cleanString(req.body.documentRef),
+          notes: cleanString(req.body.notes),
+        },
         select: {
           id: true,
+          tenantId: true,
+          branchId: true,
+          supplierId: true,
+          sourceType: true,
+          sourceDetails: true,
+          documentRef: true,
+          notes: true,
           createdAt: true,
-          ...(typeof tx.supplierSupply.fields?.branchId !== "undefined" ? { branchId: true } : {}),
         },
       });
 
       const createdItems = [];
       const updatedProducts = [];
 
-      for (const it of items) {
-        const productId = cleanString(it.productId);
-        const productName = cleanString(it.productName);
-        const qty = toInt(it.quantity);
-        const buy = toMoney(it.buyPrice);
-        const sell = toMoney(it.sellPrice);
+      for (const item of items) {
+        const productId = cleanString(item.productId);
+        const productName = cleanString(item.productName);
+        const quantity = toInt(item.quantity);
+        const buyPrice = toMoney(item.buyPrice);
+        const sellPrice = toMoney(item.sellPrice);
 
-        const row = await tx.supplierSupplyItem.create({
+        const createdItem = await tx.supplierSupplyItem.create({
           data: {
             tenantId,
             supplyId: supply.id,
             productId: productId || null,
             productName,
-            category: cleanString(it.category),
-            subcategory: cleanString(it.subcategory),
-            subcategoryOther: cleanString(it.subcategoryOther),
-            brand: cleanString(it.brand),
-            serial: cleanString(it.serial),
-            quantity: qty,
-            buyPrice: buy,
-            sellPrice: sell,
-            notes: cleanString(it.notes),
+            category: cleanString(item.category),
+            subcategory: cleanString(item.subcategory),
+            subcategoryOther: cleanString(item.subcategoryOther),
+            brand: cleanString(item.brand),
+            serial: cleanString(item.serial),
+            quantity,
+            buyPrice,
+            sellPrice,
+            notes: cleanString(item.notes),
           },
+          select: {
+            id: true,
+            productId: true,
+            productName: true,
+            quantity: true,
+            buyPrice: true,
+            sellPrice: true,
+            serial: true,
+          },
+        });
+
+        createdItems.push(createdItem);
+
+        if (!alsoUpdateStock || !productId) continue;
+
+        const product = await tx.product.findFirst({
+          where: { id: productId, tenantId },
+          select: { id: true, stockQty: true },
+        });
+
+        if (!product) continue;
+
+        const beforeQtyGlobal = Number(product.stockQty || 0);
+        const afterQtyGlobal = beforeQtyGlobal + quantity;
+
+        await tx.product.update({
+          where: { id: product.id },
+          data: {
+            stockQty: afterQtyGlobal,
+            costPrice: buyPrice,
+            sellPrice,
+            supplierId,
+            supplierName: supplier.name,
+          },
+        });
+
+        await incrementBranchInventoryIfPossible(tx, {
+          tenantId,
+          branchId: activeBranch.id,
+          productId: product.id,
+          quantity,
+        });
+
+        const stockAdjustmentData = {
+          tenantId,
+          productId: product.id,
+          type: "RESTOCK",
+          delta: quantity,
+          beforeQty: beforeQtyGlobal,
+          afterQty: afterQtyGlobal,
+          note: `Supplier supply (${supplier.name}) • Branch ${activeBranch.code || activeBranch.name || activeBranch.id}`,
+          createdById: userId,
+        };
+
+        if (HAS_STOCK_ADJUSTMENT_BRANCH) {
+          stockAdjustmentData.branchId = activeBranch.id;
+        }
+
+        await tx.stockAdjustment.create({
+          data: stockAdjustmentData,
           select: { id: true },
         });
 
-        createdItems.push(row);
-
-        if (alsoUpdateStock && productId) {
-          const p = await tx.product.findFirst({
-            where: { id: productId, tenantId },
-            select: { id: true, stockQty: true },
-          });
-
-          if (p) {
-            const beforeQtyGlobal = Number(p.stockQty || 0);
-            const afterQtyGlobal = beforeQtyGlobal + qty;
-
-            await tx.product.update({
-              where: { id: p.id },
-              data: {
-                stockQty: afterQtyGlobal,
-                costPrice: buy,
-                sellPrice: sell,
-                supplierId,
-                supplierName: supplier.name,
-              },
-            });
-
-            if (tx.branchInventory && typeof tx.branchInventory.findFirst === "function") {
-              const existingBranchInventory = await tx.branchInventory.findFirst({
-                where: {
-                  tenantId,
-                  branchId: activeBranch.id,
-                  productId: p.id,
-                },
-                select: {
-                  id: true,
-                  qtyOnHand: true,
-                },
-              });
-
-              if (existingBranchInventory) {
-                await tx.branchInventory.update({
-                  where: { id: existingBranchInventory.id },
-                  data: {
-                    qtyOnHand: Number(existingBranchInventory.qtyOnHand || 0) + qty,
-                  },
-                });
-              } else {
-                await createOrSetBranchInventoryIfPossible(tx, {
-                  tenantId,
-                  branchId: activeBranch.id,
-                  productId: p.id,
-                  qtyOnHand: qty,
-                });
-              }
-            }
-
-            const stockAdjustmentData = {
-              tenantId,
-              productId: p.id,
-              type: "RESTOCK",
-              delta: qty,
-              beforeQty: beforeQtyGlobal,
-              afterQty: afterQtyGlobal,
-              note: `Supplier supply (${supplier.name}) • Branch ${activeBranch.code || activeBranch.id}`,
-              createdById: userId,
-            };
-
-            if (typeof tx.stockAdjustment.fields?.branchId !== "undefined") {
-              stockAdjustmentData.branchId = activeBranch.id;
-            }
-
-            await tx.stockAdjustment.create({
-              data: stockAdjustmentData,
-              select: { id: true },
-            });
-
-            updatedProducts.push(p.id);
-          }
-        }
+        updatedProducts.push(product.id);
       }
 
       return {
         branchId: activeBranch.id,
-        branchCode: activeBranch.code,
+        branchCode: activeBranch.code || null,
+        branchName: activeBranch.name || null,
         supply,
         createdItemsCount: createdItems.length,
         updatedProductsCount: updatedProducts.length,
       };
     });
 
-    return res.status(201).json({ created: true, ...result });
+    return res.status(201).json({
+      created: true,
+      ...result,
+    });
   } catch (err) {
-    const msg = String(err?.message || "");
-    const code = err?.code;
+    const handled = handleBranchError(res, err);
+    if (handled) return handled;
 
-    if (code === "BRANCH_REQUIRED" || msg === "BRANCH_REQUIRED") {
-      return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
-    }
-    if (code === "BRANCH_ACCESS_DENIED" || msg === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
-    }
-    if (code === "BRANCH_NOT_FOUND" || msg === "BRANCH_NOT_FOUND") {
-      return res.status(404).json({ message: "Branch not found" });
-    }
-    if (code === "BRANCH_NOT_ACTIVE" || msg === "BRANCH_NOT_ACTIVE") {
-      return res.status(409).json({ message: "Selected branch is not active" });
-    }
-    if (msg === "SUPPLIER_NOT_FOUND") {
+    if (String(err?.message || "") === "SUPPLIER_NOT_FOUND") {
       return res.status(404).json({ message: "Supplier not found" });
     }
 

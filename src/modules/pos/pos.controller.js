@@ -728,11 +728,12 @@ async function createSale(req, res) {
 
     for (const item of items) {
       if (!item?.productId) {
-        return res.status(400).json({ message: "Each item must have productId" });
+        return res.status(400).json({ message: "Each item must have a product selected" });
       }
+
       const q = toInt(item.quantity, NaN);
       if (!Number.isInteger(q) || q <= 0) {
-        return res.status(400).json({ message: "quantity must be a positive integer" });
+        return res.status(400).json({ message: "Quantity must be a positive number" });
       }
     }
 
@@ -741,18 +742,18 @@ async function createSale(req, res) {
 
     if (!selectedPaymentMethod) {
       return res.status(400).json({
-        message: "paymentMethod must be one of CASH, MOMO, CARD, BANK, OTHER",
+        message: "Payment method must be one of CASH, MOMO, CARD, BANK, OTHER",
         code: "INVALID_PAYMENT_METHOD",
       });
     }
 
     const parsedDueDate = dueDate ? new Date(dueDate) : null;
     if (dueDate && Number.isNaN(parsedDueDate.getTime())) {
-      return res.status(400).json({ message: "Invalid dueDate" });
+      return res.status(400).json({ message: "Invalid due date" });
     }
 
     if (finalSaleType === "CREDIT" && !parsedDueDate) {
-      return res.status(400).json({ message: "dueDate is required for credit sale" });
+      return res.status(400).json({ message: "Due date is required for credit sale" });
     }
 
     const paidRequested = Math.max(0, toNumber(amountPaid, 0));
@@ -765,11 +766,12 @@ async function createSale(req, res) {
 
     if (shouldBlock && cashTouchesDrawer) {
       const openSessionId = await getOpenCashSessionId(prisma, tenantId, branchId);
+
       if (!openSessionId) {
         return res.status(409).json({
-          message: "Cash drawer is closed for the active branch. Open this branch drawer before recording cash.",
+          message:
+            "Cash drawer is closed for this selling location. Open the drawer before recording cash.",
           code: "CASH_DRAWER_CLOSED",
-          branchId,
         });
       }
     }
@@ -784,16 +786,28 @@ async function createSale(req, res) {
         });
 
         const productIds = items.map((i) => String(i.productId));
+
         const products = await tx.product.findMany({
-          where: { tenantId, id: { in: productIds }, isActive: true },
-          select: { id: true, name: true, sellPrice: true, stockQty: true },
+          where: {
+            tenantId,
+            id: { in: productIds },
+            isActive: true,
+          },
+          select: {
+            id: true,
+            name: true,
+            sellPrice: true,
+            stockQty: true,
+          },
         });
 
         const byId = new Map(products.map((p) => [p.id, p]));
 
         for (const item of items) {
           const pid = String(item.productId);
-          if (!byId.has(pid)) throw new Error(`PRODUCT_NOT_FOUND:${pid}`);
+          if (!byId.has(pid)) {
+            throw new Error(`PRODUCT_NOT_FOUND:${pid}`);
+          }
         }
 
         for (const item of items) {
@@ -808,8 +822,15 @@ async function createSale(req, res) {
           });
 
           const updated = await tx.product.updateMany({
-            where: { id: pid, tenantId, isActive: true, stockQty: { gte: qty } },
-            data: { stockQty: { decrement: qty } },
+            where: {
+              id: pid,
+              tenantId,
+              isActive: true,
+              stockQty: { gte: qty },
+            },
+            data: {
+              stockQty: { decrement: qty },
+            },
           });
 
           if (!updated || updated.count !== 1) {
@@ -828,6 +849,7 @@ async function createSale(req, res) {
           const price = Number(p.sellPrice || 0);
 
           total += price * qty;
+
           itemRows.push({
             productId: pid,
             quantity: qty,
@@ -849,6 +871,7 @@ async function createSale(req, res) {
         });
 
         const saleCreatedAt = new Date();
+
         const documentNumbers = await reserveSaleDocumentNumbersTx(tx, {
           tenantId,
           createdAt: saleCreatedAt,
@@ -891,6 +914,7 @@ async function createSale(req, res) {
         });
 
         const createdItems = [];
+
         for (const row of itemRows) {
           const it = await tx.saleItem.create({
             data: {
@@ -899,8 +923,15 @@ async function createSale(req, res) {
               quantity: row.quantity,
               price: row.price,
             },
-            select: { id: true, saleId: true, productId: true, quantity: true, price: true },
+            select: {
+              id: true,
+              saleId: true,
+              productId: true,
+              quantity: true,
+              price: true,
+            },
           });
+
           createdItems.push(it);
         }
 
@@ -911,9 +942,13 @@ async function createSale(req, res) {
         let depositMovement = null;
 
         if (finalSaleType === "CASH") {
-          const paymentNoteParts = [`Paid sale`, sale.id, selectedPaymentMethod];
-          const ref = normalizeText(paymentReference);
+          const paymentNoteParts = [
+            "Paid sale",
+            sale.receiptNumber || sale.id,
+            selectedPaymentMethod,
+          ];
 
+          const ref = normalizeText(paymentReference);
           if (ref) paymentNoteParts.push(ref);
 
           payment = await tx.salePayment.create({
@@ -945,15 +980,19 @@ async function createSale(req, res) {
               type: "IN",
               reason: "OTHER",
               amount: total,
-              note: `Cash sale ${sale.id} (${branchId})`,
+              note: `Cash sale ${sale.receiptNumber || sale.id}`,
             });
           }
         }
 
         if (finalSaleType === "CREDIT" && initialPaid > 0) {
-          const paymentNoteParts = [`Initial payment`, sale.id, selectedPaymentMethod];
-          const ref = normalizeText(paymentReference);
+          const paymentNoteParts = [
+            "Initial payment",
+            sale.receiptNumber || sale.id,
+            selectedPaymentMethod,
+          ];
 
+          const ref = normalizeText(paymentReference);
           if (ref) paymentNoteParts.push(ref);
 
           payment = await tx.salePayment.create({
@@ -985,7 +1024,7 @@ async function createSale(req, res) {
               type: "IN",
               reason: "DEPOSIT",
               amount: initialPaid,
-              note: `Credit deposit ${sale.id} (${branchId})`,
+              note: `Credit deposit ${sale.receiptNumber || sale.id}`,
             });
           }
         }
@@ -997,6 +1036,7 @@ async function createSale(req, res) {
           cashMovement,
           depositMovement,
           auditMeta: {
+            sellingLocation: activeBranch.name || activeBranch.code || null,
             branchId,
             saleType: finalSaleType,
             paymentMethod: selectedPaymentMethod,
@@ -1040,44 +1080,68 @@ async function createSale(req, res) {
     const msg = String(err?.message || "");
 
     if (msg === "BRANCH_REQUIRED") {
-      return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
+      return res.status(400).json({
+        message: "Choose a selling location before recording this sale.",
+        code: "BRANCH_REQUIRED",
+      });
     }
+
     if (msg === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
+      return res.status(403).json({
+        message: "You do not have access to this selling location.",
+        code: "BRANCH_ACCESS_DENIED",
+      });
     }
+
     if (msg === "BRANCH_OPERATION_DENIED") {
       return res.status(403).json({
-        message: "You cannot operate in this branch",
+        message: "You cannot record sales from this selling location.",
         code: "BRANCH_OPERATION_DENIED",
       });
     }
+
     if (msg === "BRANCH_NOT_FOUND") {
-      return res.status(404).json({ message: "Branch not found" });
-    }
-    if (msg === "BRANCH_NOT_ACTIVE") {
-      return res.status(409).json({ message: "Selected branch is not active" });
-    }
-    if (msg === "INVALID_CUSTOMER_FIELDS") {
-      return res.status(400).json({
-        message: "customer.name and customer.phone are required when creating a customer from sale",
+      return res.status(404).json({
+        message: "Selling location was not found.",
       });
     }
+
+    if (msg === "BRANCH_NOT_ACTIVE") {
+      return res.status(409).json({
+        message: "Selected selling location is not active.",
+      });
+    }
+
+    if (msg === "INVALID_CUSTOMER_FIELDS") {
+      return res.status(400).json({
+        message: "Customer name and customer phone are required when saving a new customer.",
+      });
+    }
+
     if (msg === "CUSTOMER_NOT_FOUND") {
       return res.status(404).json({ message: "Customer not found" });
     }
+
     if (msg.startsWith("PRODUCT_NOT_FOUND:")) {
       return res.status(404).json({ message: "Product not found" });
     }
+
     if (msg.startsWith("INSUFFICIENT_BRANCH_STOCK:")) {
-      return res.status(400).json({ message: "Insufficient branch stock for one of the selected products" });
+      return res.status(400).json({
+        message: "Not enough stock available in this selling location.",
+      });
     }
+
     if (msg.startsWith("INSUFFICIENT_STOCK:")) {
       return res.status(400).json({
         message: msg.replace("INSUFFICIENT_STOCK:", "Insufficient stock for "),
       });
     }
+
     if (msg === "AMOUNT_PAID_TOO_HIGH") {
-      return res.status(400).json({ message: "amountPaid cannot exceed total" });
+      return res.status(400).json({
+        message: "Amount paid cannot exceed sale total.",
+      });
     }
 
     console.error("createSale error:", err);

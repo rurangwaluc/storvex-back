@@ -55,8 +55,8 @@ function resolveInvoiceBranchScope(req) {
 
   if (allBranchesRequested) {
     if (!canViewAllBranches(req)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
+      const e = new Error("LOCATION_ACCESS_DENIED");
+      e.code = "LOCATION_ACCESS_DENIED";
       throw e;
     }
 
@@ -68,9 +68,13 @@ function resolveInvoiceBranchScope(req) {
   }
 
   if (requestedBranchId) {
-    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
+    if (
+      !canViewAllBranches(req) &&
+      allowedBranchIds.length > 0 &&
+      !allowedBranchIds.includes(requestedBranchId)
+    ) {
+      const e = new Error("LOCATION_ACCESS_DENIED");
+      e.code = "LOCATION_ACCESS_DENIED";
       throw e;
     }
 
@@ -96,6 +100,37 @@ function applyInvoiceBranchScope(where, scope) {
   }
 
   return next;
+}
+
+function serializeLocation(branch, branding = null) {
+  if (branding) {
+    return {
+      name:
+        branding.sellingLocation ||
+        branding.storeLocation ||
+        branding.locationName ||
+        branch?.name ||
+        "Store location",
+      code: branding.locationCode || branch?.code || null,
+      status: branding.locationStatus || branch?.status || null,
+      isMain: Boolean(branding.isMainLocation || branch?.isMain),
+      address: branding.locationAddress || null,
+      phone: branding.locationPhone || null,
+      email: branding.locationEmail || null,
+    };
+  }
+
+  return branch
+    ? {
+        name: branch.name || "Store location",
+        code: branch.code || null,
+        status: branch.status || null,
+        isMain: Boolean(branch.isMain),
+        address: null,
+        phone: null,
+        email: null,
+      }
+    : null;
 }
 
 function saleSelect() {
@@ -172,15 +207,7 @@ function mapSaleToInvoiceListRow(sale) {
   return {
     id: sale.id,
     branchId: sale.branchId || null,
-    branch: sale.branch
-      ? {
-          id: sale.branch.id || null,
-          name: sale.branch.name || null,
-          code: sale.branch.code || null,
-          status: sale.branch.status || null,
-          isMain: Boolean(sale.branch.isMain),
-        }
-      : null,
+    location: serializeLocation(sale.branch),
     number: sale.invoiceNumber || null,
     receiptNumber: sale.receiptNumber || null,
     date: sale.createdAt || null,
@@ -227,15 +254,7 @@ function mapSaleToInvoiceDetail(sale, branding) {
     invoice: {
       id: sale.id,
       branchId: sale.branchId || null,
-      branch: sale.branch
-        ? {
-            id: sale.branch.id || null,
-            name: sale.branch.name || null,
-            code: sale.branch.code || null,
-            status: sale.branch.status || null,
-            isMain: Boolean(sale.branch.isMain),
-          }
-        : null,
+      location: serializeLocation(sale.branch, branding),
       number: sale.invoiceNumber || null,
       receiptNumber: sale.receiptNumber || null,
       date: sale.createdAt || null,
@@ -277,8 +296,11 @@ function mapSaleToInvoiceDetail(sale, branding) {
             warrantyTerms: branding.warrantyTerms || null,
             proformaTerms: branding.proformaTerms || null,
             deliveryNoteTerms: branding.deliveryNoteTerms || null,
-            branchName: branding.branchName || sale.branch?.name || null,
-            branchCode: branding.branchCode || sale.branch?.code || null,
+            locationName: branding.sellingLocation || branding.storeLocation || branding.locationName || null,
+            locationCode: branding.locationCode || null,
+            locationAddress: branding.locationAddress || null,
+            sellingLocation: branding.sellingLocation || branding.locationName || null,
+            storeLocation: branding.storeLocation || branding.locationName || null,
           }
         : null,
     },
@@ -288,6 +310,7 @@ function mapSaleToInvoiceDetail(sale, branding) {
 async function listInvoices(req, res) {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(401).json({ message: "Unauthorized" });
     }
@@ -331,8 +354,8 @@ async function listInvoices(req, res) {
       branchScope: scope,
     });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
+    if (String(err?.code || err?.message || "") === "LOCATION_ACCESS_DENIED") {
+      return res.status(403).json({ message: "You cannot view documents from this store location." });
     }
 
     console.error("listInvoices error:", err);
@@ -343,14 +366,16 @@ async function listInvoices(req, res) {
 async function getInvoice(req, res) {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
     const scope = resolveInvoiceBranchScope(req);
     const id = String(req.params.id || "").trim();
+
     if (!id) {
-      return res.status(400).json({ message: "Invoice id is required" });
+      return res.status(400).json({ message: "Invoice reference is required" });
     }
 
     const sale = await prisma.sale.findFirst({
@@ -369,19 +394,15 @@ async function getInvoice(req, res) {
       return res.status(404).json({ message: "Invoice not found" });
     }
 
-    const branding = await buildTenantDocumentBranding(
-      prisma,
-      tenantId,
-      sale.branchId || null
-    );
+    const branding = await buildTenantDocumentBranding(prisma, tenantId, sale.branchId || null);
 
     return res.json({
       ...mapSaleToInvoiceDetail(sale, branding),
       branchScope: scope,
     });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
+    if (String(err?.code || err?.message || "") === "LOCATION_ACCESS_DENIED") {
+      return res.status(403).json({ message: "You cannot view documents from this store location." });
     }
 
     console.error("getInvoice error:", err);
@@ -392,14 +413,16 @@ async function getInvoice(req, res) {
 async function printInvoiceHtml(req, res) {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(401).send("Unauthorized");
     }
 
     const scope = resolveInvoiceBranchScope(req);
     const id = String(req.params.id || "").trim();
+
     if (!id) {
-      return res.status(400).send("Invoice id is required");
+      return res.status(400).send("Invoice reference is required");
     }
 
     const sale = await prisma.sale.findFirst({
@@ -418,11 +441,7 @@ async function printInvoiceHtml(req, res) {
       return res.status(404).send("Invoice not found");
     }
 
-    const branding = await buildTenantDocumentBranding(
-      prisma,
-      tenantId,
-      sale.branchId || null
-    );
+    const branding = await buildTenantDocumentBranding(prisma, tenantId, sale.branchId || null);
 
     const items = (sale.items || []).map((item) => {
       const quantity = Number(item.quantity || 0);
@@ -441,6 +460,12 @@ async function printInvoiceHtml(req, res) {
     });
 
     const subtotal = items.reduce((sum, item) => sum + Number(item.total || 0), 0);
+    const sellingLocation =
+      branding?.sellingLocation ||
+      branding?.storeLocation ||
+      branding?.locationName ||
+      sale.branch?.name ||
+      null;
 
     const html = renderInvoiceHtml({
       tenant: {
@@ -457,8 +482,11 @@ async function printInvoiceHtml(req, res) {
         warrantyTerms: branding?.warrantyTerms || null,
         proformaTerms: branding?.proformaTerms || null,
         deliveryNoteTerms: branding?.deliveryNoteTerms || null,
-        branchName: branding?.branchName || sale.branch?.name || null,
-        branchCode: branding?.branchCode || sale.branch?.code || null,
+        locationName: sellingLocation,
+        locationCode: branding?.locationCode || null,
+        locationAddress: branding?.locationAddress || null,
+        sellingLocation,
+        storeLocation: branding?.storeLocation || sellingLocation,
       },
       document: {
         number: sale.invoiceNumber || sale.id,
@@ -491,8 +519,9 @@ async function printInvoiceHtml(req, res) {
         status: sale.status || "INVOICE",
         saleRef: sale.receiptNumber || sale.id,
         dueDate: sale.dueDate || null,
-        branchName: sale.branch?.name || null,
-        branchCode: sale.branch?.code || null,
+        sellingLocation,
+        storeLocation: branding?.storeLocation || sellingLocation,
+        locationLabel: "Selling location",
         invoiceTerms: branding?.invoiceTerms || null,
       },
     });
@@ -500,8 +529,8 @@ async function printInvoiceHtml(req, res) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.send(html);
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).send("Branch access denied");
+    if (String(err?.code || err?.message || "") === "LOCATION_ACCESS_DENIED") {
+      return res.status(403).send("You cannot view documents from this store location.");
     }
 
     console.error("printInvoiceHtml error:", err);

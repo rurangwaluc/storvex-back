@@ -1,3 +1,4 @@
+// backend/src/modules/documents/documentBranding.service.js
 "use strict";
 
 const { signGetUrl } = require("../../utils/r2");
@@ -6,69 +7,274 @@ function hasField(model, fieldName) {
   return typeof model?.fields?.[fieldName] !== "undefined";
 }
 
-async function buildTenantDocumentBranding(prisma, tenantId) {
-  const documentSettingsSelect = {
+function cleanString(value) {
+  const s = String(value ?? "").trim();
+  return s || null;
+}
+
+function pickFirst(...values) {
+  for (const value of values) {
+    const cleaned = cleanString(value);
+    if (cleaned) return cleaned;
+  }
+
+  return null;
+}
+
+function buildLocationText(...parts) {
+  return parts.map(cleanString).filter(Boolean).join(" • ") || null;
+}
+
+function buildDocumentSettingsSelect(prisma) {
+  return {
     invoiceTerms: true,
     warrantyTerms: true,
-    ...(hasField(prisma.tenantDocumentSettings, "proformaTerms") ? { proformaTerms: true } : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "proformaTerms")
+      ? { proformaTerms: true }
+      : {}),
+
     ...(hasField(prisma.tenantDocumentSettings, "deliveryNoteTerms")
       ? { deliveryNoteTerms: true }
       : {}),
+
     ...(hasField(prisma.tenantDocumentSettings, "documentPrimaryColor")
       ? { documentPrimaryColor: true }
       : {}),
+
     ...(hasField(prisma.tenantDocumentSettings, "documentAccentColor")
       ? { documentAccentColor: true }
       : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "receiptPrefix")
+      ? { receiptPrefix: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "invoicePrefix")
+      ? { invoicePrefix: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "warrantyPrefix")
+      ? { warrantyPrefix: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "proformaPrefix")
+      ? { proformaPrefix: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "receiptPadding")
+      ? { receiptPadding: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "invoicePadding")
+      ? { invoicePadding: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "warrantyPadding")
+      ? { warrantyPadding: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "proformaPadding")
+      ? { proformaPadding: true }
+      : {}),
   };
+}
+
+function buildTenantSelect(prisma) {
+  return {
+    id: true,
+    name: true,
+    phone: true,
+    email: true,
+
+    ...(hasField(prisma.tenant, "shopType") ? { shopType: true } : {}),
+    ...(hasField(prisma.tenant, "district") ? { district: true } : {}),
+    ...(hasField(prisma.tenant, "sector") ? { sector: true } : {}),
+    ...(hasField(prisma.tenant, "address") ? { address: true } : {}),
+    ...(hasField(prisma.tenant, "countryCode") ? { countryCode: true } : {}),
+    ...(hasField(prisma.tenant, "currencyCode") ? { currencyCode: true } : {}),
+    ...(hasField(prisma.tenant, "timezone") ? { timezone: true } : {}),
+    ...(hasField(prisma.tenant, "taxId") ? { taxId: true } : {}),
+    ...(hasField(prisma.tenant, "tinNumber") ? { tinNumber: true } : {}),
+
+    logoUrl: true,
+    logoKey: true,
+    receiptHeader: true,
+    receiptFooter: true,
+
+    documentSettings: {
+      select: buildDocumentSettingsSelect(prisma),
+    },
+  };
+}
+
+function buildBranchSelect(prisma) {
+  return {
+    id: true,
+
+    ...(hasField(prisma.branch, "name") ? { name: true } : {}),
+    ...(hasField(prisma.branch, "code") ? { code: true } : {}),
+    ...(hasField(prisma.branch, "type") ? { type: true } : {}),
+    ...(hasField(prisma.branch, "status") ? { status: true } : {}),
+    ...(hasField(prisma.branch, "isMain") ? { isMain: true } : {}),
+    ...(hasField(prisma.branch, "district") ? { district: true } : {}),
+    ...(hasField(prisma.branch, "sector") ? { sector: true } : {}),
+    ...(hasField(prisma.branch, "address") ? { address: true } : {}),
+    ...(hasField(prisma.branch, "phone") ? { phone: true } : {}),
+    ...(hasField(prisma.branch, "email") ? { email: true } : {}),
+  };
+}
+
+async function getSignedLogoUrl(logoKey) {
+  if (!logoKey) return null;
+
+  try {
+    return await signGetUrl(logoKey, 300);
+  } catch (err) {
+    console.error("signGetUrl failed:", err?.message || err);
+    return null;
+  }
+}
+
+async function findBranch(prisma, tenantId, locationId) {
+  const branchId = cleanString(locationId);
+
+  if (!tenantId || !branchId || !prisma.branch) {
+    return null;
+  }
+
+  try {
+    return await prisma.branch.findFirst({
+      where: {
+        id: branchId,
+        tenantId: String(tenantId),
+      },
+      select: buildBranchSelect(prisma),
+    });
+  } catch (err) {
+    console.error("findBranch for document branding failed:", err?.message || err);
+    return null;
+  }
+}
+
+function serializeLocation({ branch, tenant }) {
+  const tenantLocation = buildLocationText(tenant?.sector, tenant?.district, tenant?.address);
+  const branchLocation = buildLocationText(branch?.sector, branch?.district, branch?.address);
+
+  const locationName = pickFirst(
+    branch?.name,
+    branch?.code,
+    tenant?.name,
+    "Main store"
+  );
+
+  const locationCode = cleanString(branch?.code);
+  const locationStatus = cleanString(branch?.status);
+  const locationPhone = pickFirst(branch?.phone, tenant?.phone);
+  const locationEmail = pickFirst(branch?.email, tenant?.email);
+  const locationAddress = pickFirst(branchLocation, tenantLocation);
+
+  return {
+    id: branch?.id || null,
+
+    // Keep these for backend/frontend compatibility only.
+    // Do not print them directly as tenant-facing labels.
+    branchName: branch?.name || null,
+    branchCode: branch?.code || null,
+
+    // Business-friendly document fields.
+    locationName,
+    locationCode,
+    locationStatus,
+    locationPhone,
+    locationEmail,
+    locationAddress,
+    sellingLocation: locationName,
+    storeLocation: locationName,
+    isMainLocation: Boolean(branch?.isMain),
+  };
+}
+
+async function buildTenantDocumentBranding(prisma, tenantId, locationId = null) {
+  const cleanTenantId = cleanString(tenantId);
+
+  if (!cleanTenantId) {
+    return null;
+  }
 
   const tenant = await prisma.tenant.findFirst({
-    where: { id: tenantId },
-    select: {
-      id: true,
-      name: true,
-      phone: true,
-      email: true,
-      logoUrl: true,
-      logoKey: true,
-      receiptHeader: true,
-      receiptFooter: true,
-      documentSettings: {
-        select: documentSettingsSelect,
-      },
-    },
+    where: { id: cleanTenantId },
+    select: buildTenantSelect(prisma),
   });
 
-  if (!tenant) return null;
-
-  let logoSignedUrl = null;
-
-  if (tenant.logoKey) {
-    try {
-      logoSignedUrl = await signGetUrl(tenant.logoKey, 300);
-    } catch (e) {
-      console.error("signGetUrl failed:", e?.message || e);
-    }
+  if (!tenant) {
+    return null;
   }
+
+  const branch = await findBranch(prisma, cleanTenantId, locationId);
+  const logoSignedUrl = await getSignedLogoUrl(tenant.logoKey);
+  const location = serializeLocation({ branch, tenant });
+  const settings = tenant.documentSettings || {};
+
+  const tenantLocation = buildLocationText(tenant.sector, tenant.district, tenant.address);
 
   return {
     id: tenant.id,
+
     name: tenant.name || null,
-    phone: tenant.phone || null,
-    email: tenant.email || null,
+    phone: location.locationPhone || tenant.phone || null,
+    email: location.locationEmail || tenant.email || null,
+    shopType: tenant.shopType || null,
+    district: tenant.district || null,
+    sector: tenant.sector || null,
+    address: tenant.address || null,
+    countryCode: tenant.countryCode || "RW",
+    currencyCode: tenant.currencyCode || "RWF",
+    timezone: tenant.timezone || "Africa/Kigali",
+    taxId: tenant.taxId || tenant.tinNumber || null,
+    tin: tenant.taxId || tenant.tinNumber || null,
+
     logoUrl: tenant.logoUrl || null,
     logoKey: tenant.logoKey || null,
     logoSignedUrl: logoSignedUrl || tenant.logoUrl || null,
+
     receiptHeader: tenant.receiptHeader || null,
     receiptFooter: tenant.receiptFooter || null,
 
-    documentPrimaryColor: tenant.documentSettings?.documentPrimaryColor || "#0F4C81",
-    documentAccentColor: tenant.documentSettings?.documentAccentColor || "#E8EEF5",
+    documentPrimaryColor: settings.documentPrimaryColor || "#0F4C81",
+    documentAccentColor: settings.documentAccentColor || "#E8EEF5",
 
-    invoiceTerms: tenant.documentSettings?.invoiceTerms || null,
-    warrantyTerms: tenant.documentSettings?.warrantyTerms || null,
-    proformaTerms: tenant.documentSettings?.proformaTerms || null,
-    deliveryNoteTerms: tenant.documentSettings?.deliveryNoteTerms || null,
+    invoiceTerms: settings.invoiceTerms || null,
+    warrantyTerms: settings.warrantyTerms || null,
+    proformaTerms: settings.proformaTerms || null,
+    deliveryNoteTerms: settings.deliveryNoteTerms || null,
+
+    receiptPrefix: settings.receiptPrefix || "RCT",
+    invoicePrefix: settings.invoicePrefix || "INV",
+    warrantyPrefix: settings.warrantyPrefix || "WAR",
+    proformaPrefix: settings.proformaPrefix || "PRF",
+
+    receiptPadding: Number(settings.receiptPadding || 3),
+    invoicePadding: Number(settings.invoicePadding || 3),
+    warrantyPadding: Number(settings.warrantyPadding || 3),
+    proformaPadding: Number(settings.proformaPadding || 3),
+
+    locationId: location.id,
+    locationName: location.locationName,
+    locationCode: location.locationCode,
+    locationStatus: location.locationStatus,
+    locationPhone: location.locationPhone,
+    locationEmail: location.locationEmail,
+    locationAddress: location.locationAddress || tenantLocation,
+    sellingLocation: location.sellingLocation,
+    storeLocation: location.storeLocation,
+    isMainLocation: location.isMainLocation,
+
+    // Compatibility for existing receipt/invoice rendering code.
+    // These are data fields only; tenant-facing labels must use
+    // "Selling location" or "Store location".
+    branchName: location.branchName,
+    branchCode: location.branchCode,
   };
 }
 

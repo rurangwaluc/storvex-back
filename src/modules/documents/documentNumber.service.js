@@ -10,29 +10,49 @@ function toBigIntSafe(value, fallback = 1n) {
   }
 }
 
-function padSeq(seq, padding) {
-  return String(seq).padStart(Number(padding || 6), "0");
+function cleanString(value) {
+  const s = String(value ?? "").trim();
+  return s || "";
 }
 
-function ym(date) {
+function normalizePrefix(value, fallback) {
+  const raw = cleanString(value || fallback).toUpperCase();
+  const safe = raw.replace(/[^A-Z0-9]/g, "").slice(0, 8);
+  return safe || fallback;
+}
+
+function normalizePadding(value, fallback = 3) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(Math.floor(n), 3), 12);
+}
+
+
+
+function documentYear(date) {
   const d = new Date(date || new Date());
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  return `${y}${m}`;
+  if (Number.isNaN(d.getTime())) return new Date().getFullYear();
+  return d.getFullYear();
 }
 
-function formatDocumentNumber(prefix, seq, padding, date) {
-  return `${prefix}-${ym(date)}-${padSeq(seq, padding)}`;
-}
+
 
 async function ensureSettingsTx(tx, tenantId) {
+  const cleanTenantId = cleanString(tenantId);
+
+  if (!cleanTenantId) {
+    const err = new Error("Store is required before creating a document number");
+    err.code = "TENANT_REQUIRED";
+    throw err;
+  }
+
   let settings = await tx.tenantDocumentSettings.findUnique({
-    where: { tenantId: String(tenantId) },
+    where: { tenantId: cleanTenantId },
   });
 
   if (!settings) {
     settings = await tx.tenantDocumentSettings.create({
-      data: { tenantId: String(tenantId) },
+      data: { tenantId: cleanTenantId },
     });
   }
 
@@ -40,17 +60,38 @@ async function ensureSettingsTx(tx, tenantId) {
 }
 
 async function ensureCounterTx(tx, tenantId) {
+  const cleanTenantId = cleanString(tenantId);
+
+  if (!cleanTenantId) {
+    const err = new Error("Store is required before creating a document number");
+    err.code = "TENANT_REQUIRED";
+    throw err;
+  }
+
   let counter = await tx.tenantDocumentCounter.findUnique({
-    where: { tenantId: String(tenantId) },
+    where: { tenantId: cleanTenantId },
   });
 
   if (!counter) {
     counter = await tx.tenantDocumentCounter.create({
-      data: { tenantId: String(tenantId) },
+      data: { tenantId: cleanTenantId },
     });
   }
 
   return counter;
+}
+
+function padSeq(seq, padding) {
+  return String(seq).padStart(Number(padding || 3), "0");
+}
+
+function docYear(date) {
+  const d = new Date(date || new Date());
+  return String(d.getUTCFullYear());
+}
+
+function formatDocumentNumber(prefix, seq, padding, date) {
+  return `${prefix}-${docYear(date)}-${padSeq(seq, padding)}`;
 }
 
 function normalizeSettings(settings) {
@@ -60,10 +101,10 @@ function normalizeSettings(settings) {
     warrantyPrefix: settings?.warrantyPrefix || "WAR",
     proformaPrefix: settings?.proformaPrefix || "PRF",
 
-    receiptPadding: Number(settings?.receiptPadding || 6),
-    invoicePadding: Number(settings?.invoicePadding || 6),
-    warrantyPadding: Number(settings?.warrantyPadding || 6),
-    proformaPadding: Number(settings?.proformaPadding || 6),
+    receiptPadding: Number(settings?.receiptPadding || 3),
+    invoicePadding: Number(settings?.invoicePadding || 3),
+    warrantyPadding: Number(settings?.warrantyPadding || 3),
+    proformaPadding: Number(settings?.proformaPadding || 3),
   };
 }
 
@@ -77,12 +118,23 @@ function normalizeCounter(counter) {
 }
 
 async function previewDocumentNumbers(prisma, tenantId, date = new Date()) {
+  const cleanTenantId = cleanString(tenantId);
+
+  if (!cleanTenantId) {
+    return {
+      receiptNumberPreview: "RCT-2026-001",
+      invoiceNumberPreview: "INV-2026-001",
+      warrantyNumberPreview: "WAR-2026-001",
+      proformaNumberPreview: "PRF-2026-001",
+    };
+  }
+
   const [settingsRaw, counterRaw] = await Promise.all([
     prisma.tenantDocumentSettings.findUnique({
-      where: { tenantId: String(tenantId) },
+      where: { tenantId: cleanTenantId },
     }),
     prisma.tenantDocumentCounter.findUnique({
-      where: { tenantId: String(tenantId) },
+      where: { tenantId: cleanTenantId },
     }),
   ]);
 
@@ -117,9 +169,11 @@ async function previewDocumentNumbers(prisma, tenantId, date = new Date()) {
   };
 }
 
-async function reserveSaleDocumentNumbersTx(tx, { tenantId, createdAt }) {
-  const settingsRaw = await ensureSettingsTx(tx, tenantId);
-  const counterRaw = await ensureCounterTx(tx, tenantId);
+async function reserveSaleDocumentNumbersTx(tx, { tenantId, createdAt = new Date() }) {
+  const cleanTenantId = cleanString(tenantId);
+
+  const settingsRaw = await ensureSettingsTx(tx, cleanTenantId);
+  const counterRaw = await ensureCounterTx(tx, cleanTenantId);
 
   const settings = normalizeSettings(settingsRaw);
   const counter = normalizeCounter(counterRaw);
@@ -142,7 +196,7 @@ async function reserveSaleDocumentNumbersTx(tx, { tenantId, createdAt }) {
   );
 
   await tx.tenantDocumentCounter.update({
-    where: { tenantId: String(tenantId) },
+    where: { tenantId: cleanTenantId },
     data: {
       nextReceiptSeq: receiptSeq + 1n,
       nextInvoiceSeq: invoiceSeq + 1n,
@@ -155,9 +209,11 @@ async function reserveSaleDocumentNumbersTx(tx, { tenantId, createdAt }) {
   };
 }
 
-async function reserveWarrantyDocumentNumberTx(tx, { tenantId, createdAt }) {
-  const settingsRaw = await ensureSettingsTx(tx, tenantId);
-  const counterRaw = await ensureCounterTx(tx, tenantId);
+async function reserveWarrantyDocumentNumberTx(tx, { tenantId, createdAt = new Date() }) {
+  const cleanTenantId = cleanString(tenantId);
+
+  const settingsRaw = await ensureSettingsTx(tx, cleanTenantId);
+  const counterRaw = await ensureCounterTx(tx, cleanTenantId);
 
   const settings = normalizeSettings(settingsRaw);
   const counter = normalizeCounter(counterRaw);
@@ -172,7 +228,7 @@ async function reserveWarrantyDocumentNumberTx(tx, { tenantId, createdAt }) {
   );
 
   await tx.tenantDocumentCounter.update({
-    where: { tenantId: String(tenantId) },
+    where: { tenantId: cleanTenantId },
     data: {
       nextWarrantySeq: warrantySeq + 1n,
     },
@@ -183,9 +239,11 @@ async function reserveWarrantyDocumentNumberTx(tx, { tenantId, createdAt }) {
   };
 }
 
-async function reserveProformaDocumentNumberTx(tx, { tenantId, createdAt }) {
-  const settingsRaw = await ensureSettingsTx(tx, tenantId);
-  const counterRaw = await ensureCounterTx(tx, tenantId);
+async function reserveProformaDocumentNumberTx(tx, { tenantId, createdAt = new Date() }) {
+  const cleanTenantId = cleanString(tenantId);
+
+  const settingsRaw = await ensureSettingsTx(tx, cleanTenantId);
+  const counterRaw = await ensureCounterTx(tx, cleanTenantId);
 
   const settings = normalizeSettings(settingsRaw);
   const counter = normalizeCounter(counterRaw);
@@ -200,7 +258,7 @@ async function reserveProformaDocumentNumberTx(tx, { tenantId, createdAt }) {
   );
 
   await tx.tenantDocumentCounter.update({
-    where: { tenantId: String(tenantId) },
+    where: { tenantId: cleanTenantId },
     data: {
       nextProformaSeq: proformaSeq + 1n,
     },

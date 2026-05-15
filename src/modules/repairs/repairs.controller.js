@@ -1,4 +1,3 @@
-// src/modules/repairs/repairs.controller.js
 const prisma = require("../../config/database");
 const { RepairStatus, UserRole } = require("@prisma/client");
 
@@ -23,6 +22,110 @@ function canViewAllBranches(req) {
   return Boolean(req.user?.canViewAllBranches);
 }
 
+function hasRepairBranchField() {
+  return typeof prisma.repair.fields?.branchId !== "undefined";
+}
+
+function hasRepairCreatedByField() {
+  return typeof prisma.repair.fields?.createdById !== "undefined";
+}
+
+function hasUserBranchField() {
+  return typeof prisma.user.fields?.branchId !== "undefined";
+}
+
+function createCodedError(code, message = code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function businessLocationLabel(location) {
+  const code = cleanString(location?.code);
+  const name = cleanString(location?.name);
+
+  if (code && name) return `${code} • ${name}`;
+  if (name) return name;
+  if (code) return code;
+
+  return null;
+}
+
+function toBusinessLocation(location) {
+  if (!location) return null;
+
+  return {
+    id: location.id,
+    name: location.name || null,
+    code: location.code || null,
+    status: location.status || null,
+    isMain: Boolean(location.isMain),
+    label: businessLocationLabel(location),
+  };
+}
+
+function formatRepairScopeForResponse(scope) {
+  if (!scope) {
+    return {
+      mode: "CURRENT_LOCATION",
+      storeLocationId: null,
+      allowedStoreLocationIds: [],
+    };
+  }
+
+  return {
+    mode: scope.mode === "ALL_BRANCHES" ? "ALL_LOCATIONS" : "CURRENT_LOCATION",
+    storeLocationId: scope.branchId || null,
+    allowedStoreLocationIds: Array.isArray(scope.allowedBranchIds) ? scope.allowedBranchIds : [],
+  };
+}
+
+function includeRepairRelations() {
+  return {
+    customer: {
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+      },
+    },
+    technician: {
+      select: {
+        id: true,
+        name: true,
+      },
+    },
+    ...(hasRepairBranchField()
+      ? {
+          branch: {
+            select: {
+              id: true,
+              name: true,
+              code: true,
+              status: true,
+              isMain: true,
+            },
+          },
+        }
+      : {}),
+  };
+}
+
+function decorateRepair(repair) {
+  if (!repair) return repair;
+
+  const next = {
+    ...repair,
+    storeLocation: toBusinessLocation(repair.branch),
+  };
+
+  return next;
+}
+
+function decorateRepairs(repairs) {
+  return Array.isArray(repairs) ? repairs.map(decorateRepair) : [];
+}
+
 function resolveRepairBranchScope(req) {
   const requestedBranchId =
     cleanString(req.query?.branchId) ||
@@ -40,9 +143,7 @@ function resolveRepairBranchScope(req) {
 
   if (allBranchesRequested) {
     if (!canViewAllBranches(req)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
-      throw e;
+      throw createCodedError("BRANCH_ACCESS_DENIED");
     }
 
     return {
@@ -53,10 +154,12 @@ function resolveRepairBranchScope(req) {
   }
 
   if (requestedBranchId) {
-    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
-      throw e;
+    if (
+      !canViewAllBranches(req) &&
+      allowedBranchIds.length > 0 &&
+      !allowedBranchIds.includes(requestedBranchId)
+    ) {
+      throw createCodedError("BRANCH_ACCESS_DENIED");
     }
 
     return {
@@ -76,7 +179,7 @@ function resolveRepairBranchScope(req) {
 function applyRepairBranchScope(where, scope) {
   const next = { ...(where || {}) };
 
-  if (scope?.mode === "SINGLE_BRANCH" && scope?.branchId) {
+  if (hasRepairBranchField() && scope?.mode === "SINGLE_BRANCH" && scope?.branchId) {
     next.branchId = scope.branchId;
   }
 
@@ -88,19 +191,19 @@ async function ensureWritableBranchAccessOrThrow(req) {
   const branchId = getActiveBranchId(req);
 
   if (!tenantId || !branchId) {
-    const e = new Error("BRANCH_REQUIRED");
-    e.code = "BRANCH_REQUIRED";
-    throw e;
+    throw createCodedError("BRANCH_REQUIRED");
   }
 
   const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
     ? req.user.allowedBranchIds
     : [];
 
-  if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(branchId)) {
-    const e = new Error("BRANCH_ACCESS_DENIED");
-    e.code = "BRANCH_ACCESS_DENIED";
-    throw e;
+  if (
+    !canViewAllBranches(req) &&
+    allowedBranchIds.length > 0 &&
+    !allowedBranchIds.includes(branchId)
+  ) {
+    throw createCodedError("BRANCH_ACCESS_DENIED");
   }
 
   const branch = await prisma.branch.findFirst({
@@ -122,18 +225,101 @@ async function ensureWritableBranchAccessOrThrow(req) {
   });
 
   if (!branch) {
-    const e = new Error("BRANCH_NOT_FOUND");
-    e.code = "BRANCH_NOT_FOUND";
-    throw e;
+    throw createCodedError("BRANCH_NOT_FOUND");
   }
 
   if (branch.status !== "ACTIVE") {
-    const e = new Error("BRANCH_NOT_ACTIVE");
-    e.code = "BRANCH_NOT_ACTIVE";
-    throw e;
+    throw createCodedError("BRANCH_NOT_ACTIVE");
   }
 
   return branch;
+}
+
+function sendRepairLocationError(res, err) {
+  const code = String(err?.code || err?.message || "");
+
+  if (code === "BRANCH_REQUIRED") {
+    return res.status(400).json({
+      message: "No active store location selected",
+      code: "STORE_LOCATION_REQUIRED",
+    });
+  }
+
+  if (code === "BRANCH_ACCESS_DENIED") {
+    return res.status(403).json({
+      message: "You do not have access to this store location",
+      code: "STORE_LOCATION_ACCESS_DENIED",
+    });
+  }
+
+  if (code === "BRANCH_NOT_FOUND") {
+    return res.status(404).json({
+      message: "Store location not found",
+      code: "STORE_LOCATION_NOT_FOUND",
+    });
+  }
+
+  if (code === "BRANCH_NOT_ACTIVE") {
+    return res.status(409).json({
+      message: "Selected store location is not active",
+      code: "STORE_LOCATION_NOT_ACTIVE",
+    });
+  }
+
+  return null;
+}
+
+function normalizeWarrantyEnd(value) {
+  if (value === undefined) return undefined;
+  if (!value) return null;
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw createCodedError("INVALID_WARRANTY_DATE");
+  }
+
+  return date;
+}
+
+function normalizeRepairStatus(value) {
+  const status = cleanString(value);
+
+  if (!status) {
+    throw createCodedError("STATUS_REQUIRED");
+  }
+
+  if (!Object.values(RepairStatus).includes(status)) {
+    throw createCodedError("INVALID_REPAIR_STATUS");
+  }
+
+  return status;
+}
+
+async function findScopedRepairOrThrow(req, id, extraSelect = {}) {
+  const tenantId = getTenantId(req);
+
+  if (!tenantId) {
+    throw createCodedError("UNAUTHORIZED");
+  }
+
+  const scope = resolveRepairBranchScope(req);
+
+  const repair = await prisma.repair.findFirst({
+    where: applyRepairBranchScope({ id, tenantId }, scope),
+    select: {
+      id: true,
+      tenantId: true,
+      technicianId: true,
+      ...(hasRepairBranchField() ? { branchId: true } : {}),
+      ...extraSelect,
+    },
+  });
+
+  if (!repair) {
+    throw createCodedError("REPAIR_NOT_FOUND");
+  }
+
+  return { repair, scope, tenantId };
 }
 
 // CREATE REPAIR
@@ -141,8 +327,10 @@ async function createRepair(req, res) {
   const { customerId, device, serial, issue, warrantyEnd } = req.body;
   const tenantId = getTenantId(req);
 
-  if (!customerId || !device || !issue) {
-    return res.status(400).json({ message: "Missing required fields" });
+  if (!customerId || !cleanString(device) || !cleanString(issue)) {
+    return res.status(400).json({
+      message: "Customer, device, and issue are required",
+    });
   }
 
   if (!tenantId) {
@@ -150,13 +338,21 @@ async function createRepair(req, res) {
   }
 
   try {
-    const activeBranch = await ensureWritableBranchAccessOrThrow(req);
+    const activeLocation = await ensureWritableBranchAccessOrThrow(req);
 
     const customer = await prisma.customer.findFirst({
-      where: { id: customerId, tenantId },
+      where: {
+        id: customerId,
+        tenantId,
+      },
+      select: {
+        id: true,
+      },
     });
 
-    if (!customer) return res.status(404).json({ message: "Customer not found" });
+    if (!customer) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
 
     const repairData = {
       tenantId,
@@ -165,57 +361,35 @@ async function createRepair(req, res) {
       serial: cleanString(serial),
       issue: cleanString(issue),
       status: RepairStatus.RECEIVED,
-      warrantyEnd: warrantyEnd ? new Date(warrantyEnd) : null,
+      warrantyEnd: warrantyEnd ? normalizeWarrantyEnd(warrantyEnd) : null,
     };
 
-    if (typeof prisma.repair.fields?.branchId !== "undefined") {
-      repairData.branchId = activeBranch.id;
+    if (hasRepairBranchField()) {
+      repairData.branchId = activeLocation.id;
     }
 
-    if (typeof prisma.repair.fields?.createdById !== "undefined") {
+    if (hasRepairCreatedByField()) {
       repairData.createdById = getUserId(req);
     }
 
     const repair = await prisma.repair.create({
       data: repairData,
-      include: {
-        customer: { select: { name: true, phone: true } },
-        technician: { select: { name: true } },
-        ...(typeof prisma.repair.fields?.branchId !== "undefined"
-          ? {
-              branch: {
-                select: {
-                  id: true,
-                  name: true,
-                  code: true,
-                  status: true,
-                  isMain: true,
-                },
-              },
-            }
-          : {}),
-      },
+      include: includeRepairRelations(),
     });
 
-    return res.status(201).json(repair);
+    return res.status(201).json({
+      repair: decorateRepair(repair),
+      message: "Repair created",
+    });
   } catch (err) {
-    const code = err?.code;
-    const msg = String(err?.message || "");
+    const locationError = sendRepairLocationError(res, err);
+    if (locationError) return locationError;
 
-    if (code === "BRANCH_REQUIRED" || msg === "BRANCH_REQUIRED") {
-      return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
-    }
-    if (code === "BRANCH_ACCESS_DENIED" || msg === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
-    }
-    if (code === "BRANCH_NOT_FOUND" || msg === "BRANCH_NOT_FOUND") {
-      return res.status(404).json({ message: "Branch not found" });
-    }
-    if (code === "BRANCH_NOT_ACTIVE" || msg === "BRANCH_NOT_ACTIVE") {
-      return res.status(409).json({ message: "Selected branch is not active" });
+    if (String(err?.code || err?.message || "") === "INVALID_WARRANTY_DATE") {
+      return res.status(400).json({ message: "Warranty date is invalid" });
     }
 
-    console.error(err);
+    console.error("Failed to create repair:", err);
     return res.status(500).json({ message: "Failed to create repair" });
   }
 }
@@ -231,36 +405,21 @@ async function getRepairs(req, res) {
     const repairs = await prisma.repair.findMany({
       where: applyRepairBranchScope({ tenantId }, scope),
       orderBy: { createdAt: "desc" },
-      include: {
-        customer: { select: { name: true, phone: true } },
-        technician: { select: { name: true } },
-        ...(typeof prisma.repair.fields?.branchId !== "undefined"
-          ? {
-              branch: {
-                select: {
-                  id: true,
-                  name: true,
-                  code: true,
-                  status: true,
-                  isMain: true,
-                },
-              },
-            }
-          : {}),
-      },
+      include: includeRepairRelations(),
     });
+
+    const decorated = decorateRepairs(repairs);
 
     return res.json({
-      repairs,
-      count: repairs.length,
-      branchScope: scope,
+      repairs: decorated,
+      count: decorated.length,
+      storeLocationScope: formatRepairScopeForResponse(scope),
     });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    const locationError = sendRepairLocationError(res, err);
+    if (locationError) return locationError;
 
-    console.error(err);
+    console.error("Failed to fetch repairs:", err);
     return res.status(500).json({ message: "Failed to fetch repairs" });
   }
 }
@@ -270,98 +429,80 @@ async function getRepairById(req, res) {
   const { id } = req.params;
 
   try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
     const scope = resolveRepairBranchScope(req);
 
     const repair = await prisma.repair.findFirst({
-      where: applyRepairBranchScope(
-        { id, tenantId: getTenantId(req) },
-        scope
-      ),
-      include: {
-        customer: { select: { name: true, phone: true } },
-        technician: { select: { name: true } },
-        ...(typeof prisma.repair.fields?.branchId !== "undefined"
-          ? {
-              branch: {
-                select: {
-                  id: true,
-                  name: true,
-                  code: true,
-                  status: true,
-                  isMain: true,
-                },
-              },
-            }
-          : {}),
-      },
+      where: applyRepairBranchScope({ id, tenantId }, scope),
+      include: includeRepairRelations(),
     });
 
-    if (!repair) return res.status(404).json({ message: "Repair not found" });
-
-    return res.json(repair);
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
+    if (!repair) {
+      return res.status(404).json({ message: "Repair not found" });
     }
 
-    console.error(err);
+    return res.json({
+      repair: decorateRepair(repair),
+    });
+  } catch (err) {
+    const locationError = sendRepairLocationError(res, err);
+    if (locationError) return locationError;
+
+    console.error("Failed to fetch repair:", err);
     return res.status(500).json({ message: "Failed to fetch repair" });
   }
 }
 
-// UPDATE REPAIR (all fields)
+// UPDATE REPAIR DETAILS
 async function updateRepair(req, res) {
   const { id } = req.params;
   const { device, serial, issue, warrantyEnd } = req.body;
 
   try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
     const scope = resolveRepairBranchScope(req);
 
-    const result = await prisma.repair.updateMany({
-      where: applyRepairBranchScope(
-        { id, tenantId: getTenantId(req) },
-        scope
-      ),
-      data: {
-        ...(device !== undefined ? { device: cleanString(device) } : {}),
-        ...(serial !== undefined ? { serial: cleanString(serial) } : {}),
-        ...(issue !== undefined ? { issue: cleanString(issue) } : {}),
-        ...(warrantyEnd !== undefined
-          ? { warrantyEnd: warrantyEnd ? new Date(warrantyEnd) : null }
-          : {}),
-      },
-    });
+    const data = {
+      ...(device !== undefined ? { device: cleanString(device) } : {}),
+      ...(serial !== undefined ? { serial: cleanString(serial) } : {}),
+      ...(issue !== undefined ? { issue: cleanString(issue) } : {}),
+    };
 
-    if (result.count === 0) return res.status(404).json({ message: "Repair not found" });
-
-    const updated = await prisma.repair.findFirst({
-      where: { id, tenantId: getTenantId(req) },
-      include: {
-        customer: { select: { name: true, phone: true } },
-        technician: { select: { name: true } },
-        ...(typeof prisma.repair.fields?.branchId !== "undefined"
-          ? {
-              branch: {
-                select: {
-                  id: true,
-                  name: true,
-                  code: true,
-                  status: true,
-                  isMain: true,
-                },
-              },
-            }
-          : {}),
-      },
-    });
-
-    return res.json(updated || { message: "Repair updated" });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
+    if (warrantyEnd !== undefined) {
+      data.warrantyEnd = normalizeWarrantyEnd(warrantyEnd);
     }
 
-    console.error(err);
+    const result = await prisma.repair.updateMany({
+      where: applyRepairBranchScope({ id, tenantId }, scope),
+      data,
+    });
+
+    if (result.count === 0) {
+      return res.status(404).json({ message: "Repair not found" });
+    }
+
+    const updated = await prisma.repair.findFirst({
+      where: applyRepairBranchScope({ id, tenantId }, scope),
+      include: includeRepairRelations(),
+    });
+
+    return res.json({
+      repair: decorateRepair(updated),
+      message: "Repair updated",
+    });
+  } catch (err) {
+    const locationError = sendRepairLocationError(res, err);
+    if (locationError) return locationError;
+
+    if (String(err?.code || err?.message || "") === "INVALID_WARRANTY_DATE") {
+      return res.status(400).json({ message: "Warranty date is invalid" });
+    }
+
+    console.error("Failed to update repair:", err);
     return res.status(500).json({ message: "Failed to update repair" });
   }
 }
@@ -369,87 +510,71 @@ async function updateRepair(req, res) {
 // UPDATE STATUS ONLY
 async function updateRepairStatus(req, res) {
   const { id } = req.params;
-  const { status } = req.body;
-
-  if (!status) return res.status(400).json({ message: "Status is required" });
-
-  if (!Object.values(RepairStatus).includes(status)) {
-    return res.status(400).json({
-      message: `status must be one of ${Object.values(RepairStatus).join(", ")}`,
-    });
-  }
 
   try {
-    const scope = resolveRepairBranchScope(req);
-    const userRole = String(req.user?.role || "").toUpperCase();
     const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
-    const repair = await prisma.repair.findFirst({
-      where: applyRepairBranchScope(
-        { id, tenantId },
-        scope
-      ),
-      select: {
-        id: true,
-        tenantId: true,
-        technicianId: true,
-      },
-    });
+    const status = normalizeRepairStatus(req.body?.status);
+    const userRole = String(req.user?.role || "").toUpperCase();
 
-    if (!repair) {
-      return res.status(404).json({ message: "Repair not found" });
-    }
+    const { repair, scope } = await findScopedRepairOrThrow(req, id);
 
     if (userRole === "TECHNICIAN") {
       const currentUserId = getUserId(req);
+
       if (!repair.technicianId || String(repair.technicianId) !== String(currentUserId)) {
         return res.status(403).json({
-          message: "Technician can only update assigned repairs",
+          message: "Technicians can only update repairs assigned to them",
           code: "REPAIR_ASSIGNMENT_REQUIRED",
         });
       }
     }
 
     const result = await prisma.repair.updateMany({
-      where: { id, tenantId },
+      where: applyRepairBranchScope({ id, tenantId }, scope),
       data: { status },
     });
 
-    if (result.count === 0) return res.status(404).json({ message: "Repair not found" });
-
-    const updated = await prisma.repair.findFirst({
-      where: { id, tenantId },
-      include: {
-        customer: { select: { name: true, phone: true } },
-        technician: { select: { name: true } },
-        ...(typeof prisma.repair.fields?.branchId !== "undefined"
-          ? {
-              branch: {
-                select: {
-                  id: true,
-                  name: true,
-                  code: true,
-                  status: true,
-                  isMain: true,
-                },
-              },
-            }
-          : {}),
-      },
-    });
-
-    return res.json(updated || { message: "Repair status updated" });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
+    if (result.count === 0) {
+      return res.status(404).json({ message: "Repair not found" });
     }
 
-    console.error(err);
+    const updated = await prisma.repair.findFirst({
+      where: applyRepairBranchScope({ id, tenantId }, scope),
+      include: includeRepairRelations(),
+    });
+
+    return res.json({
+      repair: decorateRepair(updated),
+      message: "Repair status updated",
+    });
+  } catch (err) {
+    const locationError = sendRepairLocationError(res, err);
+    if (locationError) return locationError;
+
+    const code = String(err?.code || err?.message || "");
+
+    if (code === "STATUS_REQUIRED") {
+      return res.status(400).json({ message: "Status is required" });
+    }
+
+    if (code === "INVALID_REPAIR_STATUS") {
+      return res.status(400).json({
+        message: `Status must be one of ${Object.values(RepairStatus).join(", ")}`,
+      });
+    }
+
+    if (code === "REPAIR_NOT_FOUND") {
+      return res.status(404).json({ message: "Repair not found" });
+    }
+
+    console.error("Failed to update repair status:", err);
     return res.status(500).json({ message: "Failed to update status" });
   }
 }
 
-// Assign or unassign technician
+// ASSIGN OR UNASSIGN TECHNICIAN
 async function assignTechnician(req, res) {
   const tenantId = getTenantId(req);
   const { id } = req.params;
@@ -458,23 +583,9 @@ async function assignTechnician(req, res) {
   const technicianId = raw === "" || raw == null ? null : String(raw);
 
   try {
-    const scope = resolveRepairBranchScope(req);
+    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
-    const repair = await prisma.repair.findFirst({
-      where: applyRepairBranchScope(
-        { id, tenantId },
-        scope
-      ),
-      select: {
-        id: true,
-        tenantId: true,
-        ...(typeof prisma.repair.fields?.branchId !== "undefined" ? { branchId: true } : {}),
-      },
-    });
-
-    if (!repair) {
-      return res.status(404).json({ message: "Repair not found" });
-    }
+    const { repair, scope } = await findScopedRepairOrThrow(req, id);
 
     if (technicianId) {
       const techWhere = {
@@ -483,25 +594,25 @@ async function assignTechnician(req, res) {
         role: UserRole.TECHNICIAN,
       };
 
-      if (typeof prisma.user.fields?.branchId !== "undefined" && repair.branchId) {
-        techWhere.OR = [
-          { branchId: repair.branchId },
-          { branchId: null },
-        ];
+      if (hasUserBranchField() && repair.branchId) {
+        techWhere.OR = [{ branchId: repair.branchId }, { branchId: null }];
       }
 
-      const tech = await prisma.user.findFirst({
+      const technician = await prisma.user.findFirst({
         where: techWhere,
         select: { id: true },
       });
 
-      if (!tech) {
-        return res.status(400).json({ message: "Invalid technicianId" });
+      if (!technician) {
+        return res.status(400).json({
+          message: "Selected technician is not available for this store location",
+          code: "TECHNICIAN_NOT_AVAILABLE",
+        });
       }
     }
 
     const result = await prisma.repair.updateMany({
-      where: { id, tenantId },
+      where: applyRepairBranchScope({ id, tenantId }, scope),
       data: { technicianId },
     });
 
@@ -510,91 +621,85 @@ async function assignTechnician(req, res) {
     }
 
     const updated = await prisma.repair.findFirst({
-      where: { id, tenantId },
-      include: {
-        customer: { select: { name: true, phone: true } },
-        technician: { select: { name: true } },
-        ...(typeof prisma.repair.fields?.branchId !== "undefined"
-          ? {
-              branch: {
-                select: {
-                  id: true,
-                  name: true,
-                  code: true,
-                  status: true,
-                  isMain: true,
-                },
-              },
-            }
-          : {}),
-      },
+      where: applyRepairBranchScope({ id, tenantId }, scope),
+      include: includeRepairRelations(),
     });
 
-    return res.status(200).json(updated);
+    return res.status(200).json({
+      repair: decorateRepair(updated),
+      message: technicianId ? "Technician assigned" : "Technician removed",
+    });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
+    const locationError = sendRepairLocationError(res, err);
+    if (locationError) return locationError;
+
+    if (String(err?.code || err?.message || "") === "REPAIR_NOT_FOUND") {
+      return res.status(404).json({ message: "Repair not found" });
     }
 
-    console.error("Error assigning/unassigning technician:", err);
-    return res.status(500).json({ message: "Failed to assign/unassign technician" });
+    console.error("Failed to assign or remove technician:", err);
+    return res.status(500).json({ message: "Failed to update technician assignment" });
   }
 }
 
-// ARCHIVE (soft delete)
+// ARCHIVE REPAIR
 async function archiveRepair(req, res) {
   const { id } = req.params;
 
   try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
     const scope = resolveRepairBranchScope(req);
 
     const result = await prisma.repair.updateMany({
-      where: applyRepairBranchScope(
-        { id, tenantId: getTenantId(req) },
-        scope
-      ),
+      where: applyRepairBranchScope({ id, tenantId }, scope),
       data: { status: RepairStatus.DELIVERED },
     });
 
-    if (result.count === 0) return res.status(404).json({ message: "Repair not found" });
-    return res.json({ message: "Repair archived" });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
+    if (result.count === 0) {
+      return res.status(404).json({ message: "Repair not found" });
     }
 
-    console.error(err);
+    return res.json({ message: "Repair archived" });
+  } catch (err) {
+    const locationError = sendRepairLocationError(res, err);
+    if (locationError) return locationError;
+
+    console.error("Failed to archive repair:", err);
     return res.status(500).json({ message: "Failed to archive repair" });
   }
 }
 
-// DELETE (hard delete)
+// DELETE REPAIR
 async function deleteRepair(req, res) {
   const { id } = req.params;
 
   try {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
     const scope = resolveRepairBranchScope(req);
 
     const result = await prisma.repair.deleteMany({
-      where: applyRepairBranchScope(
-        { id, tenantId: getTenantId(req) },
-        scope
-      ),
+      where: applyRepairBranchScope({ id, tenantId }, scope),
     });
 
-    if (result.count === 0) return res.status(404).json({ message: "Repair not found" });
-    return res.json({ message: "Repair deleted" });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
+    if (result.count === 0) {
+      return res.status(404).json({ message: "Repair not found" });
     }
 
-    console.error(err);
+    return res.json({ message: "Repair deleted" });
+  } catch (err) {
+    const locationError = sendRepairLocationError(res, err);
+    if (locationError) return locationError;
+
+    console.error("Failed to delete repair:", err);
     return res.status(500).json({ message: "Failed to delete repair" });
   }
 }
 
-// GET ALL TECHNICIANS
+// GET TECHNICIANS
 async function getTechnicians(req, res) {
   try {
     const tenantId = getTenantId(req);
@@ -604,14 +709,11 @@ async function getTechnicians(req, res) {
 
     const technicianWhere = {
       tenantId,
-      role: "TECHNICIAN",
+      role: UserRole.TECHNICIAN,
     };
 
-    if (scope.mode === "SINGLE_BRANCH" && scope.branchId && typeof prisma.user.fields?.branchId !== "undefined") {
-      technicianWhere.OR = [
-        { branchId: scope.branchId },
-        { branchId: null },
-      ];
+    if (scope.mode === "SINGLE_BRANCH" && scope.branchId && hasUserBranchField()) {
+      technicianWhere.OR = [{ branchId: scope.branchId }, { branchId: null }];
     }
 
     const technicians = await prisma.user.findMany({
@@ -619,21 +721,23 @@ async function getTechnicians(req, res) {
       select: {
         id: true,
         name: true,
-        ...(typeof prisma.user.fields?.branchId !== "undefined" ? { branchId: true } : {}),
+        ...(hasUserBranchField() ? { branchId: true } : {}),
+      },
+      orderBy: {
+        name: "asc",
       },
     });
 
     return res.json({
       technicians,
       count: technicians.length,
-      branchScope: scope,
+      storeLocationScope: formatRepairScopeForResponse(scope),
     });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    const locationError = sendRepairLocationError(res, err);
+    if (locationError) return locationError;
 
-    console.error(err);
+    console.error("Failed to fetch technicians:", err);
     return res.status(500).json({ message: "Failed to fetch technicians" });
   }
 }

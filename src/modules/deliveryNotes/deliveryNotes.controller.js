@@ -20,14 +20,39 @@ function canViewAllBranches(req) {
   return Boolean(req.user?.canViewAllBranches);
 }
 
-function cleanString(x) {
-  const s = x == null ? "" : String(x).trim();
+function cleanString(value) {
+  const s = String(value ?? "").trim();
   return s || null;
 }
 
-function toInt(x, fallback = NaN) {
-  const n = Number(x);
+function toInt(value, fallback = NaN) {
+  const n = Number(value);
   return Number.isFinite(n) ? Math.floor(n) : fallback;
+}
+
+function getLocationName(branch) {
+  if (!branch) return null;
+
+  const name = cleanString(branch.name);
+  const code = cleanString(branch.code);
+
+  if (name && code) return `${name} (${code})`;
+  if (name) return name;
+  if (code) return code;
+
+  return null;
+}
+
+function serializeSellingLocation(branch) {
+  if (!branch) return null;
+
+  return {
+    name: branch.name || null,
+    code: branch.code || null,
+    status: branch.status || null,
+    isMain: Boolean(branch.isMain),
+    label: getLocationName(branch),
+  };
 }
 
 function normalizeDeliveryItems(inputItems = []) {
@@ -58,9 +83,9 @@ function resolveDeliveryNoteBranchScope(req) {
 
   if (allBranchesRequested) {
     if (!canViewAllBranches(req)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
-      throw e;
+      const error = new Error("LOCATION_ACCESS_DENIED");
+      error.code = "LOCATION_ACCESS_DENIED";
+      throw error;
     }
 
     return {
@@ -71,10 +96,14 @@ function resolveDeliveryNoteBranchScope(req) {
   }
 
   if (requestedBranchId) {
-    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
-      throw e;
+    if (
+      !canViewAllBranches(req) &&
+      allowedBranchIds.length > 0 &&
+      !allowedBranchIds.includes(requestedBranchId)
+    ) {
+      const error = new Error("LOCATION_ACCESS_DENIED");
+      error.code = "LOCATION_ACCESS_DENIED";
+      throw error;
     }
 
     return {
@@ -94,7 +123,11 @@ function resolveDeliveryNoteBranchScope(req) {
 function applyDeliveryBranchScope(where, scope) {
   const next = { ...(where || {}) };
 
-  if (scope?.mode === "SINGLE_BRANCH" && scope?.branchId && typeof prisma.deliveryNote.fields?.branchId !== "undefined") {
+  if (
+    scope?.mode === "SINGLE_BRANCH" &&
+    scope?.branchId &&
+    typeof prisma.deliveryNote.fields?.branchId !== "undefined"
+  ) {
     next.branchId = scope.branchId;
   }
 
@@ -106,19 +139,23 @@ async function ensureWritableBranchAccessOrThrow(req) {
   const branchId = getActiveBranchId(req);
 
   if (!tenantId || !branchId) {
-    const e = new Error("BRANCH_REQUIRED");
-    e.code = "BRANCH_REQUIRED";
-    throw e;
+    const error = new Error("LOCATION_REQUIRED");
+    error.code = "LOCATION_REQUIRED";
+    throw error;
   }
 
   const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
     ? req.user.allowedBranchIds
     : [];
 
-  if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(branchId)) {
-    const e = new Error("BRANCH_ACCESS_DENIED");
-    e.code = "BRANCH_ACCESS_DENIED";
-    throw e;
+  if (
+    !canViewAllBranches(req) &&
+    allowedBranchIds.length > 0 &&
+    !allowedBranchIds.includes(branchId)
+  ) {
+    const error = new Error("LOCATION_ACCESS_DENIED");
+    error.code = "LOCATION_ACCESS_DENIED";
+    throw error;
   }
 
   const branch = await prisma.branch.findFirst({
@@ -140,25 +177,25 @@ async function ensureWritableBranchAccessOrThrow(req) {
   });
 
   if (!branch) {
-    const e = new Error("BRANCH_NOT_FOUND");
-    e.code = "BRANCH_NOT_FOUND";
-    throw e;
+    const error = new Error("LOCATION_NOT_FOUND");
+    error.code = "LOCATION_NOT_FOUND";
+    throw error;
   }
 
   if (branch.status !== "ACTIVE") {
-    const e = new Error("BRANCH_NOT_ACTIVE");
-    e.code = "BRANCH_NOT_ACTIVE";
-    throw e;
+    const error = new Error("LOCATION_NOT_ACTIVE");
+    error.code = "LOCATION_NOT_ACTIVE";
+    throw error;
   }
 
   return branch;
 }
 
 function mapDeliveryNoteListRow(row) {
+  const sellingLocation = serializeSellingLocation(row.branch);
+
   return {
     id: row.id,
-    branchId: row.branchId || null,
-    branch: row.branch || null,
     number: String(row.number),
     date: row.date,
     customerName: row.customerName,
@@ -168,6 +205,9 @@ function mapDeliveryNoteListRow(row) {
     status: "DELIVERED",
     itemsCount: Array.isArray(row.items) ? row.items.length : 0,
     createdAt: row.createdAt,
+
+    sellingLocation,
+    storeLocation: sellingLocation,
   };
 }
 
@@ -197,9 +237,54 @@ async function findDeliveryNoteById(tenantId, id, scope = null) {
   });
 }
 
+function mapDeliveryNoteDetail(note) {
+  const sellingLocation = serializeSellingLocation(note.branch);
+
+  return {
+    ...note,
+    sellingLocation,
+    storeLocation: sellingLocation,
+  };
+}
+
+function sendLocationError(res, error) {
+  const code = String(error?.code || error?.message || "");
+
+  if (code === "LOCATION_REQUIRED" || code === "BRANCH_REQUIRED") {
+    return res.status(400).json({
+      message: "No active selling location selected",
+      code: "LOCATION_REQUIRED",
+    });
+  }
+
+  if (code === "LOCATION_ACCESS_DENIED" || code === "BRANCH_ACCESS_DENIED") {
+    return res.status(403).json({
+      message: "You do not have access to this selling location",
+      code: "LOCATION_ACCESS_DENIED",
+    });
+  }
+
+  if (code === "LOCATION_NOT_FOUND" || code === "BRANCH_NOT_FOUND") {
+    return res.status(404).json({
+      message: "Selling location not found",
+      code: "LOCATION_NOT_FOUND",
+    });
+  }
+
+  if (code === "LOCATION_NOT_ACTIVE" || code === "BRANCH_NOT_ACTIVE") {
+    return res.status(409).json({
+      message: "Selected selling location is not active",
+      code: "LOCATION_NOT_ACTIVE",
+    });
+  }
+
+  return null;
+}
+
 async function listDeliveryNotes(req, res) {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(401).json({ message: "Unauthorized" });
     }
@@ -212,6 +297,7 @@ async function listDeliveryNotes(req, res) {
 
     if (q) {
       const maybeNumber = Number(q);
+
       where.OR = [
         { customerName: { contains: q, mode: "insensitive" } },
         { customerPhone: { contains: q, mode: "insensitive" } },
@@ -227,7 +313,9 @@ async function listDeliveryNotes(req, res) {
       take: 200,
       select: {
         id: true,
-        ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined" ? { branchId: true } : {}),
+        ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
+          ? { branchId: true }
+          : {}),
         ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
           ? {
               branch: {
@@ -257,14 +345,12 @@ async function listDeliveryNotes(req, res) {
     return res.json({
       deliveryNotes: rows.map(mapDeliveryNoteListRow),
       count: rows.length,
-      branchScope: scope,
     });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+  } catch (error) {
+    const handled = sendLocationError(res, error);
+    if (handled) return handled;
 
-    console.error("listDeliveryNotes error:", err);
+    console.error("listDeliveryNotes error:", error);
     return res.status(500).json({ message: "Failed to load delivery notes" });
   }
 }
@@ -352,26 +438,13 @@ async function createDeliveryNote(req, res) {
     });
 
     return res.status(201).json({
-      deliveryNote: note,
+      deliveryNote: mapDeliveryNoteDetail(note),
     });
-  } catch (err) {
-    const code = err?.code;
-    const msg = String(err?.message || "");
+  } catch (error) {
+    const handled = sendLocationError(res, error);
+    if (handled) return handled;
 
-    if (code === "BRANCH_REQUIRED" || msg === "BRANCH_REQUIRED") {
-      return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
-    }
-    if (code === "BRANCH_ACCESS_DENIED" || msg === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
-    }
-    if (code === "BRANCH_NOT_FOUND" || msg === "BRANCH_NOT_FOUND") {
-      return res.status(404).json({ message: "Branch not found" });
-    }
-    if (code === "BRANCH_NOT_ACTIVE" || msg === "BRANCH_NOT_ACTIVE") {
-      return res.status(409).json({ message: "Selected branch is not active" });
-    }
-
-    console.error("createDeliveryNote error:", err);
+    console.error("createDeliveryNote error:", error);
     return res.status(500).json({ message: "Failed to create delivery note" });
   }
 }
@@ -379,14 +452,16 @@ async function createDeliveryNote(req, res) {
 async function getDeliveryNote(req, res) {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
     const scope = resolveDeliveryNoteBranchScope(req);
     const id = String(req.params.id || "").trim();
+
     if (!id) {
-      return res.status(400).json({ message: "Delivery note id is required" });
+      return res.status(400).json({ message: "Delivery note reference is required" });
     }
 
     const note = await findDeliveryNoteById(tenantId, id, scope);
@@ -395,13 +470,14 @@ async function getDeliveryNote(req, res) {
       return res.status(404).json({ message: "Delivery note not found" });
     }
 
-    return res.json({ deliveryNote: note, branchScope: scope });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    return res.json({
+      deliveryNote: mapDeliveryNoteDetail(note),
+    });
+  } catch (error) {
+    const handled = sendLocationError(res, error);
+    if (handled) return handled;
 
-    console.error("getDeliveryNote error:", err);
+    console.error("getDeliveryNote error:", error);
     return res.status(500).json({ message: "Failed to load delivery note" });
   }
 }
@@ -409,14 +485,16 @@ async function getDeliveryNote(req, res) {
 async function updateDeliveryNote(req, res) {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
     const scope = resolveDeliveryNoteBranchScope(req);
     const id = String(req.params.id || "").trim();
+
     if (!id) {
-      return res.status(400).json({ message: "Delivery note id is required" });
+      return res.status(400).json({ message: "Delivery note reference is required" });
     }
 
     const existing = await prisma.deliveryNote.findFirst({
@@ -435,15 +513,20 @@ async function updateDeliveryNote(req, res) {
     const customerPhone =
       req.body.customerPhone !== undefined ? cleanString(req.body.customerPhone) : undefined;
     const customerAddress =
-      req.body.customerAddress !== undefined ? cleanString(req.body.customerAddress) : undefined;
+      req.body.customerAddress !== undefined
+        ? cleanString(req.body.customerAddress)
+        : undefined;
     const deliveredBy =
       req.body.deliveredBy !== undefined ? cleanString(req.body.deliveredBy) : undefined;
     const receivedBy =
       req.body.receivedBy !== undefined ? cleanString(req.body.receivedBy) : undefined;
     const receivedByPhone =
-      req.body.receivedByPhone !== undefined ? cleanString(req.body.receivedByPhone) : undefined;
+      req.body.receivedByPhone !== undefined
+        ? cleanString(req.body.receivedByPhone)
+        : undefined;
     const notes = req.body.notes !== undefined ? cleanString(req.body.notes) : undefined;
     const saleId = req.body.saleId !== undefined ? cleanString(req.body.saleId) : undefined;
+
     const hasItems = Array.isArray(req.body.items);
     const items = hasItems ? normalizeDeliveryItems(req.body.items) : null;
 
@@ -511,14 +594,13 @@ async function updateDeliveryNote(req, res) {
 
     return res.json({
       updated: true,
-      deliveryNote: result,
+      deliveryNote: mapDeliveryNoteDetail(result),
     });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+  } catch (error) {
+    const handled = sendLocationError(res, error);
+    if (handled) return handled;
 
-    console.error("updateDeliveryNote error:", err);
+    console.error("updateDeliveryNote error:", error);
     return res.status(500).json({ message: "Failed to update delivery note" });
   }
 }
@@ -526,14 +608,16 @@ async function updateDeliveryNote(req, res) {
 async function deleteDeliveryNote(req, res) {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
     const scope = resolveDeliveryNoteBranchScope(req);
     const id = String(req.params.id || "").trim();
+
     if (!id) {
-      return res.status(400).json({ message: "Delivery note id is required" });
+      return res.status(400).json({ message: "Delivery note reference is required" });
     }
 
     const existing = await prisma.deliveryNote.findFirst({
@@ -553,12 +637,11 @@ async function deleteDeliveryNote(req, res) {
       deleted: true,
       id: existing.id,
     });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+  } catch (error) {
+    const handled = sendLocationError(res, error);
+    if (handled) return handled;
 
-    console.error("deleteDeliveryNote error:", err);
+    console.error("deleteDeliveryNote error:", error);
     return res.status(500).json({ message: "Failed to delete delivery note" });
   }
 }
@@ -566,12 +649,17 @@ async function deleteDeliveryNote(req, res) {
 async function printDeliveryNoteHtml(req, res) {
   try {
     const tenantId = getTenantId(req);
+
     if (!tenantId) {
       return res.status(401).send("Unauthorized");
     }
 
     const scope = resolveDeliveryNoteBranchScope(req);
     const id = String(req.params.id || "").trim();
+
+    if (!id) {
+      return res.status(400).send("Delivery note reference is required");
+    }
 
     const note = await prisma.deliveryNote.findFirst({
       where: applyDeliveryBranchScope({ id, tenantId }, scope),
@@ -602,11 +690,17 @@ async function printDeliveryNoteHtml(req, res) {
     const tenant = await buildTenantDocumentBranding(
       prisma,
       tenantId,
-      typeof note.branchId !== "undefined" ? note.branchId : null
+      note.branchId || null
     );
 
+    const sellingLocation = getLocationName(note.branch) || tenant?.sellingLocation || null;
+
     const html = renderDeliveryNoteHtml({
-      tenant,
+      tenant: {
+        ...tenant,
+        sellingLocation,
+        storeLocation: sellingLocation,
+      },
       document: {
         number: String(note.number),
         date: note.date || note.createdAt,
@@ -617,10 +711,10 @@ async function printDeliveryNoteHtml(req, res) {
         phone: note.customerPhone,
         address: note.customerAddress,
       },
-      items: (note.items || []).map((it) => ({
-        productName: it.productName,
-        serial: it.serial,
-        quantity: it.quantity,
+      items: (note.items || []).map((item) => ({
+        productName: item.productName,
+        serial: item.serial,
+        quantity: item.quantity,
       })),
       totals: {
         currency: "RWF",
@@ -631,19 +725,22 @@ async function printDeliveryNoteHtml(req, res) {
         receivedByPhone: note.receivedByPhone,
         notes: note.notes || tenant?.deliveryNoteTerms || null,
         badgeText: "DELIVERY",
-        branchName: note.branch?.name || null,
-        branchCode: note.branch?.code || null,
+        sellingLocation,
+        storeLocation: sellingLocation,
+        locationLabel: "Store location",
       },
     });
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.send(html);
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).send("Branch access denied");
+  } catch (error) {
+    const code = String(error?.code || error?.message || "");
+
+    if (code === "LOCATION_ACCESS_DENIED" || code === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).send("You do not have access to this selling location");
     }
 
-    console.error("printDeliveryNoteHtml error:", err);
+    console.error("printDeliveryNoteHtml error:", error);
     return res.status(500).send("Failed to render delivery note");
   }
 }

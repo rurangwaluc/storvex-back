@@ -231,6 +231,9 @@ model Branch {
   userAssignments UserBranchAssignment[]
   inventory       BranchInventory[]
 
+  borrowerInterStoreDeals InterStoreDeal[]    @relation("BorrowerInterStoreDeals")
+  interStorePayments      InterStorePayment[] @relation("BranchInterStorePayments")
+
   sales            Sale[]
   salePayments     SalePayment[]
   saleRefunds      SaleRefund[]
@@ -739,6 +742,7 @@ model InterStoreDeal {
   id                    String               @id @default(uuid())
   supplierTenantId      String?
   borrowerTenantId      String
+  borrowerBranchId      String?
   productId             String?
   serial                String
   agreedPrice           Float
@@ -775,12 +779,15 @@ model InterStoreDeal {
   takenAt               DateTime?
 
   borrowerTenant        Tenant               @relation("BorrowerDeals", fields: [borrowerTenantId], references: [id])
+  borrowerBranch        Branch?              @relation("BorrowerInterStoreDeals", fields: [borrowerBranchId], references: [id])
   product               Product?             @relation("ProductDeals", fields: [productId], references: [id])
   receivedProduct       Product?             @relation("ReceivedProduct", fields: [receivedProductId], references: [id])
   supplierTenant        Tenant?              @relation("SupplierDeals", fields: [supplierTenantId], references: [id])
   payments              InterStorePayment[]
 
   @@index([borrowerTenantId])
+  @@index([borrowerTenantId, borrowerBranchId])
+  @@index([borrowerTenantId, borrowerBranchId, status])
   @@index([supplierTenantId])
   @@index([status])
   @@index([receivedProductId])
@@ -792,6 +799,7 @@ model InterStorePayment {
   id           String                  @id @default(uuid())
   dealId       String
   tenantId     String
+  branchId     String?
   receivedById String?
   amount       Float
   method       InterStorePaymentMethod @default(CASH)
@@ -799,11 +807,13 @@ model InterStorePayment {
   createdAt    DateTime                @default(now())
 
   deal         InterStoreDeal          @relation(fields: [dealId], references: [id])
+  branch       Branch?                 @relation("BranchInterStorePayments", fields: [branchId], references: [id])
   receivedBy   User?                   @relation("ReceivedInterStorePayments", fields: [receivedById], references: [id])
   tenant       Tenant                  @relation(fields: [tenantId], references: [id])
 
   @@index([dealId])
   @@index([tenantId])
+  @@index([tenantId, branchId])
   @@index([receivedById])
 }
 

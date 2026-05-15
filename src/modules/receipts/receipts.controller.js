@@ -38,8 +38,8 @@ function resolveReceiptBranchScope(req) {
 
   if (allBranchesRequested) {
     if (!canViewAllBranches(req)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
+      const e = new Error("LOCATION_ACCESS_DENIED");
+      e.code = "LOCATION_ACCESS_DENIED";
       throw e;
     }
 
@@ -51,9 +51,13 @@ function resolveReceiptBranchScope(req) {
   }
 
   if (requestedBranchId) {
-    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
+    if (
+      !canViewAllBranches(req) &&
+      allowedBranchIds.length > 0 &&
+      !allowedBranchIds.includes(requestedBranchId)
+    ) {
+      const e = new Error("LOCATION_ACCESS_DENIED");
+      e.code = "LOCATION_ACCESS_DENIED";
       throw e;
     }
 
@@ -93,6 +97,37 @@ async function getSignedLogoUrl(tenant) {
   }
 }
 
+function serializeLocation(branch, branding = null) {
+  if (branding) {
+    return {
+      name:
+        branding.sellingLocation ||
+        branding.storeLocation ||
+        branding.locationName ||
+        branch?.name ||
+        "Store location",
+      code: branding.locationCode || branch?.code || null,
+      status: branding.locationStatus || branch?.status || null,
+      isMain: Boolean(branding.isMainLocation || branch?.isMain),
+      address: branding.locationAddress || null,
+      phone: branding.locationPhone || null,
+      email: branding.locationEmail || null,
+    };
+  }
+
+  return branch
+    ? {
+        name: branch.name || "Store location",
+        code: branch.code || null,
+        status: branch.status || null,
+        isMain: Boolean(branch.isMain),
+        address: null,
+        phone: null,
+        email: null,
+      }
+    : null;
+}
+
 function mapReceiptItem(item) {
   const quantity = Number(item?.quantity || 0);
   const price = Number(item?.price || 0);
@@ -110,22 +145,15 @@ function mapReceiptItem(item) {
   };
 }
 
-function mapReceiptPayload(sale) {
+function mapReceiptPayload(sale, branding = null) {
   const items = Array.isArray(sale?.items) ? sale.items.map(mapReceiptItem) : [];
+  const location = serializeLocation(sale.branch, branding);
 
   return {
     id: sale.id,
     saleId: sale.id,
     branchId: sale.branchId || null,
-    branch: sale.branch
-      ? {
-          id: sale.branch.id || null,
-          name: sale.branch.name || null,
-          code: sale.branch.code || null,
-          status: sale.branch.status || null,
-          isMain: Boolean(sale.branch.isMain),
-        }
-      : null,
+    location,
     number: sale.receiptNumber || null,
     invoiceNumber: sale.invoiceNumber || null,
     date: sale.createdAt || null,
@@ -160,12 +188,19 @@ function mapReceiptPayload(sale) {
       : null,
 
     store: {
-      name: sale.tenant?.name || null,
-      phone: sale.tenant?.phone || null,
-      email: sale.tenant?.email || null,
-      logoUrl: sale.tenant?.logoSignedUrl || null,
-      receiptHeader: sale.tenant?.receiptHeader || null,
-      receiptFooter: sale.tenant?.receiptFooter || null,
+      name: branding?.name || sale.tenant?.name || null,
+      phone: branding?.phone || sale.tenant?.phone || null,
+      email: branding?.email || sale.tenant?.email || null,
+      logoUrl: branding?.logoSignedUrl || branding?.logoUrl || sale.tenant?.logoSignedUrl || null,
+      receiptHeader: branding?.receiptHeader || sale.tenant?.receiptHeader || null,
+      receiptFooter: branding?.receiptFooter || sale.tenant?.receiptFooter || null,
+      documentPrimaryColor: branding?.documentPrimaryColor || "#0F4C81",
+      documentAccentColor: branding?.documentAccentColor || "#E8EEF5",
+      locationName: location?.name || null,
+      locationCode: location?.code || null,
+      locationAddress: location?.address || null,
+      sellingLocation: location?.name || null,
+      storeLocation: location?.name || null,
     },
 
     items,
@@ -370,9 +405,10 @@ async function findReceiptSale(tenantId, idOrNumber, scope = null) {
   return sale;
 }
 
-// -----------------------
-// GET /api/receipts
-// -----------------------
+function keyOrSelf(v) {
+  return v;
+}
+
 async function listReceipts(req, res) {
   try {
     const tenantId = getTenantId(req);
@@ -437,7 +473,7 @@ async function listReceipts(req, res) {
     const receipts = sales.map((sale) => ({
       id: sale.id,
       branchId: sale.branchId || null,
-      branch: sale.branch || null,
+      location: serializeLocation(sale.branch),
       number: sale.receiptNumber || null,
       invoiceNumber: sale.invoiceNumber || null,
       date: sale.createdAt || null,
@@ -460,8 +496,8 @@ async function listReceipts(req, res) {
       branchScope: scope,
     });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
+    if (String(err?.code || err?.message || "") === "LOCATION_ACCESS_DENIED") {
+      return res.status(403).json({ message: "You cannot view documents from this store location." });
     }
 
     console.error("listReceipts error:", err);
@@ -469,14 +505,6 @@ async function listReceipts(req, res) {
   }
 }
 
-// helper only to keep OR array valid
-function keyOrSelf(v) {
-  return v;
-}
-
-// -----------------------
-// GET /api/receipts/:id
-// -----------------------
 async function getReceipt(req, res) {
   try {
     const tenantId = getTenantId(req);
@@ -484,8 +512,9 @@ async function getReceipt(req, res) {
 
     const scope = resolveReceiptBranchScope(req);
     const key = String(req.params.id || "").trim();
+
     if (!key) {
-      return res.status(400).json({ message: "Receipt id is required" });
+      return res.status(400).json({ message: "Receipt reference is required" });
     }
 
     const sale = await findReceiptSale(tenantId, key, scope);
@@ -494,13 +523,15 @@ async function getReceipt(req, res) {
       return res.status(404).json({ message: "Receipt not found" });
     }
 
+    const branding = await buildTenantDocumentBranding(prisma, tenantId, sale.branchId || null);
+
     return res.json({
-      receipt: mapReceiptPayload(sale),
+      receipt: mapReceiptPayload(sale, branding),
       branchScope: scope,
     });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
+    if (String(err?.code || err?.message || "") === "LOCATION_ACCESS_DENIED") {
+      return res.status(403).json({ message: "You cannot view documents from this store location." });
     }
 
     console.error("getReceipt error:", err);
@@ -508,9 +539,6 @@ async function getReceipt(req, res) {
   }
 }
 
-// -----------------------
-// GET /api/receipts/:id/print
-// -----------------------
 async function printReceiptHtml(req, res) {
   try {
     const tenantId = getTenantId(req);
@@ -518,18 +546,21 @@ async function printReceiptHtml(req, res) {
 
     const scope = resolveReceiptBranchScope(req);
     const key = String(req.params.id || "").trim();
-    if (!key) return res.status(400).send("Receipt id is required");
+
+    if (!key) return res.status(400).send("Receipt reference is required");
 
     const sale = await findReceiptSale(tenantId, key, scope);
     if (!sale) return res.status(404).send("Receipt not found");
 
-    const payload = mapReceiptPayload(sale);
+    const branding = await buildTenantDocumentBranding(prisma, tenantId, sale.branchId || null);
+    const payload = mapReceiptPayload(sale, branding);
 
-    const branding = await buildTenantDocumentBranding(
-      prisma,
-      tenantId,
-      sale.branchId || null
-    );
+    const sellingLocation =
+      branding?.sellingLocation ||
+      branding?.storeLocation ||
+      branding?.locationName ||
+      payload.location?.name ||
+      null;
 
     const html = renderReceiptHtml({
       tenant: {
@@ -545,8 +576,11 @@ async function printReceiptHtml(req, res) {
         warrantyTerms: branding?.warrantyTerms || null,
         proformaTerms: branding?.proformaTerms || null,
         deliveryNoteTerms: branding?.deliveryNoteTerms || null,
-        branchName: payload.branch?.name || null,
-        branchCode: payload.branch?.code || null,
+        locationName: sellingLocation,
+        locationCode: branding?.locationCode || payload.location?.code || null,
+        locationAddress: branding?.locationAddress || payload.location?.address || null,
+        sellingLocation,
+        storeLocation: branding?.storeLocation || sellingLocation,
       },
       document: {
         number: payload.number,
@@ -576,8 +610,9 @@ async function printReceiptHtml(req, res) {
         saleType: payload.saleType,
         status: payload.status,
         isCancelled: Boolean(payload.isCancelled),
-        branchName: payload.branch?.name || null,
-        branchCode: payload.branch?.code || null,
+        sellingLocation,
+        storeLocation: branding?.storeLocation || sellingLocation,
+        locationLabel: "Selling location",
         notes: payload.isCancelled
           ? `This receipt was cancelled.${payload.cancelNote ? ` Note: ${payload.cancelNote}` : ""}`
           : "Keep this receipt for support and warranty.",
@@ -587,8 +622,8 @@ async function printReceiptHtml(req, res) {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(html);
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).send("Branch access denied");
+    if (String(err?.code || err?.message || "") === "LOCATION_ACCESS_DENIED") {
+      return res.status(403).send("You cannot view documents from this store location.");
     }
 
     console.error("printReceiptHtml error:", err);

@@ -21,25 +21,50 @@ function canViewAllBranches(req) {
   return Boolean(req.user?.canViewAllBranches);
 }
 
-function cleanString(x) {
-  const s = String(x ?? "").trim();
+function cleanString(value) {
+  const s = String(value ?? "").trim();
   return s || null;
 }
 
-function toInt(x, fallback = NaN) {
-  const n = Number(x);
+function toInt(value, fallback = NaN) {
+  const n = Number(value);
   return Number.isFinite(n) ? Math.floor(n) : fallback;
 }
 
-function toNumber(x, fallback = NaN) {
-  const n = Number(x);
+function toNumber(value, fallback = NaN) {
+  const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
 
-function normalizeStatus(x) {
-  const v = String(x || "").trim().toUpperCase();
+function normalizeStatus(value) {
+  const v = String(value || "").trim().toUpperCase();
   if (["DRAFT", "SENT", "EXPIRED", "CONVERTED", "CANCELLED"].includes(v)) return v;
   return null;
+}
+
+function getLocationName(location) {
+  if (!location) return null;
+
+  const name = cleanString(location.name);
+  const code = cleanString(location.code);
+
+  if (name && code) return `${name} (${code})`;
+  if (name) return name;
+  if (code) return code;
+
+  return null;
+}
+
+function serializeSellingLocation(location) {
+  if (!location) return null;
+
+  return {
+    name: location.name || null,
+    code: location.code || null,
+    status: location.status || null,
+    isMain: Boolean(location.isMain),
+    label: getLocationName(location),
+  };
 }
 
 function resolveProformaBranchScope(req) {
@@ -59,9 +84,9 @@ function resolveProformaBranchScope(req) {
 
   if (allBranchesRequested) {
     if (!canViewAllBranches(req)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
-      throw e;
+      const error = new Error("LOCATION_ACCESS_DENIED");
+      error.code = "LOCATION_ACCESS_DENIED";
+      throw error;
     }
 
     return {
@@ -72,10 +97,14 @@ function resolveProformaBranchScope(req) {
   }
 
   if (requestedBranchId) {
-    if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(requestedBranchId)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
-      throw e;
+    if (
+      !canViewAllBranches(req) &&
+      allowedBranchIds.length > 0 &&
+      !allowedBranchIds.includes(requestedBranchId)
+    ) {
+      const error = new Error("LOCATION_ACCESS_DENIED");
+      error.code = "LOCATION_ACCESS_DENIED";
+      throw error;
     }
 
     return {
@@ -111,22 +140,26 @@ async function ensureWritableBranchAccessOrThrow(req) {
   const branchId = getActiveBranchId(req);
 
   if (!tenantId || !branchId) {
-    const e = new Error("BRANCH_REQUIRED");
-    e.code = "BRANCH_REQUIRED";
-    throw e;
+    const error = new Error("LOCATION_REQUIRED");
+    error.code = "LOCATION_REQUIRED";
+    throw error;
   }
 
   const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
     ? req.user.allowedBranchIds
     : [];
 
-  if (!canViewAllBranches(req) && allowedBranchIds.length > 0 && !allowedBranchIds.includes(branchId)) {
-    const e = new Error("BRANCH_ACCESS_DENIED");
-    e.code = "BRANCH_ACCESS_DENIED";
-    throw e;
+  if (
+    !canViewAllBranches(req) &&
+    allowedBranchIds.length > 0 &&
+    !allowedBranchIds.includes(branchId)
+  ) {
+    const error = new Error("LOCATION_ACCESS_DENIED");
+    error.code = "LOCATION_ACCESS_DENIED";
+    throw error;
   }
 
-  const branch = await prisma.branch.findFirst({
+  const location = await prisma.branch.findFirst({
     where: {
       id: branchId,
       tenantId,
@@ -144,105 +177,147 @@ async function ensureWritableBranchAccessOrThrow(req) {
     },
   });
 
-  if (!branch) {
-    const e = new Error("BRANCH_NOT_FOUND");
-    e.code = "BRANCH_NOT_FOUND";
-    throw e;
+  if (!location) {
+    const error = new Error("LOCATION_NOT_FOUND");
+    error.code = "LOCATION_NOT_FOUND";
+    throw error;
   }
 
-  if (branch.status !== "ACTIVE") {
-    const e = new Error("BRANCH_NOT_ACTIVE");
-    e.code = "BRANCH_NOT_ACTIVE";
-    throw e;
+  if (location.status !== "ACTIVE") {
+    const error = new Error("LOCATION_NOT_ACTIVE");
+    error.code = "LOCATION_NOT_ACTIVE";
+    throw error;
   }
 
-  return branch;
+  return location;
 }
 
-function mapProformaListRow(p) {
+function sendLocationError(res, error) {
+  const code = String(error?.code || error?.message || "");
+
+  if (code === "LOCATION_REQUIRED" || code === "BRANCH_REQUIRED") {
+    return res.status(400).json({
+      message: "No active selling location selected",
+      code: "LOCATION_REQUIRED",
+    });
+  }
+
+  if (code === "LOCATION_ACCESS_DENIED" || code === "BRANCH_ACCESS_DENIED") {
+    return res.status(403).json({
+      message: "You do not have access to this selling location",
+      code: "LOCATION_ACCESS_DENIED",
+    });
+  }
+
+  if (code === "LOCATION_NOT_FOUND" || code === "BRANCH_NOT_FOUND") {
+    return res.status(404).json({
+      message: "Selling location not found",
+      code: "LOCATION_NOT_FOUND",
+    });
+  }
+
+  if (code === "LOCATION_NOT_ACTIVE" || code === "BRANCH_NOT_ACTIVE") {
+    return res.status(409).json({
+      message: "Selected selling location is not active",
+      code: "LOCATION_NOT_ACTIVE",
+    });
+  }
+
+  return null;
+}
+
+function mapProformaListRow(proforma) {
+  const sellingLocation = serializeSellingLocation(proforma.branch);
+
   return {
-    id: p.id,
-    branchId: p.branchId || null,
-    branch: p.branch || null,
-    number: p.number,
-    status: p.status,
-    customerName: p.customerName,
-    customerPhone: p.customerPhone,
-    customerEmail: p.customerEmail,
-    total: Number(p.total || 0),
-    subtotal: Number(p.subtotal || 0),
-    currency: p.currency || "RWF",
-    validUntil: p.validUntil || null,
-    preparedBy: p.preparedBy || null,
-    reference: p.reference || null,
-    convertedToSaleId: p.convertedToSaleId || null,
-    convertedAt: p.convertedAt || null,
-    itemsCount: Array.isArray(p.items) ? p.items.length : 0,
-    createdAt: p.createdAt,
-    updatedAt: p.updatedAt,
+    id: proforma.id,
+    number: proforma.number,
+    status: proforma.status,
+    customerName: proforma.customerName,
+    customerPhone: proforma.customerPhone,
+    customerEmail: proforma.customerEmail,
+    total: Number(proforma.total || 0),
+    subtotal: Number(proforma.subtotal || 0),
+    currency: proforma.currency || "RWF",
+    validUntil: proforma.validUntil || null,
+    preparedBy: proforma.preparedBy || null,
+    reference: proforma.reference || null,
+    convertedToSaleId: proforma.convertedToSaleId || null,
+    convertedAt: proforma.convertedAt || null,
+    itemsCount: Array.isArray(proforma.items) ? proforma.items.length : 0,
+    createdAt: proforma.createdAt,
+    updatedAt: proforma.updatedAt,
+
+    sellingLocation,
+    storeLocation: sellingLocation,
   };
 }
 
-function mapProformaDetail(p, tenant) {
+function mapProformaDetail(proforma, tenant) {
+  const sellingLocation =
+    serializeSellingLocation(proforma.branch) ||
+    (tenant?.sellingLocation
+      ? {
+          name: tenant.sellingLocation,
+          code: null,
+          status: null,
+          isMain: false,
+          label: tenant.sellingLocation,
+        }
+      : null);
+
   return {
     proforma: {
-      id: p.id,
-      branchId: p.branchId || null,
-      branch: p.branch
+      id: proforma.id,
+      number: proforma.number,
+      status: proforma.status,
+      tenantId: proforma.tenantId,
+      customerId: proforma.customerId || null,
+      createdById: proforma.createdById || null,
+
+      customerName: proforma.customerName,
+      customerPhone: proforma.customerPhone || null,
+      customerEmail: proforma.customerEmail || null,
+      customerAddress: proforma.customerAddress || null,
+
+      subtotal: Number(proforma.subtotal || 0),
+      total: Number(proforma.total || 0),
+      currency: proforma.currency || "RWF",
+
+      validUntil: proforma.validUntil || null,
+      preparedBy: proforma.preparedBy || null,
+      reference: proforma.reference || null,
+      notes: proforma.notes || null,
+
+      convertedToSaleId: proforma.convertedToSaleId || null,
+      convertedAt: proforma.convertedAt || null,
+
+      createdAt: proforma.createdAt,
+      updatedAt: proforma.updatedAt,
+
+      sellingLocation,
+      storeLocation: sellingLocation,
+
+      customer: proforma.customer
         ? {
-            id: p.branch.id || null,
-            name: p.branch.name || null,
-            code: p.branch.code || null,
-            status: p.branch.status || null,
-            isMain: Boolean(p.branch.isMain),
-          }
-        : null,
-      number: p.number,
-      status: p.status,
-      tenantId: p.tenantId,
-      customerId: p.customerId || null,
-      createdById: p.createdById || null,
-
-      customerName: p.customerName,
-      customerPhone: p.customerPhone || null,
-      customerEmail: p.customerEmail || null,
-      customerAddress: p.customerAddress || null,
-
-      subtotal: Number(p.subtotal || 0),
-      total: Number(p.total || 0),
-      currency: p.currency || "RWF",
-
-      validUntil: p.validUntil || null,
-      preparedBy: p.preparedBy || null,
-      reference: p.reference || null,
-      notes: p.notes || null,
-
-      convertedToSaleId: p.convertedToSaleId || null,
-      convertedAt: p.convertedAt || null,
-
-      createdAt: p.createdAt,
-      updatedAt: p.updatedAt,
-
-      customer: p.customer
-        ? {
-            id: p.customer.id,
-            name: p.customer.name,
-            phone: p.customer.phone,
-            email: p.customer.email || null,
-            address: p.customer.address || null,
-            tinNumber: p.customer.tinNumber || null,
-            idNumber: p.customer.idNumber || null,
-            notes: p.customer.notes || null,
+            id: proforma.customer.id,
+            name: proforma.customer.name,
+            phone: proforma.customer.phone,
+            email: proforma.customer.email || null,
+            address: proforma.customer.address || null,
+            tinNumber: proforma.customer.tinNumber || null,
+            idNumber: proforma.customer.idNumber || null,
+            notes: proforma.customer.notes || null,
           }
         : null,
 
-      createdBy: p.createdBy
+      createdBy: proforma.createdBy
         ? {
-            id: p.createdBy.id,
-            name: p.createdBy.name || null,
-            email: p.createdBy.email || null,
-            phone: p.createdBy.phone || null,
-            role: p.createdBy.role || null,
+            id: proforma.createdBy.id,
+            name: proforma.createdBy.name || null,
+            email: proforma.createdBy.email || null,
+            phone: proforma.createdBy.phone || null,
+            role: proforma.createdBy.role || null,
           }
         : null,
 
@@ -255,13 +330,19 @@ function mapProformaDetail(p, tenant) {
             logoSignedUrl: tenant.logoSignedUrl || null,
             receiptHeader: tenant.receiptHeader || null,
             receiptFooter: tenant.receiptFooter || null,
-            branchName: tenant.branchName || p.branch?.name || null,
-            branchCode: tenant.branchCode || p.branch?.code || null,
+            documentPrimaryColor: tenant.documentPrimaryColor || "#1F365C",
+            documentAccentColor: tenant.documentAccentColor || "#D8D2C2",
+            invoiceTerms: tenant.invoiceTerms || null,
+            warrantyTerms: tenant.warrantyTerms || null,
+            proformaTerms: tenant.proformaTerms || null,
+            deliveryNoteTerms: tenant.deliveryNoteTerms || null,
+            sellingLocation: sellingLocation?.label || tenant.sellingLocation || null,
+            storeLocation: sellingLocation?.label || tenant.storeLocation || null,
           }
         : null,
 
-      items: Array.isArray(p.items)
-        ? p.items.map((item) => ({
+      items: Array.isArray(proforma.items)
+        ? proforma.items.map((item) => ({
             id: item.id,
             proformaId: item.proformaId,
             productId: item.productId || null,
@@ -286,13 +367,66 @@ function mapProformaDetail(p, tenant) {
   };
 }
 
-// -----------------------
-// GET /api/proformas
-// -----------------------
+function proformaInclude() {
+  return {
+    ...(typeof prisma.proforma.fields?.branchId !== "undefined"
+      ? {
+          branch: {
+            select: {
+              id: true,
+              name: true,
+              code: true,
+              status: true,
+              isMain: true,
+            },
+          },
+        }
+      : {}),
+    customer: {
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        email: true,
+        address: true,
+        tinNumber: true,
+        idNumber: true,
+        notes: true,
+      },
+    },
+    createdBy: {
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phone: true,
+        role: true,
+      },
+    },
+    items: {
+      orderBy: [{ createdAt: "asc" }],
+      include: {
+        product: {
+          select: {
+            id: true,
+            name: true,
+            sku: true,
+            barcode: true,
+            serial: true,
+          },
+        },
+      },
+    },
+  };
+}
+
 async function listProformas(req, res) {
   try {
     const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
+    if (!tenantId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
     const scope = resolveProformaBranchScope(req);
     const q = cleanString(req.query.q);
@@ -360,29 +494,26 @@ async function listProformas(req, res) {
     return res.json({
       proformas: rows.map(mapProformaListRow),
       count: rows.length,
-      branchScope: scope,
     });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+  } catch (error) {
+    const handled = sendLocationError(res, error);
+    if (handled) return handled;
 
-    console.error("listProformas error:", err);
+    console.error("listProformas error:", error);
     return res.status(500).json({ message: "Failed to load proformas" });
   }
 }
 
-// -----------------------
-// POST /api/proformas
-// -----------------------
 async function createProforma(req, res) {
   try {
     const tenantId = getTenantId(req);
     const userId = getUserId(req);
 
-    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+    if (!tenantId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
-    const activeBranch = await ensureWritableBranchAccessOrThrow(req);
+    const activeLocation = await ensureWritableBranchAccessOrThrow(req);
 
     const {
       customerId,
@@ -400,13 +531,15 @@ async function createProforma(req, res) {
     } = req.body || {};
 
     const cleanCustomerName = cleanString(customerName);
+
     if (!cleanCustomerName) {
-      return res.status(400).json({ message: "customerName is required" });
+      return res.status(400).json({ message: "Customer name is required" });
     }
 
     const list = Array.isArray(items) ? items : [];
+
     if (list.length === 0) {
-      return res.status(400).json({ message: "items are required" });
+      return res.status(400).json({ message: "Items are required" });
     }
 
     for (const item of list) {
@@ -415,24 +548,34 @@ async function createProforma(req, res) {
       const unitPrice = toNumber(item.unitPrice, NaN);
 
       if (!productName) {
-        return res.status(400).json({ message: "Each item must have productName" });
+        return res.status(400).json({ message: "Each item must have a product name" });
       }
+
       if (!Number.isInteger(quantity) || quantity <= 0) {
-        return res.status(400).json({ message: "Each item quantity must be a positive integer" });
+        return res.status(400).json({
+          message: "Each item quantity must be a positive whole number",
+        });
       }
+
       if (!Number.isFinite(unitPrice) || unitPrice < 0) {
-        return res.status(400).json({ message: "Each item unitPrice must be a valid number" });
+        return res.status(400).json({
+          message: "Each item price must be a valid number",
+        });
       }
     }
 
     const parsedValidUntil = validUntil ? new Date(validUntil) : null;
+
     if (validUntil && Number.isNaN(parsedValidUntil.getTime())) {
-      return res.status(400).json({ message: "validUntil is invalid" });
+      return res.status(400).json({ message: "Valid until date is invalid" });
     }
 
     const finalStatus = normalizeStatus(status) || "DRAFT";
+
     if (["CONVERTED", "EXPIRED"].includes(finalStatus)) {
-      return res.status(400).json({ message: "Cannot create proforma directly in this status" });
+      return res.status(400).json({
+        message: "Cannot create a proforma directly in this status",
+      });
     }
 
     const result = await prisma.$transaction(async (tx) => {
@@ -444,7 +587,13 @@ async function createProforma(req, res) {
             id: String(customerId),
             tenantId,
           },
-          select: { id: true, name: true, phone: true, email: true, address: true },
+          select: {
+            id: true,
+            name: true,
+            phone: true,
+            email: true,
+            address: true,
+          },
         });
 
         if (!customer) {
@@ -453,17 +602,18 @@ async function createProforma(req, res) {
       }
 
       const createdAt = new Date();
-      const doc = await reserveProformaDocumentNumberTx(tx, {
+      const documentNumber = await reserveProformaDocumentNumberTx(tx, {
         tenantId,
         createdAt,
       });
 
       const preparedByText =
-        cleanString(preparedBy) || req.user?.name || req.user?.email || "Store Staff";
+        cleanString(preparedBy) || req.user?.name || req.user?.email || "Store staff";
 
       const itemRows = list.map((item) => {
         const quantity = toInt(item.quantity, 0);
         const unitPrice = toNumber(item.unitPrice, 0);
+
         return {
           productId: cleanString(item.productId),
           productName: cleanString(item.productName),
@@ -482,7 +632,7 @@ async function createProforma(req, res) {
         customerId: customer?.id || cleanString(customerId),
         createdById: userId || null,
 
-        number: doc.proformaNumber,
+        number: documentNumber.proformaNumber,
         status: finalStatus,
 
         customerName: cleanCustomerName,
@@ -501,14 +651,16 @@ async function createProforma(req, res) {
       };
 
       if (typeof tx.proforma.fields?.branchId !== "undefined") {
-        createData.branchId = activeBranch.id;
+        createData.branchId = activeLocation.id;
       }
 
       const proforma = await tx.proforma.create({
         data: createData,
         select: {
           id: true,
-          ...(typeof tx.proforma.fields?.branchId !== "undefined" ? { branchId: true } : {}),
+          ...(typeof tx.proforma.fields?.branchId !== "undefined"
+            ? { branchId: true }
+            : {}),
           number: true,
           status: true,
           customerName: true,
@@ -539,52 +691,40 @@ async function createProforma(req, res) {
         })),
       });
 
-      return {
-        ...proforma,
-        branchId: proforma.branchId || activeBranch.id,
-      };
+      return proforma;
     });
 
     return res.status(201).json({
       created: true,
       proforma: result,
     });
-  } catch (err) {
-    const code = err?.code;
-    const msg = String(err?.message || "");
+  } catch (error) {
+    const handled = sendLocationError(res, error);
+    if (handled) return handled;
 
-    if (code === "BRANCH_REQUIRED" || msg === "BRANCH_REQUIRED") {
-      return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
-    }
-    if (code === "BRANCH_ACCESS_DENIED" || msg === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
-    }
-    if (code === "BRANCH_NOT_FOUND" || msg === "BRANCH_NOT_FOUND") {
-      return res.status(404).json({ message: "Branch not found" });
-    }
-    if (code === "BRANCH_NOT_ACTIVE" || msg === "BRANCH_NOT_ACTIVE") {
-      return res.status(409).json({ message: "Selected branch is not active" });
-    }
-    if (msg === "CUSTOMER_NOT_FOUND") {
+    if (String(error?.message || "") === "CUSTOMER_NOT_FOUND") {
       return res.status(404).json({ message: "Customer not found" });
     }
 
-    console.error("createProforma error:", err);
+    console.error("createProforma error:", error);
     return res.status(500).json({ message: "Failed to create proforma" });
   }
 }
 
-// -----------------------
-// GET /api/proformas/:id
-// -----------------------
 async function getProforma(req, res) {
   try {
     const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
+    if (!tenantId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
     const scope = resolveProformaBranchScope(req);
     const id = String(req.params.id || "").trim();
-    if (!id) return res.status(400).json({ message: "Proforma id is required" });
+
+    if (!id) {
+      return res.status(400).json({ message: "Proforma reference is required" });
+    }
 
     const proforma = await prisma.proforma.findFirst({
       where: applyProformaBranchScope(
@@ -594,56 +734,7 @@ async function getProforma(req, res) {
         },
         scope
       ),
-      include: {
-        ...(typeof prisma.proforma.fields?.branchId !== "undefined"
-          ? {
-              branch: {
-                select: {
-                  id: true,
-                  name: true,
-                  code: true,
-                  status: true,
-                  isMain: true,
-                },
-              },
-            }
-          : {}),
-        customer: {
-          select: {
-            id: true,
-            name: true,
-            phone: true,
-            email: true,
-            address: true,
-            tinNumber: true,
-            idNumber: true,
-            notes: true,
-          },
-        },
-        createdBy: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            phone: true,
-            role: true,
-          },
-        },
-        items: {
-          orderBy: [{ createdAt: "asc" }],
-          include: {
-            product: {
-              select: {
-                id: true,
-                name: true,
-                sku: true,
-                barcode: true,
-                serial: true,
-              },
-            },
-          },
-        },
-      },
+      include: proformaInclude(),
     });
 
     if (!proforma) {
@@ -656,31 +747,30 @@ async function getProforma(req, res) {
       proforma.branchId || null
     );
 
-    return res.json({
-      ...mapProformaDetail(proforma, tenant),
-      branchScope: scope,
-    });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    return res.json(mapProformaDetail(proforma, tenant));
+  } catch (error) {
+    const handled = sendLocationError(res, error);
+    if (handled) return handled;
 
-    console.error("getProforma error:", err);
+    console.error("getProforma error:", error);
     return res.status(500).json({ message: "Failed to load proforma" });
   }
 }
 
-// -----------------------
-// PATCH /api/proformas/:id
-// -----------------------
 async function updateProforma(req, res) {
   try {
     const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
+    if (!tenantId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
     const scope = resolveProformaBranchScope(req);
     const id = String(req.params.id || "").trim();
-    if (!id) return res.status(400).json({ message: "Proforma id is required" });
+
+    if (!id) {
+      return res.status(400).json({ message: "Proforma reference is required" });
+    }
 
     const existing = await prisma.proforma.findFirst({
       where: applyProformaBranchScope(
@@ -705,17 +795,22 @@ async function updateProforma(req, res) {
     }
 
     const nextStatus = req.body?.status ? normalizeStatus(req.body.status) : null;
+
     if (req.body?.status && !nextStatus) {
       return res.status(400).json({ message: "Invalid status" });
     }
+
     if (nextStatus === "CONVERTED") {
-      return res.status(400).json({ message: "Use conversion flow to mark proforma as converted" });
+      return res.status(400).json({
+        message: "Use the conversion flow to mark a proforma as converted",
+      });
     }
 
     const payloadItems = Array.isArray(req.body?.items) ? req.body.items : null;
+
     if (payloadItems) {
       if (payloadItems.length === 0) {
-        return res.status(400).json({ message: "items cannot be empty" });
+        return res.status(400).json({ message: "Items cannot be empty" });
       }
 
       for (const item of payloadItems) {
@@ -724,13 +819,19 @@ async function updateProforma(req, res) {
         const unitPrice = toNumber(item.unitPrice, NaN);
 
         if (!productName) {
-          return res.status(400).json({ message: "Each item must have productName" });
+          return res.status(400).json({ message: "Each item must have a product name" });
         }
+
         if (!Number.isInteger(quantity) || quantity <= 0) {
-          return res.status(400).json({ message: "Each item quantity must be a positive integer" });
+          return res.status(400).json({
+            message: "Each item quantity must be a positive whole number",
+          });
         }
+
         if (!Number.isFinite(unitPrice) || unitPrice < 0) {
-          return res.status(400).json({ message: "Each item unitPrice must be a valid number" });
+          return res.status(400).json({
+            message: "Each item price must be a valid number",
+          });
         }
       }
     }
@@ -739,12 +840,12 @@ async function updateProforma(req, res) {
       req.body?.validUntil === undefined
         ? undefined
         : req.body?.validUntil
-        ? new Date(req.body.validUntil)
-        : null;
+          ? new Date(req.body.validUntil)
+          : null;
 
     if (parsedValidUntil !== undefined && parsedValidUntil !== null) {
       if (Number.isNaN(parsedValidUntil.getTime())) {
-        return res.status(400).json({ message: "validUntil is invalid" });
+        return res.status(400).json({ message: "Valid until date is invalid" });
       }
     }
 
@@ -756,6 +857,7 @@ async function updateProforma(req, res) {
         const itemRows = payloadItems.map((item) => {
           const quantity = toInt(item.quantity, 0);
           const unitPrice = toNumber(item.unitPrice, 0);
+
           return {
             productId: cleanString(item.productId),
             productName: cleanString(item.productName),
@@ -786,7 +888,7 @@ async function updateProforma(req, res) {
         });
       }
 
-      const updated = await tx.proforma.update({
+      return tx.proforma.update({
         where: { id: existing.id },
         data: {
           ...(req.body?.customerName !== undefined
@@ -810,9 +912,7 @@ async function updateProforma(req, res) {
           ...(req.body?.reference !== undefined
             ? { reference: cleanString(req.body.reference) }
             : {}),
-          ...(req.body?.notes !== undefined
-            ? { notes: cleanString(req.body.notes) }
-            : {}),
+          ...(req.body?.notes !== undefined ? { notes: cleanString(req.body.notes) } : {}),
           ...(parsedValidUntil !== undefined ? { validUntil: parsedValidUntil } : {}),
           ...(nextStatus ? { status: nextStatus } : {}),
           ...(subtotal !== undefined ? { subtotal } : {}),
@@ -840,20 +940,17 @@ async function updateProforma(req, res) {
           updatedAt: true,
         },
       });
-
-      return updated;
     });
 
     return res.json({
       updated: true,
       proforma: result,
     });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+  } catch (error) {
+    const handled = sendLocationError(res, error);
+    if (handled) return handled;
 
-    console.error("updateProforma error:", err);
+    console.error("updateProforma error:", error);
     return res.status(500).json({ message: "Failed to update proforma" });
   }
 }
@@ -861,11 +958,17 @@ async function updateProforma(req, res) {
 async function deleteProforma(req, res) {
   try {
     const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
+
+    if (!tenantId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
     const scope = resolveProformaBranchScope(req);
     const id = String(req.params.id || "").trim();
-    if (!id) return res.status(400).json({ message: "Proforma id is required" });
+
+    if (!id) {
+      return res.status(400).json({ message: "Proforma reference is required" });
+    }
 
     const existing = await prisma.proforma.findFirst({
       where: applyProformaBranchScope(
@@ -902,27 +1005,29 @@ async function deleteProforma(req, res) {
       id: existing.id,
       number: existing.number || null,
     });
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+  } catch (error) {
+    const handled = sendLocationError(res, error);
+    if (handled) return handled;
 
-    console.error("deleteProforma error:", err);
+    console.error("deleteProforma error:", error);
     return res.status(500).json({ message: "Failed to delete proforma" });
   }
 }
 
-// -----------------------
-// GET /api/proformas/:id/print
-// -----------------------
 async function printProformaHtml(req, res) {
   try {
     const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(401).send("Unauthorized");
+
+    if (!tenantId) {
+      return res.status(401).send("Unauthorized");
+    }
 
     const scope = resolveProformaBranchScope(req);
     const id = String(req.params.id || "").trim();
-    if (!id) return res.status(400).send("Proforma id is required");
+
+    if (!id) {
+      return res.status(400).send("Proforma reference is required");
+    }
 
     const proforma = await prisma.proforma.findFirst({
       where: applyProformaBranchScope(
@@ -972,7 +1077,9 @@ async function printProformaHtml(req, res) {
       },
     });
 
-    if (!proforma) return res.status(404).send("Proforma not found");
+    if (!proforma) {
+      return res.status(404).send("Proforma not found");
+    }
 
     const tenant = await buildTenantDocumentBranding(
       prisma,
@@ -980,11 +1087,13 @@ async function printProformaHtml(req, res) {
       proforma.branchId || null
     );
 
+    const sellingLocation = getLocationName(proforma.branch) || tenant?.sellingLocation || null;
+
     const html = renderProformaHtml({
       tenant: {
         ...tenant,
-        branchName: tenant?.branchName || proforma.branch?.name || null,
-        branchCode: tenant?.branchCode || proforma.branch?.code || null,
+        sellingLocation,
+        storeLocation: sellingLocation,
       },
       document: {
         number: proforma.number,
@@ -1005,6 +1114,8 @@ async function printProformaHtml(req, res) {
       items: (proforma.items || []).map((item) => ({
         productName: item.productName || item.product?.name || "—",
         serial: item.serial || item.product?.serial || null,
+        sku: item.product?.sku || null,
+        barcode: item.product?.barcode || null,
         quantity: Number(item.quantity || 0),
         unitPrice: Number(item.unitPrice || 0),
         price: Number(item.unitPrice || 0),
@@ -1022,19 +1133,22 @@ async function printProformaHtml(req, res) {
         preparedBy: proforma.preparedBy,
         validUntil: proforma.validUntil,
         reference: proforma.reference,
-        branchName: proforma.branch?.name || null,
-        branchCode: proforma.branch?.code || null,
+        sellingLocation,
+        storeLocation: sellingLocation,
+        locationLabel: "Selling location",
       },
     });
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(html);
-  } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).send("Branch access denied");
+  } catch (error) {
+    const code = String(error?.code || error?.message || "");
+
+    if (code === "LOCATION_ACCESS_DENIED" || code === "BRANCH_ACCESS_DENIED") {
+      return res.status(403).send("You do not have access to this selling location");
     }
 
-    console.error("printProformaHtml error:", err);
+    console.error("printProformaHtml error:", error);
     return res.status(500).send("Failed to render proforma");
   }
 }

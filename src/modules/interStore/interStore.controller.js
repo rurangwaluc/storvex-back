@@ -1,33 +1,18 @@
+// backend/src/modules/interstore/interStore.controller.js
 const {
   InterStoreDealStatus,
   AuditAction,
   InterStorePaymentMethod,
 } = require("@prisma/client");
+
 const prisma = require("../../config/database");
 const logAudit = require("../../utils/auditLogger");
 
 const ALLOWED_INTERSTORE_METHODS = new Set(Object.values(InterStorePaymentMethod));
 const ALLOWED_COLLECTION_STATUSES = new Set(Object.values(InterStoreDealStatus));
-const BILLABLE_INTERSTORE_ROLES = new Set([
-  "OWNER",
-  "MANAGER",
-  "CASHIER",
-  "SELLER",
-  "STOREKEEPER",
-  "TECHNICIAN",
-]);
 
-function hasField(model, fieldName) {
-  return typeof model?.fields?.[fieldName] !== "undefined";
-}
-
-function getActiveBranchId(req) {
-  return req.user?.branchId || req.branch?.id || null;
-}
-
-function canViewAllBranches(req) {
-  return Boolean(req.user?.canViewAllBranches);
-}
+const WRITABLE_BRANCH_STATUSES = new Set(["ACTIVE"]);
+const READABLE_BRANCH_STATUSES = new Set(["ACTIVE", "CLOSED"]);
 
 function cleanString(value) {
   const s = String(value || "").trim();
@@ -83,11 +68,127 @@ function parseIsoDateOrNull(value) {
   return d;
 }
 
+function getTenantId(req) {
+  return cleanString(req.user?.tenantId || req.tenantId);
+}
+
+function getActorUserId(req) {
+  return cleanString(req.user?.userId || req.user?.id);
+}
+
+function getActiveBranchId(req) {
+  return cleanString(
+    req.user?.activeBranchId ||
+      req.user?.branchId ||
+      req.branch?.id ||
+      req.headers?.["x-branch-id"]
+  );
+}
+
+function getAllowedBranchIds(req) {
+  if (Array.isArray(req.user?.allowedBranchIds)) {
+    return req.user.allowedBranchIds.map(cleanString).filter(Boolean);
+  }
+
+  if (Array.isArray(req.user?.visibleBranchIds)) {
+    return req.user.visibleBranchIds.map(cleanString).filter(Boolean);
+  }
+
+  return [];
+}
+
+function canViewAllBranches(req) {
+  return Boolean(req.user?.canViewAllBranches || req.user?.role === "OWNER");
+}
+
+function makeAppError(code, message = code, status = 400) {
+  const err = new Error(message);
+  err.code = code;
+  err.status = status;
+  return err;
+}
+
+function serializeBranch(branch) {
+  if (!branch) return null;
+
+  return {
+    id: branch.id,
+    tenantId: branch.tenantId,
+    name: branch.name || "",
+    code: branch.code || "",
+    type: branch.type || "",
+    status: branch.status || "",
+    phone: branch.phone || null,
+    email: branch.email || null,
+    district: branch.district || null,
+    sector: branch.sector || null,
+    address: branch.address || null,
+    isMain: Boolean(branch.isMain),
+  };
+}
+
+function branchSelect() {
+  return {
+    id: true,
+    tenantId: true,
+    name: true,
+    code: true,
+    type: true,
+    status: true,
+    phone: true,
+    email: true,
+    district: true,
+    sector: true,
+    address: true,
+    isMain: true,
+  };
+}
+
+function dealInclude() {
+  return {
+    borrowerBranch: {
+      select: branchSelect(),
+    },
+  };
+}
+
+function paymentInclude() {
+  return {
+    deal: {
+      select: {
+        id: true,
+        borrowerTenantId: true,
+        supplierTenantId: true,
+        borrowerBranchId: true,
+        status: true,
+        productName: true,
+        serial: true,
+        resellerName: true,
+        resellerPhone: true,
+        agreedPrice: true,
+        soldQuantity: true,
+        dueDate: true,
+        paidAmount: true,
+        borrowerBranch: {
+          select: branchSelect(),
+        },
+      },
+    },
+    branch: {
+      select: branchSelect(),
+    },
+  };
+}
+
 function serializeDeal(deal) {
   if (!deal) return null;
 
+  const branch = deal.borrowerBranch ? serializeBranch(deal.borrowerBranch) : null;
+
   return {
     ...deal,
+    borrowerBranch: branch,
+    branch,
     borrowedAt: toIsoOrNull(deal.borrowedAt),
     dueDate: toIsoOrNull(deal.dueDate),
     takenAt: toIsoOrNull(deal.takenAt),
@@ -97,9 +198,13 @@ function serializeDeal(deal) {
     paidAt: toIsoOrNull(deal.paidAt),
     createdAt: toIsoOrNull(deal.createdAt),
     updatedAt: toIsoOrNull(deal.updatedAt),
-    agreedPrice: Number.isFinite(Number(deal.agreedPrice)) ? Number(deal.agreedPrice) : deal.agreedPrice,
+    agreedPrice: Number.isFinite(Number(deal.agreedPrice))
+      ? Number(deal.agreedPrice)
+      : deal.agreedPrice,
     soldPrice: Number.isFinite(Number(deal.soldPrice)) ? Number(deal.soldPrice) : deal.soldPrice,
-    paidAmount: Number.isFinite(Number(deal.paidAmount)) ? Number(deal.paidAmount) : deal.paidAmount,
+    paidAmount: Number.isFinite(Number(deal.paidAmount))
+      ? Number(deal.paidAmount)
+      : deal.paidAmount,
   };
 }
 
@@ -110,6 +215,15 @@ function serializePayment(payment) {
     ...payment,
     amount: Number.isFinite(Number(payment.amount)) ? Number(payment.amount) : payment.amount,
     createdAt: toIsoOrNull(payment.createdAt),
+    branch: payment.branch ? serializeBranch(payment.branch) : null,
+    deal: payment.deal
+      ? {
+          ...payment.deal,
+          borrowerBranch: payment.deal.borrowerBranch
+            ? serializeBranch(payment.deal.borrowerBranch)
+            : null,
+        }
+      : undefined,
   };
 }
 
@@ -139,82 +253,9 @@ function paymentsListSuccess(res, payments, extra = {}) {
   });
 }
 
-function resolveBorrowerBranchScope(req) {
-  const requestedBranchId =
-    cleanString(req.query?.branchId) ||
-    cleanString(req.headers["x-branch-id"]) ||
-    null;
-
-  const allBranchesRequested =
-    String(req.query?.allBranches || "")
-      .trim()
-      .toLowerCase() === "true";
-
-  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
-    ? req.user.allowedBranchIds
-    : [];
-
-  if (allBranchesRequested) {
-    if (!canViewAllBranches(req)) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
-      throw e;
-    }
-
-    return {
-      mode: "ALL_BRANCHES",
-      branchId: null,
-      allowedBranchIds,
-    };
-  }
-
-  if (requestedBranchId) {
-    if (
-      !canViewAllBranches(req) &&
-      allowedBranchIds.length > 0 &&
-      !allowedBranchIds.includes(requestedBranchId)
-    ) {
-      const e = new Error("BRANCH_ACCESS_DENIED");
-      e.code = "BRANCH_ACCESS_DENIED";
-      throw e;
-    }
-
-    return {
-      mode: "SINGLE_BRANCH",
-      branchId: requestedBranchId,
-      allowedBranchIds,
-    };
-  }
-
-  return {
-    mode: "SINGLE_BRANCH",
-    branchId: getActiveBranchId(req),
-    allowedBranchIds,
-  };
-}
-
-async function ensureWritableBranchAccessOrThrow(req) {
-  const tenantId = req.user?.tenantId;
-  const branchId = getActiveBranchId(req);
-
+async function getBranchOrThrow({ tenantId, branchId, writable = false }) {
   if (!tenantId || !branchId) {
-    const e = new Error("BRANCH_REQUIRED");
-    e.code = "BRANCH_REQUIRED";
-    throw e;
-  }
-
-  const allowedBranchIds = Array.isArray(req.user?.allowedBranchIds)
-    ? req.user.allowedBranchIds
-    : [];
-
-  if (
-    !canViewAllBranches(req) &&
-    allowedBranchIds.length > 0 &&
-    !allowedBranchIds.includes(branchId)
-  ) {
-    const e = new Error("BRANCH_ACCESS_DENIED");
-    e.code = "BRANCH_ACCESS_DENIED";
-    throw e;
+    throw makeAppError("BRANCH_REQUIRED", "No active branch selected", 400);
   }
 
   const branch = await prisma.branch.findFirst({
@@ -222,46 +263,136 @@ async function ensureWritableBranchAccessOrThrow(req) {
       id: branchId,
       tenantId,
       status: {
-        in: ["ACTIVE", "CLOSED"],
+        in: writable ? Array.from(WRITABLE_BRANCH_STATUSES) : Array.from(READABLE_BRANCH_STATUSES),
       },
     },
-    select: {
-      id: true,
-      tenantId: true,
-      name: true,
-      code: true,
-      status: true,
-      isMain: true,
-    },
+    select: branchSelect(),
   });
 
   if (!branch) {
-    const e = new Error("BRANCH_NOT_FOUND");
-    e.code = "BRANCH_NOT_FOUND";
-    throw e;
+    throw makeAppError("BRANCH_NOT_FOUND", "Branch not found", 404);
   }
 
-  if (branch.status !== "ACTIVE") {
-    const e = new Error("BRANCH_NOT_ACTIVE");
-    e.code = "BRANCH_NOT_ACTIVE";
-    throw e;
+  if (writable && branch.status !== "ACTIVE") {
+    throw makeAppError("BRANCH_NOT_ACTIVE", "Selected branch is not active", 409);
   }
 
   return branch;
 }
 
-function withBorrowerBranchScope(where, scope) {
-  const next = { ...(where || {}) };
+async function ensureReadableBranchAccessOrThrow(req, requestedBranchId = null) {
+  const tenantId = getTenantId(req);
+  const allowedBranchIds = getAllowedBranchIds(req);
+  const requested = cleanString(requestedBranchId);
 
-  if (
-    scope?.mode === "SINGLE_BRANCH" &&
-    scope?.branchId &&
-    hasField(prisma.interStoreDeal, "borrowerBranchId")
-  ) {
-    next.borrowerBranchId = scope.branchId;
+  if (!tenantId) {
+    throw makeAppError("UNAUTHORIZED", "Unauthorized", 401);
   }
 
-  return next;
+  if (!requested) return null;
+
+  if (!canViewAllBranches(req) && !allowedBranchIds.includes(requested)) {
+    throw makeAppError("BRANCH_ACCESS_DENIED", "Branch access denied", 403);
+  }
+
+  return getBranchOrThrow({
+    tenantId,
+    branchId: requested,
+    writable: false,
+  });
+}
+
+async function ensureWritableBranchAccessOrThrow(req) {
+  const tenantId = getTenantId(req);
+  const branchId = getActiveBranchId(req);
+  const allowedBranchIds = getAllowedBranchIds(req);
+
+  if (!tenantId || !branchId) {
+    throw makeAppError("BRANCH_REQUIRED", "No active branch selected", 400);
+  }
+
+  if (!canViewAllBranches(req) && !allowedBranchIds.includes(branchId)) {
+    throw makeAppError("BRANCH_ACCESS_DENIED", "Branch access denied", 403);
+  }
+
+  return getBranchOrThrow({
+    tenantId,
+    branchId,
+    writable: true,
+  });
+}
+
+function resolveBorrowerBranchScope(req) {
+  const requestedBranchId =
+    cleanString(req.query?.branchId) || cleanString(req.headers?.["x-branch-id"]);
+
+  const allBranchesRequested =
+    String(req.query?.allBranches || "").trim().toLowerCase() === "true";
+
+  const activeBranchId = getActiveBranchId(req);
+  const allowedBranchIds = getAllowedBranchIds(req);
+  const ownerCanSeeAll = canViewAllBranches(req);
+
+  if (allBranchesRequested) {
+    if (!ownerCanSeeAll) {
+      throw makeAppError("BRANCH_ACCESS_DENIED", "Branch access denied", 403);
+    }
+
+    return {
+      mode: "ALL_BRANCHES",
+      branchId: null,
+      allowedBranchIds,
+      canViewAllBranches: true,
+    };
+  }
+
+  if (requestedBranchId) {
+    if (!ownerCanSeeAll && !allowedBranchIds.includes(requestedBranchId)) {
+      throw makeAppError("BRANCH_ACCESS_DENIED", "Branch access denied", 403);
+    }
+
+    return {
+      mode: "SINGLE_BRANCH",
+      branchId: requestedBranchId,
+      allowedBranchIds,
+      canViewAllBranches: ownerCanSeeAll,
+    };
+  }
+
+  if (ownerCanSeeAll && !activeBranchId) {
+    return {
+      mode: "ALL_BRANCHES",
+      branchId: null,
+      allowedBranchIds,
+      canViewAllBranches: true,
+    };
+  }
+
+  return {
+    mode: "SINGLE_BRANCH",
+    branchId: activeBranchId,
+    allowedBranchIds,
+    canViewAllBranches: ownerCanSeeAll,
+  };
+}
+
+function borrowerBranchWhereForScope(scope) {
+  if (scope?.mode === "SINGLE_BRANCH" && scope?.branchId) {
+    return { borrowerBranchId: scope.branchId };
+  }
+
+  if (scope?.mode === "ALL_BRANCHES") {
+    return {};
+  }
+
+  return { borrowerBranchId: "__NO_BRANCH__" };
+}
+
+function withBorrowerBranchScope(where, scope) {
+  return {
+    ...(where || {}),
+    ...borrowerBranchWhereForScope(scope),
+  };
 }
 
 function buildBorrowerDealWhere(id, tenantId, scope = null) {
@@ -275,47 +406,40 @@ function buildBorrowerDealWhere(id, tenantId, scope = null) {
 }
 
 function buildVisibleDealWhere(id, tenantId, scope = null) {
-  const base = {
-    id,
-    OR: [{ borrowerTenantId: tenantId }, { supplierTenantId: tenantId }],
+  const borrowerVisibility = {
+    borrowerTenantId: tenantId,
+    ...borrowerBranchWhereForScope(scope),
   };
 
-  if (
-    hasField(prisma.interStoreDeal, "borrowerBranchId") &&
-    scope?.mode === "SINGLE_BRANCH" &&
-    scope?.branchId
-  ) {
-    return {
-      AND: [
-        base,
-        {
-          OR: [
-            { supplierTenantId: tenantId },
-            { borrowerBranchId: scope.branchId },
-          ],
-        },
-      ],
-    };
-  }
-
-  return base;
+  return {
+    id,
+    OR: [
+      borrowerVisibility,
+      {
+        supplierTenantId: tenantId,
+      },
+    ],
+  };
 }
 
 async function getBorrowerDealOrNull({ id, tenantId, scope = null, tx = prisma }) {
   return tx.interStoreDeal.findFirst({
     where: buildBorrowerDealWhere(id, tenantId, scope),
+    include: dealInclude(),
   });
 }
 
 async function getVisibleDealOrNull({ id, tenantId, scope = null, tx = prisma }) {
   return tx.interStoreDeal.findFirst({
     where: buildVisibleDealWhere(id, tenantId, scope),
+    include: dealInclude(),
   });
 }
 
 async function assertBorrowerSerialNotDuplicated({
   tx,
   tenantId,
+  branchId,
   serial,
   ignoreDealId = null,
   ignoreProductId = null,
@@ -325,6 +449,7 @@ async function assertBorrowerSerialNotDuplicated({
   const activeDeal = await tx.interStoreDeal.findFirst({
     where: {
       borrowerTenantId: tenantId,
+      borrowerBranchId: branchId,
       serial,
       ...(ignoreDealId ? { id: { not: ignoreDealId } } : {}),
       status: {
@@ -345,6 +470,7 @@ async function assertBorrowerSerialNotDuplicated({
   const product = await tx.product.findFirst({
     where: {
       tenantId,
+      branchId,
       serial,
       ...(ignoreProductId ? { id: { not: ignoreProductId } } : {}),
       isActive: true,
@@ -360,7 +486,10 @@ async function assertBorrowerSerialNotDuplicated({
 function buildCollectionProjection() {
   return {
     id: true,
-    ...(hasField(prisma.interStoreDeal, "borrowerBranchId") ? { borrowerBranchId: true } : {}),
+    borrowerBranchId: true,
+    borrowerBranch: {
+      select: branchSelect(),
+    },
     status: true,
     productName: true,
     serial: true,
@@ -396,12 +525,43 @@ function computeDaysOverdue(dueDate) {
   return Math.ceil((Date.now() - due) / (1000 * 60 * 60 * 24));
 }
 
+function handleBranchError(res, err) {
+  const code = String(err?.code || err?.message || "");
+
+  if (code === "UNAUTHORIZED") {
+    res.status(401).json({ message: "Unauthorized", code });
+    return true;
+  }
+
+  if (code === "BRANCH_REQUIRED") {
+    res.status(400).json({ message: "No active branch selected", code });
+    return true;
+  }
+
+  if (code === "BRANCH_ACCESS_DENIED") {
+    res.status(403).json({ message: "Branch access denied", code });
+    return true;
+  }
+
+  if (code === "BRANCH_NOT_FOUND") {
+    res.status(404).json({ message: "Branch not found", code });
+    return true;
+  }
+
+  if (code === "BRANCH_NOT_ACTIVE") {
+    res.status(409).json({ message: "Selected branch is not active", code });
+    return true;
+  }
+
+  return false;
+}
+
 /**
  * INTERNAL SUPPLIERS
  */
 async function listInternalSuppliers(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = getTenantId(req);
     const q = cleanString(req.query.q);
     const takeRaw = toInt(req.query.take);
     const take = Number.isFinite(takeRaw) ? Math.min(Math.max(1, takeRaw), 50) : 20;
@@ -451,9 +611,10 @@ async function listInternalSuppliers(req, res) {
  */
 async function searchInternalSupplierProducts(req, res) {
   try {
-    const borrowerTenantId = req.user.tenantId;
+    const borrowerTenantId = getTenantId(req);
     const supplierTenantId = cleanString(req.params.supplierTenantId);
     const q = cleanString(req.query.q);
+    const supplierBranchId = cleanString(req.query.supplierBranchId);
     const takeRaw = toInt(req.query.take);
     const take = Number.isFinite(takeRaw) ? Math.min(Math.max(1, takeRaw), 50) : 20;
 
@@ -469,6 +630,7 @@ async function searchInternalSupplierProducts(req, res) {
       tenantId: supplierTenantId,
       isActive: true,
       stockQty: { gt: 0 },
+      ...(supplierBranchId ? { branchId: supplierBranchId } : {}),
     };
 
     if (q) {
@@ -488,6 +650,11 @@ async function searchInternalSupplierProducts(req, res) {
       take,
       select: {
         id: true,
+        tenantId: true,
+        branchId: true,
+        branch: {
+          select: branchSelect(),
+        },
         name: true,
         serial: true,
         sku: true,
@@ -504,6 +671,9 @@ async function searchInternalSupplierProducts(req, res) {
       ok: true,
       products: rows.map((row) => ({
         id: row.id,
+        tenantId: row.tenantId,
+        branchId: row.branchId || null,
+        branch: serializeBranch(row.branch),
         name: row.name || "Unnamed product",
         serial: row.serial || null,
         sku: row.sku || null,
@@ -522,11 +692,12 @@ async function searchInternalSupplierProducts(req, res) {
 }
 
 /**
- * CREATE DEAL (BORROW)
+ * CREATE DEAL
  */
 async function createDeal(req, res) {
   try {
-    const borrowerTenantId = req.user.tenantId;
+    const borrowerTenantId = getTenantId(req);
+    const actorUserId = getActorUserId(req);
     const activeBranch = await ensureWritableBranchAccessOrThrow(req);
 
     const payload = {
@@ -628,6 +799,7 @@ async function createDeal(req, res) {
       await assertBorrowerSerialNotDuplicated({
         tx,
         tenantId: borrowerTenantId,
+        branchId: activeBranch.id,
         serial: payload.serial,
       });
 
@@ -659,52 +831,55 @@ async function createDeal(req, res) {
         }
       }
 
-      const createData = {
-        borrowerTenantId,
-        supplierTenantId: payload.supplierTenantId || null,
-        externalSupplierName: payload.externalSupplierName || null,
-        externalSupplierPhone: payload.externalSupplierPhone || null,
-        resellerName: payload.resellerName,
-        resellerPhone: payload.resellerPhone,
-        resellerStore: payload.resellerStore,
-        resellerWorkplace: payload.resellerWorkplace,
-        resellerDistrict: payload.resellerDistrict,
-        resellerSector: payload.resellerSector,
-        resellerAddress: payload.resellerAddress,
-        resellerNationalId: payload.resellerNationalId,
-        productId: payload.productId || null,
-        productName: payload.productName,
-        productCategory: payload.productCategory,
-        productColor: payload.productColor,
-        serial: payload.serial,
-        quantity: qty,
-        soldQuantity: 0,
-        returnedQuantity: 0,
-        agreedPrice: price,
-        dueDate: parsedDueDate,
-        takenAt: parsedTakenAt,
-        notes: payload.notes,
-        status: InterStoreDealStatus.BORROWED,
-        borrowedAt: new Date(),
-      };
+      const created = await tx.interStoreDeal.create({
+        data: {
+          borrowerTenantId,
+          borrowerBranchId: activeBranch.id,
+          supplierTenantId: payload.supplierTenantId || null,
+          externalSupplierName: payload.externalSupplierName || null,
+          externalSupplierPhone: payload.externalSupplierPhone || null,
+          resellerName: payload.resellerName,
+          resellerPhone: payload.resellerPhone,
+          resellerStore: payload.resellerStore,
+          resellerWorkplace: payload.resellerWorkplace,
+          resellerDistrict: payload.resellerDistrict,
+          resellerSector: payload.resellerSector,
+          resellerAddress: payload.resellerAddress,
+          resellerNationalId: payload.resellerNationalId,
+          productId: payload.productId || null,
+          productName: payload.productName,
+          productCategory: payload.productCategory,
+          productColor: payload.productColor,
+          serial: payload.serial,
+          quantity: qty,
+          soldQuantity: 0,
+          returnedQuantity: 0,
+          agreedPrice: price,
+          dueDate: parsedDueDate,
+          takenAt: parsedTakenAt,
+          notes: payload.notes,
+          status: InterStoreDealStatus.BORROWED,
+          borrowedAt: new Date(),
+        },
+        select: { id: true },
+      });
 
-      if (hasField(tx.interStoreDeal, "borrowerBranchId")) {
-        createData.borrowerBranchId = activeBranch.id;
-      }
-
-      return tx.interStoreDeal.create({
-        data: createData,
+      return tx.interStoreDeal.findFirst({
+        where: { id: created.id },
+        include: dealInclude(),
       });
     });
 
     await logAudit({
       tenantId: borrowerTenantId,
-      userId: req.user.userId,
+      branchId: activeBranch.id,
+      userId: actorUserId,
       action: AuditAction.CREATE_DEAL,
       entity: "INTERSTORE_DEAL",
       entityId: deal.id,
       metadata: {
-        borrowerBranchId: deal.borrowerBranchId || activeBranch.id || null,
+        borrowerBranchId: deal.borrowerBranchId || activeBranch.id,
+        branchName: activeBranch.name,
         supplierTenantId: payload.supplierTenantId || null,
         externalSupplierName: payload.externalSupplierName || null,
         productId: payload.productId || null,
@@ -723,21 +898,7 @@ async function createDeal(req, res) {
       deal: serializeDeal(deal),
     });
   } catch (err) {
-    const code = err?.code;
-    const msg = String(err?.message || "");
-
-    if (code === "BRANCH_REQUIRED" || msg === "BRANCH_REQUIRED") {
-      return res.status(400).json({ message: "No active branch selected", code: "BRANCH_REQUIRED" });
-    }
-    if (code === "BRANCH_ACCESS_DENIED" || msg === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied", code: "BRANCH_ACCESS_DENIED" });
-    }
-    if (code === "BRANCH_NOT_FOUND" || msg === "BRANCH_NOT_FOUND") {
-      return res.status(404).json({ message: "Branch not found" });
-    }
-    if (code === "BRANCH_NOT_ACTIVE" || msg === "BRANCH_NOT_ACTIVE") {
-      return res.status(409).json({ message: "Selected branch is not active" });
-    }
+    if (handleBranchError(res, err)) return;
 
     if (err.message === "SUPPLIER_PRODUCT_NOT_FOUND") {
       return res.status(404).json({ message: "Supplier product not found" });
@@ -749,13 +910,13 @@ async function createDeal(req, res) {
 
     if (err.message === "DUPLICATE_ACTIVE_DEAL_SERIAL") {
       return res.status(409).json({
-        message: "This serial already exists in another active interstore deal for this tenant",
+        message: "This serial already exists in another active inter-store deal for this branch",
       });
     }
 
     if (err.message === "DUPLICATE_INVENTORY_SERIAL") {
       return res.status(409).json({
-        message: "This serial already exists in borrower inventory",
+        message: "This serial already exists in this branch inventory",
       });
     }
 
@@ -769,8 +930,9 @@ async function createDeal(req, res) {
  */
 async function markReceived(req, res) {
   try {
-    const id = req.params.id;
-    const tenantId = req.user.tenantId;
+    const id = cleanString(req.params.id);
+    const tenantId = getTenantId(req);
+    const actorUserId = getActorUserId(req);
     const scope = resolveBorrowerBranchScope(req);
 
     const deal = await getBorrowerDealOrNull({ id, tenantId, scope });
@@ -788,6 +950,7 @@ async function markReceived(req, res) {
       await assertBorrowerSerialNotDuplicated({
         tx,
         tenantId,
+        branchId: deal.borrowerBranchId,
         serial: deal.serial,
         ignoreDealId: deal.id,
       });
@@ -798,6 +961,7 @@ async function markReceived(req, res) {
         const createdProduct = await tx.product.create({
           data: {
             tenantId: deal.borrowerTenantId,
+            branchId: deal.borrowerBranchId,
             name: deal.productName,
             serial: deal.serial,
             costPrice: deal.agreedPrice,
@@ -827,6 +991,7 @@ async function markReceived(req, res) {
 
       return tx.interStoreDeal.findFirst({
         where: buildBorrowerDealWhere(deal.id, tenantId, scope),
+        include: dealInclude(),
       });
     });
 
@@ -836,7 +1001,8 @@ async function markReceived(req, res) {
 
     await logAudit({
       tenantId,
-      userId: req.user.userId,
+      branchId: result.borrowerBranchId || null,
+      userId: actorUserId,
       action: AuditAction.MARK_RECEIVED,
       entity: "INTERSTORE_DEAL",
       entityId: result.id,
@@ -849,19 +1015,17 @@ async function markReceived(req, res) {
 
     return dealSuccess(res, result, { message: "Deal marked as received" });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     if (err.message === "DUPLICATE_ACTIVE_DEAL_SERIAL") {
       return res.status(409).json({
-        message: "This serial already exists in another active interstore deal for this tenant",
+        message: "This serial already exists in another active inter-store deal for this branch",
       });
     }
 
     if (err.message === "DUPLICATE_INVENTORY_SERIAL") {
       return res.status(409).json({
-        message: "This serial already exists in borrower inventory",
+        message: "This serial already exists in this branch inventory",
       });
     }
 
@@ -875,8 +1039,9 @@ async function markReceived(req, res) {
  */
 async function markSold(req, res) {
   try {
-    const id = req.params.id;
-    const tenantId = req.user.tenantId;
+    const id = cleanString(req.params.id);
+    const tenantId = getTenantId(req);
+    const actorUserId = getActorUserId(req);
     const scope = resolveBorrowerBranchScope(req);
     const { soldPrice, soldQuantity } = req.body;
 
@@ -911,6 +1076,7 @@ async function markSold(req, res) {
         where: {
           id: deal.receivedProductId,
           tenantId,
+          branchId: deal.borrowerBranchId,
           stockQty: { gte: sq },
         },
         data: { stockQty: { decrement: sq } },
@@ -939,19 +1105,28 @@ async function markSold(req, res) {
       if (upd.count === 0) return null;
 
       const p = await tx.product.findFirst({
-        where: { id: deal.receivedProductId, tenantId },
+        where: {
+          id: deal.receivedProductId,
+          tenantId,
+          branchId: deal.borrowerBranchId,
+        },
         select: { stockQty: true },
       });
 
       if (p && p.stockQty <= 0) {
         await tx.product.updateMany({
-          where: { id: deal.receivedProductId, tenantId },
+          where: {
+            id: deal.receivedProductId,
+            tenantId,
+            branchId: deal.borrowerBranchId,
+          },
           data: { isActive: false },
         });
       }
 
       return tx.interStoreDeal.findFirst({
         where: buildBorrowerDealWhere(deal.id, tenantId, scope),
+        include: dealInclude(),
       });
     });
 
@@ -961,7 +1136,8 @@ async function markSold(req, res) {
 
     await logAudit({
       tenantId,
-      userId: req.user.userId,
+      branchId: updated.borrowerBranchId || null,
+      userId: actorUserId,
       action: AuditAction.MARK_SOLD,
       entity: "INTERSTORE_DEAL",
       entityId: updated.id,
@@ -975,13 +1151,11 @@ async function markSold(req, res) {
 
     return dealSuccess(res, updated, { message: "Deal sale recorded" });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     if (err.message === "BORROWER_PRODUCT_OUT_OF_STOCK_OR_NOT_FOUND") {
       return res.status(400).json({
-        message: "Borrower inventory product not found or insufficient stock",
+        message: "Borrower branch inventory product not found or insufficient stock",
       });
     }
 
@@ -995,8 +1169,9 @@ async function markSold(req, res) {
  */
 async function markReturned(req, res) {
   try {
-    const id = req.params.id;
-    const tenantId = req.user.tenantId;
+    const id = cleanString(req.params.id);
+    const tenantId = getTenantId(req);
+    const actorUserId = getActorUserId(req);
     const scope = resolveBorrowerBranchScope(req);
     const { returnedQuantity } = req.body;
 
@@ -1023,6 +1198,7 @@ async function markReturned(req, res) {
           where: {
             id: deal.receivedProductId,
             tenantId,
+            branchId: deal.borrowerBranchId,
             stockQty: { gte: rq },
           },
           data: { stockQty: { decrement: rq } },
@@ -1033,13 +1209,21 @@ async function markReturned(req, res) {
         }
 
         const p = await tx.product.findFirst({
-          where: { id: deal.receivedProductId, tenantId },
+          where: {
+            id: deal.receivedProductId,
+            tenantId,
+            branchId: deal.borrowerBranchId,
+          },
           select: { stockQty: true },
         });
 
         if (p && p.stockQty <= 0) {
           await tx.product.updateMany({
-            where: { id: deal.receivedProductId, tenantId },
+            where: {
+              id: deal.receivedProductId,
+              tenantId,
+              branchId: deal.borrowerBranchId,
+            },
             data: { isActive: false },
           });
         }
@@ -1081,6 +1265,7 @@ async function markReturned(req, res) {
 
       return tx.interStoreDeal.findFirst({
         where: buildBorrowerDealWhere(deal.id, tenantId, scope),
+        include: dealInclude(),
       });
     });
 
@@ -1090,7 +1275,8 @@ async function markReturned(req, res) {
 
     await logAudit({
       tenantId,
-      userId: req.user.userId,
+      branchId: updated.borrowerBranchId || null,
+      userId: actorUserId,
       action: AuditAction.MARK_RETURNED,
       entity: "INTERSTORE_DEAL",
       entityId: updated.id,
@@ -1103,13 +1289,11 @@ async function markReturned(req, res) {
 
     return dealSuccess(res, updated, { message: "Deal return recorded" });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     if (err.message === "BORROWER_PRODUCT_OUT_OF_STOCK_OR_NOT_FOUND") {
       return res.status(400).json({
-        message: "Borrower inventory product not found or insufficient stock",
+        message: "Borrower branch inventory product not found or insufficient stock",
       });
     }
 
@@ -1127,8 +1311,9 @@ async function markReturned(req, res) {
  */
 async function markPaid(req, res) {
   try {
-    const id = req.params.id;
-    const tenantId = req.user.tenantId;
+    const id = cleanString(req.params.id);
+    const tenantId = getTenantId(req);
+    const actorUserId = getActorUserId(req);
     const scope = resolveBorrowerBranchScope(req);
     const { paidAmount, paymentMethod } = req.body;
 
@@ -1137,9 +1322,7 @@ async function markPaid(req, res) {
       return res.status(400).json({ message: "paidAmount must be a positive number" });
     }
 
-    const normalizedMethod = paymentMethod
-      ? normalizeInterStoreMethod(paymentMethod)
-      : null;
+    const normalizedMethod = paymentMethod ? normalizeInterStoreMethod(paymentMethod) : null;
 
     if (paymentMethod && !normalizedMethod) {
       return res.status(400).json({
@@ -1188,7 +1371,8 @@ async function markPaid(req, res) {
 
     await logAudit({
       tenantId,
-      userId: req.user.userId,
+      branchId: updated?.borrowerBranchId || null,
+      userId: actorUserId,
       action: AuditAction.MARK_PAID,
       entity: "INTERSTORE_DEAL",
       entityId: deal.id,
@@ -1202,9 +1386,7 @@ async function markPaid(req, res) {
 
     return dealSuccess(res, updated, { message: "Deal marked as paid" });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     console.error(err);
     return res.status(500).json({ message: "Failed to mark paid" });
@@ -1216,34 +1398,27 @@ async function markPaid(req, res) {
  */
 async function listDeals(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = getTenantId(req);
     const scope = resolveBorrowerBranchScope(req);
 
-    const borrowerWhere = withBorrowerBranchScope(
-      { borrowerTenantId: tenantId },
-      scope
-    );
+    const borrowerWhere = withBorrowerBranchScope({ borrowerTenantId: tenantId }, scope);
 
     const deals = await prisma.interStoreDeal.findMany({
-      where:
-        scope.mode === "SINGLE_BRANCH" && scope.branchId && hasField(prisma.interStoreDeal, "borrowerBranchId")
-          ? {
-              OR: [
-                borrowerWhere,
-                { supplierTenantId: tenantId },
-              ],
-            }
-          : {
-              OR: [{ borrowerTenantId: tenantId }, { supplierTenantId: tenantId }],
-            },
+      where: {
+        OR: [
+          borrowerWhere,
+          {
+            supplierTenantId: tenantId,
+          },
+        ],
+      },
       orderBy: { createdAt: "desc" },
+      include: dealInclude(),
     });
 
     return dealsListSuccess(res, deals, { branchScope: scope });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch deals" });
@@ -1252,7 +1427,7 @@ async function listDeals(req, res) {
 
 async function listOutstanding(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = getTenantId(req);
     const scope = resolveBorrowerBranchScope(req);
 
     const deals = await prisma.interStoreDeal.findMany({
@@ -1275,9 +1450,7 @@ async function listOutstanding(req, res) {
 
     return res.json({ ok: true, deals: items, count: items.length, branchScope: scope });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch outstanding deals" });
@@ -1286,7 +1459,7 @@ async function listOutstanding(req, res) {
 
 async function listOverdue(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = getTenantId(req);
     const now = new Date();
     const scope = resolveBorrowerBranchScope(req);
 
@@ -1311,9 +1484,7 @@ async function listOverdue(req, res) {
 
     return res.json({ ok: true, deals: items, count: items.length, branchScope: scope });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch overdue deals" });
@@ -1322,7 +1493,7 @@ async function listOverdue(req, res) {
 
 async function searchDeals(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = getTenantId(req);
     const scope = resolveBorrowerBranchScope(req);
     const qRaw = req.query.q;
 
@@ -1341,19 +1512,20 @@ async function searchDeals(req, res) {
             { resellerPhone: { contains: q, mode: "insensitive" } },
             { resellerName: { contains: q, mode: "insensitive" } },
             { productName: { contains: q, mode: "insensitive" } },
+            { borrowerBranch: { name: { contains: q, mode: "insensitive" } } },
+            { borrowerBranch: { code: { contains: q, mode: "insensitive" } } },
           ],
         },
         scope
       ),
       orderBy: { createdAt: "desc" },
       take: 50,
+      include: dealInclude(),
     });
 
     return dealsListSuccess(res, deals, { branchScope: scope });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     console.error(err);
     return res.status(500).json({ message: "Failed to search deals" });
@@ -1362,15 +1534,13 @@ async function searchDeals(req, res) {
 
 async function searchCollections(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = getTenantId(req);
     const scope = resolveBorrowerBranchScope(req);
     const qRaw = req.query.q;
     const scopeFilter = String(req.query.scope || "all").toLowerCase();
     const q = qRaw ? String(qRaw).trim() : "";
 
-    const andWhere = [
-      withBorrowerBranchScope({ borrowerTenantId: tenantId }, scope),
-    ];
+    const andWhere = [withBorrowerBranchScope({ borrowerTenantId: tenantId }, scope)];
 
     if (scopeFilter === "outstanding") {
       andWhere.push({ status: InterStoreDealStatus.SOLD });
@@ -1388,6 +1558,8 @@ async function searchCollections(req, res) {
           { resellerPhone: { contains: q, mode: "insensitive" } },
           { resellerName: { contains: q, mode: "insensitive" } },
           { productName: { contains: q, mode: "insensitive" } },
+          { borrowerBranch: { name: { contains: q, mode: "insensitive" } } },
+          { borrowerBranch: { code: { contains: q, mode: "insensitive" } } },
         ],
       });
     }
@@ -1396,13 +1568,12 @@ async function searchCollections(req, res) {
       where: { AND: andWhere },
       orderBy: [{ dueDate: "asc" }, { createdAt: "desc" }],
       take: 100,
+      include: dealInclude(),
     });
 
     return dealsListSuccess(res, deals, { branchScope: scope });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     console.error(err);
     return res.status(500).json({ message: "Failed to search collections" });
@@ -1410,13 +1581,13 @@ async function searchCollections(req, res) {
 }
 
 /**
- * ADD PAYMENT (installments)
+ * ADD PAYMENT
  */
 async function addPayment(req, res) {
   try {
-    const tenantId = req.user.tenantId;
-    const userId = req.user.userId;
-    const id = req.params.id;
+    const tenantId = getTenantId(req);
+    const userId = getActorUserId(req);
+    const id = cleanString(req.params.id);
     const scope = resolveBorrowerBranchScope(req);
     const { amount, method, note } = req.body;
 
@@ -1461,21 +1632,17 @@ async function addPayment(req, res) {
         return { overpay: true, owed, totalPaidBefore };
       }
 
-      const createData = {
-        dealId: deal.id,
-        tenantId,
-        receivedById: userId,
-        amount: amt,
-        method: normalizedMethod,
-        note: note ? String(note).slice(0, 2000) : null,
-      };
-
-      if (hasField(tx.interStorePayment, "branchId")) {
-        createData.branchId = deal.borrowerBranchId || getActiveBranchId(req) || null;
-      }
-
       const payment = await tx.interStorePayment.create({
-        data: createData,
+        data: {
+          dealId: deal.id,
+          tenantId,
+          branchId: deal.borrowerBranchId || null,
+          receivedById: userId,
+          amount: amt,
+          method: normalizedMethod,
+          note: note ? String(note).slice(0, 2000) : null,
+        },
+        include: paymentInclude(),
       });
 
       const aggAfter = await tx.interStorePayment.aggregate({
@@ -1504,6 +1671,7 @@ async function addPayment(req, res) {
 
       const reRead = await tx.interStoreDeal.findFirst({
         where: buildBorrowerDealWhere(deal.id, tenantId, scope),
+        include: dealInclude(),
       });
 
       return {
@@ -1531,6 +1699,7 @@ async function addPayment(req, res) {
 
     await logAudit({
       tenantId,
+      branchId: result.updatedDeal?.borrowerBranchId || null,
       userId,
       action: AuditAction.ADD_PAYMENT,
       entity: "INTERSTORE_DEAL",
@@ -1555,6 +1724,10 @@ async function addPayment(req, res) {
       deal: {
         id: result.updatedDeal.id,
         status: result.updatedDeal.status,
+        borrowerBranchId: result.updatedDeal.borrowerBranchId || null,
+        borrowerBranch: result.updatedDeal.borrowerBranch
+          ? serializeBranch(result.updatedDeal.borrowerBranch)
+          : null,
         agreedPrice: Number(result.updatedDeal.agreedPrice),
         soldQuantity: Number(result.updatedDeal.soldQuantity || 0),
         owed: result.owed,
@@ -1563,13 +1736,11 @@ async function addPayment(req, res) {
       },
     });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     if (err.message === "INVALID_OWED_AMOUNT") {
       return res.status(400).json({
-        message: "Invalid owed amount (check agreedPrice and soldQuantity)",
+        message: "Invalid owed amount. Check agreed price and sold quantity.",
       });
     }
 
@@ -1580,26 +1751,35 @@ async function addPayment(req, res) {
 
 async function listDealAudit(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = getTenantId(req);
     const scope = resolveBorrowerBranchScope(req);
 
     const logs = await prisma.auditLog.findMany({
       where: {
         tenantId,
         entity: "INTERSTORE_DEAL",
-        ...(scope.mode === "SINGLE_BRANCH" && scope.branchId && hasField(prisma.auditLog, "branchId")
-          ? { branchId: scope.branchId }
-          : {}),
+        ...(scope.mode === "SINGLE_BRANCH" && scope.branchId ? { branchId: scope.branchId } : {}),
       },
       orderBy: { createdAt: "desc" },
       take: 100,
+      include: {
+        branch: {
+          select: branchSelect(),
+        },
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+          },
+        },
+      },
     });
 
     return res.json({ ok: true, logs, count: logs.length, branchScope: scope });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch audit logs" });
@@ -1608,18 +1788,16 @@ async function listDealAudit(req, res) {
 
 async function getDeal(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = getTenantId(req);
     const scope = resolveBorrowerBranchScope(req);
-    const id = req.params.id;
+    const id = cleanString(req.params.id);
 
     const deal = await getVisibleDealOrNull({ id, tenantId, scope });
     if (!deal) return res.status(404).json({ message: "Deal not found" });
 
     return dealSuccess(res, deal, { branchScope: scope });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch deal" });
@@ -1628,7 +1806,7 @@ async function getDeal(req, res) {
 
 async function listPayments(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = getTenantId(req);
     const scope = resolveBorrowerBranchScope(req);
     const takeRaw = Number(req.query.take);
     const take = Number.isFinite(takeRaw) ? Math.min(Math.max(1, takeRaw), 200) : 50;
@@ -1675,23 +1853,15 @@ async function listPayments(req, res) {
       statusFilter = status;
     }
 
-    const borrowerDealFilter = withBorrowerBranchScope(
-      { borrowerTenantId: tenantId },
-      scope
-    );
+    const borrowerDealFilter = withBorrowerBranchScope({ borrowerTenantId: tenantId }, scope);
 
     const andWhere = [
       {
-        OR:
-          scope.mode === "SINGLE_BRANCH" &&
-          scope.branchId &&
-          hasField(prisma.interStoreDeal, "borrowerBranchId")
-            ? [
-                { tenantId },
-                { deal: borrowerDealFilter },
-                { deal: { supplierTenantId: tenantId } },
-              ]
-            : [{ tenantId }, { deal: { supplierTenantId: tenantId } }],
+        OR: [
+          { tenantId },
+          { deal: borrowerDealFilter },
+          { deal: { supplierTenantId: tenantId } },
+        ],
       },
     ];
 
@@ -1716,7 +1886,7 @@ async function listPayments(req, res) {
       andWhere.push({ deal: { status: statusFilter } });
     }
 
-    if (scope.mode === "SINGLE_BRANCH" && scope.branchId && hasField(prisma.interStorePayment, "branchId")) {
+    if (scope.mode === "SINGLE_BRANCH" && scope.branchId) {
       andWhere.push({
         OR: [
           { branchId: scope.branchId },
@@ -1732,6 +1902,8 @@ async function listPayments(req, res) {
           { deal: { productName: { contains: q, mode: "insensitive" } } },
           { deal: { resellerPhone: { contains: q, mode: "insensitive" } } },
           { deal: { resellerName: { contains: q, mode: "insensitive" } } },
+          { branch: { name: { contains: q, mode: "insensitive" } } },
+          { branch: { code: { contains: q, mode: "insensitive" } } },
         ],
       });
     }
@@ -1741,33 +1913,7 @@ async function listPayments(req, res) {
       orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       take: take + 1,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      select: {
-        id: true,
-        ...(hasField(prisma.interStorePayment, "branchId") ? { branchId: true } : {}),
-        dealId: true,
-        amount: true,
-        method: true,
-        note: true,
-        createdAt: true,
-        tenantId: true,
-        receivedById: true,
-        deal: {
-          select: {
-            ...(hasField(prisma.interStoreDeal, "borrowerBranchId") ? { borrowerBranchId: true } : {}),
-            borrowerTenantId: true,
-            supplierTenantId: true,
-            status: true,
-            productName: true,
-            serial: true,
-            resellerName: true,
-            resellerPhone: true,
-            agreedPrice: true,
-            soldQuantity: true,
-            dueDate: true,
-            paidAmount: true,
-          },
-        },
-      },
+      include: paymentInclude(),
     });
 
     const hasNextPage = payments.length > take;
@@ -1787,9 +1933,7 @@ async function listPayments(req, res) {
       branchScope: scope,
     });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch payments" });
@@ -1798,9 +1942,9 @@ async function listPayments(req, res) {
 
 async function getDealPayments(req, res) {
   try {
-    const tenantId = req.user.tenantId;
+    const tenantId = getTenantId(req);
     const scope = resolveBorrowerBranchScope(req);
-    const id = req.params.id;
+    const id = cleanString(req.params.id);
 
     const deal = await getVisibleDealOrNull({ id, tenantId, scope });
     if (!deal) return res.status(404).json({ message: "Deal not found" });
@@ -1808,14 +1952,10 @@ async function getDealPayments(req, res) {
     const payments = await prisma.interStorePayment.findMany({
       where: { dealId: id },
       orderBy: { createdAt: "asc" },
-      select: {
-        id: true,
-        ...(hasField(prisma.interStorePayment, "branchId") ? { branchId: true } : {}),
-        amount: true,
-        method: true,
-        note: true,
-        createdAt: true,
-        receivedById: true,
+      include: {
+        branch: {
+          select: branchSelect(),
+        },
       },
     });
 
@@ -1835,6 +1975,8 @@ async function getDealPayments(req, res) {
       ok: true,
       dealId: id,
       status: deal.status,
+      borrowerBranchId: deal.borrowerBranchId || null,
+      borrowerBranch: deal.borrowerBranch ? serializeBranch(deal.borrowerBranch) : null,
       agreedPrice: Number.isFinite(price) ? price : 0,
       soldQuantity: Number.isFinite(soldQty) ? soldQty : 0,
       owed,
@@ -1851,9 +1993,7 @@ async function getDealPayments(req, res) {
       branchScope: scope,
     });
   } catch (err) {
-    if (String(err?.code || err?.message || "") === "BRANCH_ACCESS_DENIED") {
-      return res.status(403).json({ message: "Branch access denied" });
-    }
+    if (handleBranchError(res, err)) return;
 
     console.error(err);
     return res.status(500).json({ message: "Failed to fetch deal payments" });

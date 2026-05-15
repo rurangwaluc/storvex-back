@@ -1,4 +1,6 @@
+// src/modules/suppliers/suppliers.routes.js
 const express = require("express");
+
 const router = express.Router();
 
 const suppliersController = require("./suppliers.controller");
@@ -13,6 +15,7 @@ const requireDbPermission = require("../../middlewares/requireDbPermission");
 const { PERMISSIONS } = require("../auth/permissions");
 
 const readBase = [authenticate, requireTenant, requireActiveSubscription];
+
 const writeBase = [
   authenticate,
   requireTenant,
@@ -20,7 +23,6 @@ const writeBase = [
   requireWritableSubscription,
 ];
 
-// Suppliers
 router.get(
   "/",
   ...readBase,
@@ -30,6 +32,7 @@ router.get(
 
 router.post(
   "/",
+  express.json(),
   ...writeBase,
   requireDbPermission(PERMISSIONS.SUPPLIERS_CREATE),
   suppliersController.createSupplier
@@ -44,6 +47,7 @@ router.get(
 
 router.put(
   "/:id",
+  express.json(),
   ...writeBase,
   requireDbPermission(PERMISSIONS.SUPPLIERS_EDIT),
   suppliersController.updateSupplier
@@ -63,7 +67,6 @@ router.patch(
   suppliersController.deactivateSupplier
 );
 
-// Supplies
 router.get(
   "/:id/supplies",
   ...readBase,
@@ -73,6 +76,7 @@ router.get(
 
 router.post(
   "/:id/supplies",
+  express.json(),
   ...writeBase,
   requireDbPermission(PERMISSIONS.SUPPLIERS_EDIT),
   suppliersController.createSupply

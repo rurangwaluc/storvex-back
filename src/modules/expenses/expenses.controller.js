@@ -1,3 +1,4 @@
+// src/modules/expenses/expenses.controller.js
 const prisma = require("../../config/database");
 const logAudit = require("../../utils/auditLogger");
 const { AuditAction, AuditEntity, ExpenseCategory } = require("@prisma/client");
@@ -10,21 +11,25 @@ function getUserId(req) {
   return req.user?.id || req.user?.userId || null;
 }
 
-function getBranchId(req) {
+function getActiveStoreLocationId(req) {
   return req.user?.branchId || req.branch?.id || null;
 }
 
-function canViewAllBranches(req) {
+function canViewAllStoreLocations(req) {
   return Boolean(req.user?.canViewAllBranches);
 }
 
-function toMoneyNumber(x) {
-  const n = typeof x === "string" ? Number(x.trim()) : Number(x);
+function allowedStoreLocationIds(req) {
+  return Array.isArray(req.user?.allowedBranchIds) ? req.user.allowedBranchIds : [];
+}
+
+function toMoneyNumber(value) {
+  const n = typeof value === "string" ? Number(value.trim()) : Number(value);
   return Number.isFinite(n) ? n : NaN;
 }
 
-function cleanString(x) {
-  const s = x == null ? "" : String(x).trim();
+function cleanString(value) {
+  const s = value == null ? "" : String(value).trim();
   return s || null;
 }
 
@@ -34,113 +39,248 @@ function normalizeExpenseCategory(input) {
   return Object.values(ExpenseCategory).includes(raw) ? raw : null;
 }
 
-function resolveExpenseBranchScope(req) {
-  const branchIdFromQuery = cleanString(req.query?.branchId);
-  const allBranchesRequested =
+function makeAccessError(code, message, status = 403) {
+  const error = new Error(message);
+  error.status = status;
+  error.code = code;
+  return error;
+}
+
+function resolveExpenseStoreLocationScope(req) {
+  const requestedStoreLocationId =
+    cleanString(req.query?.branchId) ||
+    cleanString(req.headers["x-branch-id"]) ||
+    null;
+
+  const allStoreLocationsRequested =
     String(req.query?.allBranches || "")
       .trim()
       .toLowerCase() === "true";
 
-  if (allBranchesRequested) {
-    if (!canViewAllBranches(req)) {
-      const err = new Error("Branch access denied");
-      err.status = 403;
-      err.code = "BRANCH_ACCESS_DENIED";
-      throw err;
+  const allowedIds = allowedStoreLocationIds(req);
+
+  if (allStoreLocationsRequested) {
+    if (!canViewAllStoreLocations(req)) {
+      throw makeAccessError(
+        "STORE_LOCATION_ACCESS_DENIED",
+        "You do not have access to view all store locations."
+      );
     }
 
     return {
-      mode: "ALL_BRANCHES",
+      mode: "ALL_STORE_LOCATIONS",
       branchId: null,
+      storeLocationId: null,
+      allowedStoreLocationIds: allowedIds,
     };
   }
 
-  if (branchIdFromQuery) {
-    if (!canViewAllBranches(req)) {
-      const allowed = Array.isArray(req.user?.allowedBranchIds) ? req.user.allowedBranchIds : [];
-      if (!allowed.includes(branchIdFromQuery)) {
-        const err = new Error("Branch access denied");
-        err.status = 403;
-        err.code = "BRANCH_ACCESS_DENIED";
-        throw err;
-      }
+  if (requestedStoreLocationId) {
+    if (
+      !canViewAllStoreLocations(req) &&
+      allowedIds.length > 0 &&
+      !allowedIds.includes(requestedStoreLocationId)
+    ) {
+      throw makeAccessError(
+        "STORE_LOCATION_ACCESS_DENIED",
+        "You do not have access to this store location."
+      );
     }
 
     return {
-      mode: "SINGLE_BRANCH",
-      branchId: branchIdFromQuery,
+      mode: "SINGLE_STORE_LOCATION",
+      branchId: requestedStoreLocationId,
+      storeLocationId: requestedStoreLocationId,
+      allowedStoreLocationIds: allowedIds,
     };
   }
+
+  const activeStoreLocationId = getActiveStoreLocationId(req);
 
   return {
-    mode: "SINGLE_BRANCH",
-    branchId: getBranchId(req),
+    mode: "SINGLE_STORE_LOCATION",
+    branchId: activeStoreLocationId,
+    storeLocationId: activeStoreLocationId,
+    allowedStoreLocationIds: allowedIds,
   };
+}
+
+function applyExpenseStoreLocationScope(where, scope) {
+  const next = { ...(where || {}) };
+
+  if (scope?.mode === "SINGLE_STORE_LOCATION" && scope?.branchId) {
+    next.branchId = scope.branchId;
+  }
+
+  return next;
+}
+
+async function ensureWritableStoreLocationAccessOrThrow(req) {
+  const tenantId = getTenantId(req);
+  const storeLocationId = getActiveStoreLocationId(req);
+
+  if (!tenantId) {
+    throw makeAccessError("UNAUTHORIZED", "Unauthorized", 401);
+  }
+
+  if (!storeLocationId) {
+    throw makeAccessError(
+      "STORE_LOCATION_REQUIRED",
+      "No active store location selected.",
+      400
+    );
+  }
+
+  const allowedIds = allowedStoreLocationIds(req);
+
+  if (
+    !canViewAllStoreLocations(req) &&
+    allowedIds.length > 0 &&
+    !allowedIds.includes(storeLocationId)
+  ) {
+    throw makeAccessError(
+      "STORE_LOCATION_ACCESS_DENIED",
+      "You do not have access to this store location."
+    );
+  }
+
+  const storeLocation = await prisma.branch.findFirst({
+    where: {
+      id: storeLocationId,
+      tenantId,
+      status: {
+        in: ["ACTIVE", "CLOSED"],
+      },
+    },
+    select: {
+      id: true,
+      tenantId: true,
+      name: true,
+      code: true,
+      status: true,
+      isMain: true,
+    },
+  });
+
+  if (!storeLocation) {
+    throw makeAccessError(
+      "STORE_LOCATION_NOT_FOUND",
+      "Store location not found.",
+      404
+    );
+  }
+
+  if (storeLocation.status !== "ACTIVE") {
+    throw makeAccessError(
+      "STORE_LOCATION_NOT_ACTIVE",
+      "Selected store location is not active.",
+      409
+    );
+  }
+
+  return storeLocation;
+}
+
+function expenseInclude() {
+  return {
+    createdBy: { select: { id: true, name: true } },
+    approvedBy: { select: { id: true, name: true } },
+    branch: {
+      select: {
+        id: true,
+        name: true,
+        code: true,
+        status: true,
+        isMain: true,
+      },
+    },
+  };
+}
+
+function storeLocationScopeForClient(scope) {
+  if (!scope) return null;
+
+  return {
+    mode: scope.mode,
+    storeLocationId: scope.storeLocationId || null,
+    allowedStoreLocationIds: scope.allowedStoreLocationIds || [],
+  };
+}
+
+function handleStoreLocationError(res, error, fallbackMessage) {
+  const code = String(error?.code || "");
+
+  if (
+    code === "UNAUTHORIZED" ||
+    code === "STORE_LOCATION_REQUIRED" ||
+    code === "STORE_LOCATION_ACCESS_DENIED" ||
+    code === "STORE_LOCATION_NOT_FOUND" ||
+    code === "STORE_LOCATION_NOT_ACTIVE"
+  ) {
+    return res.status(error.status || 500).json({
+      message: error.message,
+      code,
+    });
+  }
+
+  return res.status(error?.status || 500).json({
+    message: error?.message || fallbackMessage,
+    code: error?.code || null,
+  });
 }
 
 // CREATE EXPENSE
 async function createExpense(req, res) {
   const tenantId = getTenantId(req);
   const userId = getUserId(req);
-  const branchId = getBranchId(req);
 
-  const { title, category, amount, notes } = req.body;
+  const { title, category, amount, notes } = req.body || {};
 
   if (!tenantId || !userId) {
-    return res.status(401).json({ message: "Unauthorized" });
+    return res.status(401).json({ message: "Unauthorized", code: "UNAUTHORIZED" });
   }
 
-  if (!branchId) {
+  const cleanTitle = cleanString(title);
+  if (!cleanTitle) {
     return res.status(400).json({
-      message: "No active branch selected",
-      code: "BRANCH_REQUIRED",
+      message: "Expense title is required.",
+      code: "EXPENSE_TITLE_REQUIRED",
     });
   }
 
-  const t = title == null ? "" : String(title).trim();
-  if (!t) {
-    return res.status(400).json({ message: "title is required" });
-  }
-
-  const cat = normalizeExpenseCategory(category);
-  if (!cat) {
+  const cleanCategory = normalizeExpenseCategory(category);
+  if (!cleanCategory) {
     return res.status(400).json({
-      message: `category must be one of ${Object.values(ExpenseCategory).join(", ")}`,
+      message: `Expense category must be one of ${Object.values(ExpenseCategory).join(", ")}.`,
+      code: "EXPENSE_CATEGORY_INVALID",
     });
   }
 
-  const amt = toMoneyNumber(amount);
-  if (!Number.isFinite(amt) || amt <= 0) {
-    return res.status(400).json({ message: "amount must be a positive number" });
+  const cleanAmount = toMoneyNumber(amount);
+  if (!Number.isFinite(cleanAmount) || cleanAmount <= 0) {
+    return res.status(400).json({
+      message: "Expense amount must be a positive number.",
+      code: "EXPENSE_AMOUNT_INVALID",
+    });
   }
 
-  const cleanNotes = notes == null ? null : String(notes).trim() || null;
+  const cleanNotes = cleanString(notes);
 
   try {
+    const storeLocation = await ensureWritableStoreLocationAccessOrThrow(req);
+
     const expense = await prisma.expense.create({
       data: {
-        title: t,
-        category: cat,
-        amount: amt,
+        title: cleanTitle,
+        category: cleanCategory,
+        amount: cleanAmount,
         notes: cleanNotes,
         status: "PENDING",
         tenantId,
-        branchId,
+        branchId: storeLocation.id,
         createdById: userId,
       },
-      include: {
-        createdBy: { select: { id: true, name: true } },
-        approvedBy: { select: { id: true, name: true } },
-        branch: {
-          select: {
-            id: true,
-            name: true,
-            code: true,
-            status: true,
-            isMain: true,
-          },
-        },
-      },
+      include: expenseInclude(),
     });
 
     await logAudit({
@@ -150,79 +290,73 @@ async function createExpense(req, res) {
       entity: AuditEntity.EXPENSE,
       entityId: expense.id,
       metadata: {
-        title: t,
-        category: cat,
-        amount: amt,
-        branchId,
+        title: cleanTitle,
+        category: cleanCategory,
+        amount: cleanAmount,
+        storeLocationId: storeLocation.id,
+        branchId: storeLocation.id,
       },
     });
 
     return res.status(201).json(expense);
-  } catch (err) {
-    console.error("createExpense error:", err);
-    return res.status(500).json({ message: "Failed to create expense" });
+  } catch (error) {
+    console.error("createExpense error:", error);
+    return handleStoreLocationError(res, error, "Failed to create expense");
   }
 }
 
 // LIST EXPENSES
 async function listExpenses(req, res) {
   const tenantId = getTenantId(req);
+
   if (!tenantId) {
-    return res.status(401).json({ message: "Unauthorized" });
+    return res.status(401).json({ message: "Unauthorized", code: "UNAUTHORIZED" });
   }
 
   try {
-    const scope = resolveExpenseBranchScope(req);
-
-    const where = {
-      tenantId,
-      ...(scope.branchId ? { branchId: scope.branchId } : {}),
-    };
+    const scope = resolveExpenseStoreLocationScope(req);
 
     const expenses = await prisma.expense.findMany({
-      where,
+      where: applyExpenseStoreLocationScope({ tenantId }, scope),
       orderBy: { createdAt: "desc" },
-      include: {
-        createdBy: { select: { id: true, name: true } },
-        approvedBy: { select: { id: true, name: true } },
-        branch: {
-          select: {
-            id: true,
-            name: true,
-            code: true,
-            status: true,
-            isMain: true,
-          },
-        },
-      },
+      include: expenseInclude(),
       take: 200,
     });
 
     return res.json({
       expenses,
       count: expenses.length,
-      branchScope: scope,
+      storeLocationScope: storeLocationScopeForClient(scope),
+
+      // Kept temporarily for older frontend code that still reads branchScope.
+      branchScope: {
+        mode:
+          scope.mode === "ALL_STORE_LOCATIONS"
+            ? "ALL_BRANCHES"
+            : "SINGLE_BRANCH",
+        branchId: scope.branchId || null,
+        allowedBranchIds: scope.allowedStoreLocationIds || [],
+      },
     });
-  } catch (err) {
-    console.error("listExpenses error:", err);
-    return res.status(err.status || 500).json({
-      message: err.message || "Failed to fetch expenses",
-      code: err.code || null,
-    });
+  } catch (error) {
+    console.error("listExpenses error:", error);
+    return handleStoreLocationError(res, error, "Failed to fetch expenses");
   }
 }
 
-// APPROVE EXPENSE (tenant-safe + branch-aware)
+// APPROVE EXPENSE
 async function approveExpense(req, res) {
   const tenantId = getTenantId(req);
   const userId = getUserId(req);
   const { id } = req.params;
 
   if (!tenantId || !userId) {
-    return res.status(401).json({ message: "Unauthorized" });
+    return res.status(401).json({ message: "Unauthorized", code: "UNAUTHORIZED" });
   }
 
   try {
+    const scope = resolveExpenseStoreLocationScope(req);
+
     const existing = await prisma.expense.findFirst({
       where: { id, tenantId },
       select: {
@@ -234,16 +368,30 @@ async function approveExpense(req, res) {
     });
 
     if (!existing) {
-      return res.status(404).json({ message: "Expense not found" });
+      return res.status(404).json({
+        message: "Expense not found.",
+        code: "EXPENSE_NOT_FOUND",
+      });
     }
 
-    const scope = resolveExpenseBranchScope(req);
-
-    if (scope.mode === "SINGLE_BRANCH" && scope.branchId && existing.branchId !== scope.branchId) {
+    if (
+      scope.mode === "SINGLE_STORE_LOCATION" &&
+      scope.branchId &&
+      existing.branchId !== scope.branchId
+    ) {
       return res.status(403).json({
-        message: "Branch access denied",
-        code: "BRANCH_ACCESS_DENIED",
+        message: "You do not have access to this store location.",
+        code: "STORE_LOCATION_ACCESS_DENIED",
       });
+    }
+
+    if (existing.status === "APPROVED") {
+      const approved = await prisma.expense.findFirst({
+        where: { id, tenantId },
+        include: expenseInclude(),
+      });
+
+      return res.json(approved);
     }
 
     const result = await prisma.expense.updateMany({
@@ -260,7 +408,10 @@ async function approveExpense(req, res) {
     });
 
     if (result.count === 0) {
-      return res.status(404).json({ message: "Expense not found or already approved" });
+      return res.status(404).json({
+        message: "Expense not found or already approved.",
+        code: "EXPENSE_NOT_FOUND_OR_ALREADY_APPROVED",
+      });
     }
 
     await logAudit({
@@ -270,48 +421,36 @@ async function approveExpense(req, res) {
       entity: AuditEntity.EXPENSE,
       entityId: id,
       metadata: {
+        storeLocationId: existing.branchId || null,
         branchId: existing.branchId || null,
       },
     });
 
     const updated = await prisma.expense.findFirst({
       where: { id, tenantId },
-      include: {
-        createdBy: { select: { id: true, name: true } },
-        approvedBy: { select: { id: true, name: true } },
-        branch: {
-          select: {
-            id: true,
-            name: true,
-            code: true,
-            status: true,
-            isMain: true,
-          },
-        },
-      },
+      include: expenseInclude(),
     });
 
     return res.json(updated);
-  } catch (err) {
-    console.error("approveExpense error:", err);
-    return res.status(err.status || 500).json({
-      message: err.message || "Failed to approve expense",
-      code: err.code || null,
-    });
+  } catch (error) {
+    console.error("approveExpense error:", error);
+    return handleStoreLocationError(res, error, "Failed to approve expense");
   }
 }
 
-// DELETE EXPENSE (tenant-safe + branch-aware)
+// DELETE EXPENSE
 async function deleteExpense(req, res) {
   const tenantId = getTenantId(req);
   const userId = getUserId(req);
   const { id } = req.params;
 
   if (!tenantId || !userId) {
-    return res.status(401).json({ message: "Unauthorized" });
+    return res.status(401).json({ message: "Unauthorized", code: "UNAUTHORIZED" });
   }
 
   try {
+    const scope = resolveExpenseStoreLocationScope(req);
+
     const existing = await prisma.expense.findFirst({
       where: { id, tenantId },
       select: {
@@ -323,15 +462,27 @@ async function deleteExpense(req, res) {
     });
 
     if (!existing) {
-      return res.status(404).json({ message: "Expense not found" });
+      return res.status(404).json({
+        message: "Expense not found.",
+        code: "EXPENSE_NOT_FOUND",
+      });
     }
 
-    const scope = resolveExpenseBranchScope(req);
-
-    if (scope.mode === "SINGLE_BRANCH" && scope.branchId && existing.branchId !== scope.branchId) {
+    if (
+      scope.mode === "SINGLE_STORE_LOCATION" &&
+      scope.branchId &&
+      existing.branchId !== scope.branchId
+    ) {
       return res.status(403).json({
-        message: "Branch access denied",
-        code: "BRANCH_ACCESS_DENIED",
+        message: "You do not have access to this store location.",
+        code: "STORE_LOCATION_ACCESS_DENIED",
+      });
+    }
+
+    if (existing.status === "APPROVED") {
+      return res.status(409).json({
+        message: "Approved expenses cannot be deleted because they are financial records.",
+        code: "APPROVED_EXPENSE_CANNOT_BE_DELETED",
       });
     }
 
@@ -345,7 +496,8 @@ async function deleteExpense(req, res) {
 
     if (result.count === 0) {
       return res.status(404).json({
-        message: "Expense not found or cannot delete (approved)",
+        message: "Expense not found or cannot be deleted.",
+        code: "EXPENSE_NOT_FOUND_OR_NOT_DELETABLE",
       });
     }
 
@@ -356,17 +508,18 @@ async function deleteExpense(req, res) {
       entity: AuditEntity.EXPENSE,
       entityId: id,
       metadata: {
+        storeLocationId: existing.branchId || null,
         branchId: existing.branchId || null,
       },
     });
 
-    return res.json({ message: "Expense deleted successfully" });
-  } catch (err) {
-    console.error("deleteExpense error:", err);
-    return res.status(err.status || 500).json({
-      message: err.message || "Failed to delete expense",
-      code: err.code || null,
+    return res.json({
+      message: "Expense deleted successfully.",
+      code: "EXPENSE_DELETED",
     });
+  } catch (error) {
+    console.error("deleteExpense error:", error);
+    return handleStoreLocationError(res, error, "Failed to delete expense");
   }
 }
 

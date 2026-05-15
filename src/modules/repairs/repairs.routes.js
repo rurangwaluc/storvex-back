@@ -1,5 +1,7 @@
 const express = require("express");
+
 const router = express.Router();
+
 const repairsController = require("./repairs.controller");
 
 const authenticate = require("../../middlewares/authenticate");
@@ -12,6 +14,7 @@ const requireDbPermission = require("../../middlewares/requireDbPermission");
 const { PERMISSIONS } = require("../auth/permissions");
 
 const readBase = [authenticate, requireTenant, requireActiveSubscription];
+
 const writeBase = [
   authenticate,
   requireTenant,
@@ -19,7 +22,6 @@ const writeBase = [
   requireWritableSubscription,
 ];
 
-// Create repair
 router.post(
   "/",
   ...writeBase,
@@ -27,7 +29,6 @@ router.post(
   repairsController.createRepair
 );
 
-// List all repairs
 router.get(
   "/",
   ...readBase,
@@ -35,8 +36,6 @@ router.get(
   repairsController.getRepairs
 );
 
-// IMPORTANT: static routes must come before /:id to avoid being shadowed
-// Get technicians list
 router.get(
   "/technicians",
   ...readBase,
@@ -44,7 +43,6 @@ router.get(
   repairsController.getTechnicians
 );
 
-// Get single repair
 router.get(
   "/:id",
   ...readBase,
@@ -52,7 +50,6 @@ router.get(
   repairsController.getRepairById
 );
 
-// Update full repair details
 router.put(
   "/:id",
   ...writeBase,
@@ -60,7 +57,6 @@ router.put(
   repairsController.updateRepair
 );
 
-// Update repair status only
 router.put(
   "/:id/status",
   ...writeBase,
@@ -68,7 +64,6 @@ router.put(
   repairsController.updateRepairStatus
 );
 
-// Assign technician
 router.put(
   "/:id/assign",
   ...writeBase,
@@ -76,7 +71,6 @@ router.put(
   repairsController.assignTechnician
 );
 
-// Archive repair (soft delete)
 router.delete(
   "/:id/archive",
   ...writeBase,
@@ -84,7 +78,6 @@ router.delete(
   repairsController.archiveRepair
 );
 
-// Hard delete repair
 router.delete(
   "/:id",
   ...writeBase,
