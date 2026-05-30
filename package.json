@@ -19,7 +19,7 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.995.0",
+    "@aws-sdk/client-s3": "^3.1050.0",
     "@aws-sdk/s3-request-presigner": "^3.995.0",
     "@prisma/client": "^6.19.2",
     "africastalking": "^0.7.9",
@@ -29,7 +29,7 @@
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
-    "multer": "^2.0.2",
+    "multer": "^2.1.1",
     "openai": "^6.32.0",
     "pdfkit": "^0.17.2",
     "plivo": "^4.75.7",

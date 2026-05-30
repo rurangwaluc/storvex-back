@@ -33,6 +33,10 @@ function cleanString(x) {
   return s || null;
 }
 
+function lower(value) {
+  return String(value || "").toLowerCase();
+}
+
 function getClientIp(req) {
   const xf = req.headers["x-forwarded-for"];
   if (xf) return String(xf).split(",")[0].trim();
@@ -41,6 +45,83 @@ function getClientIp(req) {
 
 function getUserAgent(req) {
   return req.headers["user-agent"] ? String(req.headers["user-agent"]) : null;
+}
+
+function parseUserAgent(ua) {
+  const text = String(ua || "");
+  const value = lower(text);
+
+  if (!text) return "Unknown device";
+
+  const isExpo = value.includes("expo");
+  const isChrome = value.includes("chrome") || value.includes("crios");
+  const isSafari = value.includes("safari") && !isChrome;
+  const isFirefox = value.includes("firefox");
+  const isEdge = value.includes("edg/");
+  const isSamsung = value.includes("samsungbrowser");
+
+  let device = "Unknown device";
+
+  if (value.includes("cros")) device = "Chromebook";
+  else if (value.includes("iphone")) device = "iPhone";
+  else if (value.includes("ipad")) device = "iPad";
+  else if (value.includes("android")) device = "Android device";
+  else if (value.includes("windows")) device = "Windows device";
+  else if (value.includes("macintosh") || value.includes("mac os")) device = "Mac device";
+  else if (value.includes("linux")) device = "Linux device";
+
+  let app = null;
+
+  if (isExpo) app = "Storvex mobile";
+  else if (isSamsung) app = "Samsung Internet";
+  else if (isEdge) app = "Microsoft Edge";
+  else if (isChrome) app = "Chrome";
+  else if (isFirefox) app = "Firefox";
+  else if (isSafari) app = "Safari";
+
+  return app ? `${device} · ${app}` : device;
+}
+
+function passwordProblems(value) {
+  const password = String(value || "");
+  const problems = [];
+
+  if (password.length < 8) problems.push("Use at least 8 characters.");
+  if (!/[a-z]/.test(password)) problems.push("Add a lowercase letter.");
+  if (!/[A-Z]/.test(password)) problems.push("Add an uppercase letter.");
+  if (!/[0-9]/.test(password)) problems.push("Add a number.");
+  if (!/[^A-Za-z0-9]/.test(password)) problems.push("Add a symbol.");
+
+  return problems;
+}
+
+async function recordLoginEventSafe(req, {
+  tenantId,
+  userId = null,
+  email = null,
+  role = null,
+  status,
+  method = "PASSWORD",
+  reason = null,
+}) {
+  if (!tenantId || !status) return;
+
+  await prisma.loginEvent
+    .create({
+      data: {
+        tenantId,
+        userId,
+        email: normalizeEmail(email) || null,
+        role: role || null,
+        status,
+        method,
+        ipAddress: getClientIp(req),
+        userAgent: getUserAgent(req),
+        deviceLabel: parseUserAgent(getUserAgent(req)),
+        reason,
+      },
+    })
+    .catch(() => null);
 }
 
 function assertJwtSecret() {
@@ -98,8 +179,8 @@ function makeMainBranchName(storeName) {
   const name = cleanString(storeName);
   if (!name) return "Main Branch";
 
-  const lower = name.toLowerCase();
-  if (lower.includes("main branch")) return name;
+  const lowerName = name.toLowerCase();
+  if (lowerName.includes("main branch")) return name;
 
   return `${name} Main Branch`;
 }
@@ -134,33 +215,13 @@ function buildTenantCreateData(intent, ownerEmail, ownerPhone) {
     status: "ACTIVE",
   };
 
-  if (fieldExists(prisma.tenant, "shopType")) {
-    data.shopType = cleanString(intent.shopType);
-  }
-
-  if (fieldExists(prisma.tenant, "district")) {
-    data.district = cleanString(intent.district);
-  }
-
-  if (fieldExists(prisma.tenant, "sector")) {
-    data.sector = cleanString(intent.sector);
-  }
-
-  if (fieldExists(prisma.tenant, "address")) {
-    data.address = cleanString(intent.address);
-  }
-
-  if (fieldExists(prisma.tenant, "countryCode")) {
-    data.countryCode = "RW";
-  }
-
-  if (fieldExists(prisma.tenant, "currencyCode")) {
-    data.currencyCode = "RWF";
-  }
-
-  if (fieldExists(prisma.tenant, "timezone")) {
-    data.timezone = "Africa/Kigali";
-  }
+  if (fieldExists(prisma.tenant, "shopType")) data.shopType = cleanString(intent.shopType);
+  if (fieldExists(prisma.tenant, "district")) data.district = cleanString(intent.district);
+  if (fieldExists(prisma.tenant, "sector")) data.sector = cleanString(intent.sector);
+  if (fieldExists(prisma.tenant, "address")) data.address = cleanString(intent.address);
+  if (fieldExists(prisma.tenant, "countryCode")) data.countryCode = "RW";
+  if (fieldExists(prisma.tenant, "currencyCode")) data.currencyCode = "RWF";
+  if (fieldExists(prisma.tenant, "timezone")) data.timezone = "Africa/Kigali";
 
   return data;
 }
@@ -467,9 +528,7 @@ async function ownerIntent(req, res) {
     const emailNorm = normalizeEmail(email);
     const phoneNorm = normalizePhone(phone);
 
-    if (!emailNorm) {
-      return res.status(400).json({ message: "Invalid email format" });
-    }
+    if (!emailNorm) return res.status(400).json({ message: "Invalid email format" });
 
     if (!phoneNorm || !isRwandaMsisdn250(phoneNorm)) {
       return res
@@ -478,6 +537,7 @@ async function ownerIntent(req, res) {
     }
 
     const signupMode = String(mode || "TRIAL").trim().toUpperCase();
+
     if (signupMode !== "PAID" && signupMode !== "TRIAL") {
       return res.status(400).json({ message: "Invalid mode. Use PAID or TRIAL." });
     }
@@ -485,14 +545,10 @@ async function ownerIntent(req, res) {
     let requestedPlan = null;
 
     if (signupMode === "PAID") {
-      if (!planKey) {
-        return res.status(400).json({ message: "planKey is required for paid signup" });
-      }
+      if (!planKey) return res.status(400).json({ message: "planKey is required for paid signup" });
 
       requestedPlan = getPlanByKey(planKey);
-      if (!requestedPlan) {
-        return res.status(400).json({ message: "Invalid planKey" });
-      }
+      if (!requestedPlan) return res.status(400).json({ message: "Invalid planKey" });
     } else {
       requestedPlan = getTrialPlan();
     }
@@ -506,10 +562,10 @@ async function ownerIntent(req, res) {
         ownerName: String(ownerName).trim(),
         email: emailNorm,
         phone: phoneNorm,
-        shopType: shopType ? String(shopType).trim() : null,
-        district: district ? String(district).trim() : null,
-        sector: sector ? String(sector).trim() : null,
-        address: address ? String(address).trim() : null,
+        shopType: cleanString(shopType),
+        district: cleanString(district),
+        sector: cleanString(sector),
+        address: cleanString(address),
         deviceId: cleanString(deviceId),
         browserFingerprint: cleanString(browserFingerprint),
         signupIp: getClientIp(req),
@@ -595,43 +651,63 @@ async function login(req, res) {
     }
 
     if (user.isActive === false) {
+      await recordLoginEventSafe(req, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        status: "BLOCKED",
+        method: "PASSWORD",
+        reason: "Account is deactivated.",
+      });
+
       return res.status(403).json({ message: "Account is deactivated" });
     }
 
     const validPassword = await bcrypt.compare(String(password), user.password);
+
     if (!validPassword) {
+      await recordLoginEventSafe(req, {
+        tenantId: user.tenantId,
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        status: "FAILED",
+        method: "PASSWORD",
+        reason: "Incorrect password.",
+      });
+
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const tokenId = crypto.randomUUID();
     const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000);
+    const ipAddress = getClientIp(req);
+    const userAgent = getUserAgent(req);
+    const deviceLabel = parseUserAgent(userAgent);
 
     await prisma.userSession.create({
       data: {
         tenantId: user.tenantId,
         userId: user.id,
         tokenId,
-        ipAddress: getClientIp(req),
-        userAgent: getUserAgent(req),
+        ipAddress,
+        userAgent,
         expiresAt,
         isRevoked: false,
         lastSeenAt: new Date(),
       },
     });
 
-    await prisma.loginEvent.create({
-      data: {
-        tenantId: user.tenantId,
-        userId: user.id,
-        email: user.email,
-        role: user.role,
-        status: "SUCCESS",
-        method: "PASSWORD",
-        ipAddress: getClientIp(req),
-        userAgent: getUserAgent(req),
-        deviceLabel: getUserAgent(req),
-      },
-    }).catch(() => null);
+    await recordLoginEventSafe(req, {
+      tenantId: user.tenantId,
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      status: "SUCCESS",
+      method: "PASSWORD",
+      reason: `${deviceLabel} signed in successfully.`,
+    });
 
     const token = signAuthToken({ user, tokenId });
     const workspace = await getWorkspaceContextForUser(user.id, user.tenantId);
@@ -666,7 +742,15 @@ async function confirmSignup(req, res) {
       return res.status(400).json({ message: "intentId and password are required" });
     }
 
+    const passwordIssues = passwordProblems(password);
+    if (passwordIssues.length) {
+      return res.status(400).json({
+        message: `Password is not strong enough. ${passwordIssues.join(" ")}`,
+      });
+    }
+
     const signupMode = String(mode || "PAID").toUpperCase();
+
     if (signupMode !== "PAID" && signupMode !== "TRIAL") {
       return res.status(400).json({ message: "Invalid mode. Use PAID or TRIAL." });
     }
@@ -698,9 +782,7 @@ async function confirmSignup(req, res) {
       },
     });
 
-    if (!intent) {
-      return res.status(404).json({ message: "Owner intent not found" });
-    }
+    if (!intent) return res.status(404).json({ message: "Owner intent not found" });
 
     if (intent.expiresAt < new Date()) {
       return res.status(403).json({ message: "Owner intent expired" });
@@ -762,6 +844,7 @@ async function confirmSignup(req, res) {
           tierKey: true,
           cycleKey: true,
           staffLimit: true,
+          branchLimit: true,
           priceAmount: true,
           currency: true,
           createdAt: true,
@@ -780,9 +863,7 @@ async function confirmSignup(req, res) {
         cleanString(latestSuccessfulPayment?.planKey) ||
         cleanString(intent.requestedPlanKey);
 
-      if (effectivePlanKey) {
-        selectedPlan = getPlanByKey(effectivePlanKey);
-      }
+      if (effectivePlanKey) selectedPlan = getPlanByKey(effectivePlanKey);
 
       if (!selectedPlan && Number.isFinite(Number(planDays))) {
         const fallbackDays = Number(planDays);
@@ -817,7 +898,9 @@ async function confirmSignup(req, res) {
             : Number.isFinite(Number(intent.requestedStaffLimit))
               ? Number(intent.requestedStaffLimit)
               : null,
-          branchLimit: 1,
+          branchLimit: Number.isFinite(Number(latestSuccessfulPayment?.branchLimit))
+            ? Number(latestSuccessfulPayment.branchLimit)
+            : 1,
         };
       }
 
@@ -845,171 +928,190 @@ async function confirmSignup(req, res) {
       isEnterprise: Boolean(selectedPlan.isEnterprise),
     };
 
-    const hashedPassword = await bcrypt.hash(String(password), 10);
+    const hashedPassword = await bcrypt.hash(String(password), 12);
 
-    const result = await prisma.$transaction(async (tx) => {
-      if (signupMode === "TRIAL") {
-        await enforceTrialGuardOrThrowTx(tx, {
-          intentId: intent.id,
-          email: ownerEmail,
-          phone: ownerPhone,
-          deviceId: String(intent.deviceId).trim(),
-          browserFingerprint: cleanString(intent.browserFingerprint),
-          ip: getClientIp(req),
-          userAgent: getUserAgent(req),
+    const result = await prisma.$transaction(
+      async (tx) => {
+        if (signupMode === "TRIAL") {
+          await enforceTrialGuardOrThrowTx(tx, {
+            intentId: intent.id,
+            email: ownerEmail,
+            phone: ownerPhone,
+            deviceId: String(intent.deviceId).trim(),
+            browserFingerprint: cleanString(intent.browserFingerprint),
+            ip: getClientIp(req),
+            userAgent: getUserAgent(req),
+          });
+        }
+
+        const tenant = await tx.tenant.create({
+          data: buildTenantCreateData(intent, ownerEmail, ownerPhone),
+          select: buildTenantSelect(),
         });
-      }
 
-      const tenant = await tx.tenant.create({
-        data: buildTenantCreateData(intent, ownerEmail, ownerPhone),
-        select: buildTenantSelect(),
-      });
-
-      const owner = await tx.user.create({
-        data: {
-          tenantId: tenant.id,
-          name: ownerName,
-          email: ownerEmail,
-          phone: ownerPhone,
-          password: hashedPassword,
-          role: "OWNER",
-        },
-        select: {
-          id: true,
-          tenantId: true,
-          name: true,
-          email: true,
-          phone: true,
-          role: true,
-        },
-      });
-
-      const mainBranch = await tx.branch.create({
-        data: {
-          tenantId: tenant.id,
-          name: makeMainBranchName(tenantName),
-          code: makeMainBranchCode(tenantName),
-          type: "MAIN",
-          status: "ACTIVE",
-          phone: ownerPhone,
-          countryCode: "RW",
-          isMain: true,
-        },
-        select: {
-          id: true,
-          tenantId: true,
-          name: true,
-          code: true,
-          type: true,
-          status: true,
-          isMain: true,
-        },
-      });
-
-      if (fieldExists(tx.tenant, "mainBranchId")) {
-        await tx.tenant.update({
-          where: { id: tenant.id },
+        const owner = await tx.user.create({
           data: {
-            mainBranchId: mainBranch.id,
+            tenantId: tenant.id,
+            name: ownerName,
+            email: ownerEmail,
+            phone: ownerPhone,
+            password: hashedPassword,
+            role: "OWNER",
+          },
+          select: {
+            id: true,
+            tenantId: true,
+            name: true,
+            email: true,
+            phone: true,
+            role: true,
           },
         });
-      }
 
-      await tx.userBranchAssignment.create({
-        data: {
-          tenantId: tenant.id,
-          userId: owner.id,
-          branchId: mainBranch.id,
-          isDefault: true,
-          canOperate: true,
-          canViewReports: true,
-        },
-      });
+        const mainBranch = await tx.branch.create({
+          data: {
+            tenantId: tenant.id,
+            name: makeMainBranchName(tenantName),
+            code: makeMainBranchCode(tenantName),
+            type: "MAIN",
+            status: "ACTIVE",
+            phone: ownerPhone,
+            countryCode: "RW",
+            isMain: true,
+          },
+          select: {
+            id: true,
+            tenantId: true,
+            name: true,
+            code: true,
+            type: true,
+            status: true,
+            isMain: true,
+          },
+        });
 
-      const startDate = new Date();
-      const endDate = new Date(startDate);
-      endDate.setDate(endDate.getDate() + subscriptionDays);
+        if (fieldExists(tx.tenant, "mainBranchId")) {
+          await tx.tenant.update({
+            where: { id: tenant.id },
+            data: {
+              mainBranchId: mainBranch.id,
+            },
+          });
+        }
 
-      const accessMode = signupMode === "TRIAL" ? "TRIAL" : "ACTIVE";
+        await tx.userBranchAssignment.create({
+          data: {
+            tenantId: tenant.id,
+            userId: owner.id,
+            branchId: mainBranch.id,
+            isDefault: true,
+            canOperate: true,
+            canViewReports: true,
+          },
+        });
 
-      await tx.subscription.create({
-        data: {
-          tenantId: tenant.id,
-          status: "ACTIVE",
-          accessMode,
-          planKey: planSnapshot.planKey,
-          tierKey: planSnapshot.tierKey,
-          cycleKey: planSnapshot.cycleKey,
-          staffLimit: planSnapshot.staffLimit,
-          branchLimit: planSnapshot.branchLimit,
-          extraBranchCount: 0,
-          priceAmount: planSnapshot.price,
-          currency: planSnapshot.currency,
+        const startDate = new Date();
+        const endDate = new Date(startDate);
+        endDate.setDate(endDate.getDate() + subscriptionDays);
+
+        const accessMode = signupMode === "TRIAL" ? "TRIAL" : "ACTIVE";
+
+        await tx.subscription.create({
+          data: {
+            tenantId: tenant.id,
+            status: "ACTIVE",
+            accessMode,
+            planKey: planSnapshot.planKey,
+            tierKey: planSnapshot.tierKey,
+            cycleKey: planSnapshot.cycleKey,
+            staffLimit: planSnapshot.staffLimit,
+            branchLimit: planSnapshot.branchLimit,
+            extraBranchCount: 0,
+            priceAmount: planSnapshot.price,
+            currency: planSnapshot.currency,
+            startDate,
+            endDate,
+            graceEndDate: null,
+            readOnlySince: null,
+            lastPaymentAt: signupMode === "PAID" ? new Date() : null,
+            renewedAt: signupMode === "PAID" ? new Date() : null,
+            trialConsumed: signupMode === "TRIAL",
+            trialSourceIntentId: signupMode === "TRIAL" ? intent.id : null,
+            trialStartDate: signupMode === "TRIAL" ? startDate : null,
+            trialEndDate: signupMode === "TRIAL" ? endDate : null,
+          },
+        });
+
+        await tx.ownerIntent.update({
+          where: { id: intent.id },
+          data:
+            signupMode === "TRIAL"
+              ? {
+                  status: "CONSUMED",
+                  convertedAt: new Date(),
+                  trialGrantedAt: new Date(),
+                  trialEligibilityCheckedAt: new Date(),
+                  trialBlockedReason: null,
+                  requestedPlanKey: planSnapshot.planKey,
+                  requestedTierKey: planSnapshot.tierKey,
+                  requestedCycleKey: planSnapshot.cycleKey,
+                  requestedStaffLimit: planSnapshot.staffLimit,
+                  requestedPriceAmount: planSnapshot.price,
+                  requestedCurrency: planSnapshot.currency,
+                }
+              : {
+                  status: "CONSUMED",
+                  convertedAt: new Date(),
+                  requestedPlanKey: planSnapshot.planKey,
+                  requestedTierKey: planSnapshot.tierKey,
+                  requestedCycleKey: planSnapshot.cycleKey,
+                  requestedStaffLimit: planSnapshot.staffLimit,
+                  requestedPriceAmount: planSnapshot.price,
+                  requestedCurrency: planSnapshot.currency,
+                },
+        });
+
+        return {
+          tenant,
+          owner,
+          mainBranch,
+          planSnapshot,
           startDate,
-          endDate,
-          graceEndDate: null,
-          readOnlySince: null,
-          lastPaymentAt: signupMode === "PAID" ? new Date() : null,
-          renewedAt: signupMode === "PAID" ? new Date() : null,
-          trialConsumed: signupMode === "TRIAL",
-          trialSourceIntentId: signupMode === "TRIAL" ? intent.id : null,
-          trialStartDate: signupMode === "TRIAL" ? startDate : null,
-          trialEndDate: signupMode === "TRIAL" ? endDate : null,
-        },
-      });
-
-      await tx.ownerIntent.update({
-        where: { id: intent.id },
-        data:
-          signupMode === "TRIAL"
-            ? {
-                status: "CONSUMED",
-                convertedAt: new Date(),
-                trialGrantedAt: new Date(),
-                trialEligibilityCheckedAt: new Date(),
-                trialBlockedReason: null,
-                requestedPlanKey: planSnapshot.planKey,
-                requestedTierKey: planSnapshot.tierKey,
-                requestedCycleKey: planSnapshot.cycleKey,
-                requestedStaffLimit: planSnapshot.staffLimit,
-                requestedPriceAmount: planSnapshot.price,
-                requestedCurrency: planSnapshot.currency,
-              }
-            : {
-                status: "CONSUMED",
-                convertedAt: new Date(),
-                requestedPlanKey: planSnapshot.planKey,
-                requestedTierKey: planSnapshot.tierKey,
-                requestedCycleKey: planSnapshot.cycleKey,
-                requestedStaffLimit: planSnapshot.staffLimit,
-                requestedPriceAmount: planSnapshot.price,
-                requestedCurrency: planSnapshot.currency,
-              },
-      });
-
-      return {
-        tenant,
-        owner,
-        mainBranch,
-        planSnapshot,
-        startDate,
-      };
-    });
+        };
+      },
+      {
+        maxWait: 15_000,
+        timeout: 30_000,
+      }
+    );
 
     const tokenId = crypto.randomUUID();
     const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000);
+    const ipAddress = getClientIp(req);
+    const userAgent = getUserAgent(req);
+    const deviceLabel = parseUserAgent(userAgent);
 
     await prisma.userSession.create({
       data: {
         tenantId: result.tenant.id,
         userId: result.owner.id,
         tokenId,
-        ipAddress: getClientIp(req),
-        userAgent: getUserAgent(req),
+        ipAddress,
+        userAgent,
         expiresAt,
         isRevoked: false,
         lastSeenAt: new Date(),
       },
+    });
+
+    await recordLoginEventSafe(req, {
+      tenantId: result.tenant.id,
+      userId: result.owner.id,
+      email: result.owner.email,
+      role: result.owner.role,
+      status: "SUCCESS",
+      method: signupMode === "TRIAL" ? "TRIAL_SIGNUP" : "PAID_SIGNUP",
+      reason: `${deviceLabel} created owner access.`,
     });
 
     const token = signAuthToken({

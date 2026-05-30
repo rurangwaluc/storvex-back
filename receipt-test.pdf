@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Receipt RCT-2026-000012</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" />
+  
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: #eef2f7;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #0f172a;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .wrap { padding: 28px 20px 40px; }
+
+  .actions {
+    width: 210mm;
+    margin: 0 auto 14px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .actBtn {
+    height: 36px;
+    padding: 0 16px;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    border: 1px solid #e2e8f0;
+    background: #fff;
+    color: #0f172a;
+  }
+
+  .actBtn.primary {
+    background: #4AA3FF;
+    border-color: #4AA3FF;
+    color: #fff;
+  }
+
+  .page {
+    width: 210mm;
+    margin: 0 auto;
+    background: #fff;
+    border-radius: 20px;
+    box-shadow: 0 20px 60px rgba(15,23,42,0.14);
+    overflow: hidden;
+    position: relative;
+  }
+
+  .pageInner { padding: 40px 44px 52px; }
+
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 24px;
+    padding-bottom: 24px;
+    border-bottom: 3px solid #4AA3FF;
+    margin-bottom: 28px;
+  }
+
+  .brandBlock {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    min-width: 0;
+    max-width: 56%;
+  }
+
+  .brandBlockLogoOnly {
+    max-width: 44%;
+  }
+
+  .logoFrame {
+    width: 64px;
+    height: 64px;
+    flex-shrink: 0;
+    border-radius: 14px;
+    border: 1px solid #e2e8f0;
+    background: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    padding: 6px;
+  }
+
+  .logo {
+    display: block;
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    object-position: center;
+  }
+
+  .logoFallback {
+    width: 64px;
+    height: 64px;
+    border-radius: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 22px;
+    font-weight: 900;
+    flex-shrink: 0;
+  }
+
+  .brandName {
+    font-size: 26px;
+    font-weight: 900;
+    letter-spacing: -0.5px;
+    color: #4AA3FF;
+    line-height: 1.1;
+    overflow-wrap: anywhere;
+  }
+
+  .brandSub {
+    margin-top: 5px;
+    font-size: 12px;
+    color: #64748b;
+    line-height: 1.5;
+  }
+
+  .brandSub div { margin-top: 1px; }
+
+  .docBlock {
+    text-align: right;
+    flex-shrink: 0;
+    max-width: 40%;
+  }
+
+  .docType {
+    font-size: 38px;
+    font-weight: 950;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: #0f172a;
+    line-height: 1;
+  }
+
+  .docNum {
+    margin-top: 8px;
+    font-size: 14px;
+    font-weight: 700;
+    color: #4AA3FF;
+    overflow-wrap: anywhere;
+  }
+
+  .docMeta {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #64748b;
+    line-height: 1.7;
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    margin-top: 6px;
+  }
+
+  .infoStrip {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 28px;
+  }
+
+  .infoCol {
+    padding: 16px 18px;
+    border-right: 1px solid #e2e8f0;
+  }
+
+  .infoCol:last-child { border-right: none; }
+
+  .infoLabel {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #64748b;
+    margin-bottom: 8px;
+  }
+
+  .infoName {
+    font-size: 15px;
+    font-weight: 800;
+    color: #0f172a;
+    margin-bottom: 4px;
+    line-height: 1.3;
+  }
+
+  .infoLine {
+    font-size: 12.5px;
+    color: #334155;
+    line-height: 1.6;
+  }
+
+  .infoKey {
+    color: #94a3b8;
+  }
+
+  .tableWrap {
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 24px;
+    flex: 1;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  thead th {
+    background: #f1f5f9;
+    padding: 10px 14px;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #334155;
+    text-align: left;
+    border-bottom: 1px solid #e2e8f0;
+  }
+
+  th.r, td.r { text-align: right; }
+  th.c, td.c { text-align: center; }
+
+  tbody td {
+    padding: 13px 14px;
+    font-size: 13px;
+    color: #0f172a;
+    border-bottom: 1px solid #e2e8f0;
+    vertical-align: top;
+  }
+
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:nth-child(even) { background: #f8fafc; }
+
+  .iNum {
+    color: #64748b;
+    font-size: 12px;
+  }
+
+  .iName {
+    font-weight: 700;
+    color: #0f172a;
+  }
+
+  .iMeta {
+    margin-top: 3px;
+    font-size: 11px;
+    color: #64748b;
+    line-height: 1.5;
+  }
+
+  .iAmt { font-weight: 800; }
+
+  .emptyRow td {
+    padding: 28px 14px;
+    text-align: center;
+    color: #64748b;
+    font-size: 13px;
+  }
+
+  .totalsSection {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 28px;
+  }
+
+  .totalsBox { width: 300px; }
+
+  .totalsRow {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 7px 0;
+    font-size: 13px;
+    border-bottom: 1px solid #e2e8f0;
+    gap: 12px;
+  }
+
+  .totalsRow:last-child { border-bottom: none; }
+
+  .totalsKey { color: #64748b; }
+  .totalsVal { font-weight: 800; color: #0f172a; text-align: right; }
+  .totalsValGreen { font-weight: 800; color: #059669; text-align: right; }
+
+  .totalsBalance {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 11px 0 4px;
+    gap: 12px;
+    border-top: 2px solid #e2e8f0;
+    margin-top: 4px;
+  }
+
+  .totalsBalanceKey {
+    font-size: 16px;
+    font-weight: 900;
+    color: #d97706;
+    letter-spacing: -0.2px;
+  }
+
+  .totalsBalanceVal {
+    font-size: 20px;
+    font-weight: 900;
+    color: #d97706;
+    letter-spacing: -0.5px;
+    text-align: right;
+  }
+
+  .footerArea {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 24px;
+    margin-top: 28px;
+    padding-top: 24px;
+    border-top: 1px solid #e2e8f0;
+  }
+
+  .termsBlock { max-width: 52%; }
+
+  .termsTitle {
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: #64748b;
+    margin-bottom: 7px;
+  }
+
+  .termsText {
+    font-size: 12px;
+    color: #334155;
+    line-height: 1.7;
+    white-space: pre-wrap;
+  }
+
+  .sigBlock {
+    text-align: right;
+    flex-shrink: 0;
+  }
+
+  .sigLine {
+    width: 140px;
+    height: 1px;
+    background: #e2e8f0;
+    margin: 36px 0 8px auto;
+  }
+
+  .sigLabel {
+    font-size: 11px;
+    color: #64748b;
+    font-weight: 600;
+  }
+
+  .sigName {
+    font-size: 13px;
+    font-weight: 800;
+    color: #4AA3FF;
+    margin-top: 3px;
+  }
+
+  .sigRow {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-top: 24px;
+    padding-top: 24px;
+    border-top: 1px solid #e2e8f0;
+  }
+
+  .sigCard {
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+
+  .sigCardLabel {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #64748b;
+    margin-bottom: 32px;
+  }
+
+  .sigCardLine {
+    height: 1px;
+    background: #e2e8f0;
+    margin-bottom: 8px;
+  }
+
+  .sigCardMeta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: #64748b;
+  }
+
+  .compactPage .pageInner { padding: 30px 38px 38px; }
+
+  .compactPage .header {
+    padding-bottom: 18px;
+    margin-bottom: 20px;
+  }
+
+  .compactPage .logoFrame,
+  .compactPage .logoFallback {
+    width: 54px;
+    height: 54px;
+    border-radius: 12px;
+  }
+
+  .compactPage .brandBlockLogoOnly .logoFrame {
+    width: 76px;
+    height: 76px;
+    border-radius: 16px;
+  }
+
+  .compactPage .brandName { font-size: 23px; }
+  .compactPage .brandSub { font-size: 11.5px; }
+  .compactPage .docType { font-size: 32px; }
+  .compactPage .infoStrip { margin-bottom: 20px; }
+  .compactPage .infoCol { padding: 13px 15px; }
+  .compactPage tbody td { padding: 10px 12px; }
+  .compactPage thead th { padding: 9px 12px; }
+  .compactPage .tableWrap { margin-bottom: 18px; }
+  .compactPage .totalsSection { margin-bottom: 18px; }
+  .compactPage .footerArea {
+    margin-top: 18px;
+    padding-top: 18px;
+  }
+
+  .brandBlockLogoOnly .logoFrame {
+    width: 92px;
+    height: 92px;
+    border-radius: 18px;
+  }
+
+  .brandBlockLogoOnly .logo {
+    max-width: 100%;
+    max-height: 100%;
+  }
+
+  @media screen and (max-width: 750px) {
+    .wrap { padding: 12px 8px 24px; }
+    .actions, .page { width: 100%; }
+    .pageInner { padding: 24px 20px 36px; }
+    .header { flex-direction: column; gap: 16px; }
+    .brandBlock, .docBlock { max-width: 100%; }
+    .docBlock { text-align: left; }
+    .infoStrip { grid-template-columns: 1fr; }
+    .infoCol { border-right: none; border-bottom: 1px solid #e2e8f0; }
+    .infoCol:last-child { border-bottom: none; }
+    .totalsBox { width: 100%; }
+    .footerArea { flex-direction: column; }
+    .termsBlock { max-width: 100%; }
+    .sigBlock { text-align: left; }
+    .sigLine { margin-left: 0; }
+    .sigRow { grid-template-columns: 1fr; }
+    .docType { font-size: 26px; }
+  }
+
+  @page {
+    size: A4 portrait;
+    margin: 12mm 14mm;
+  }
+
+  @media print {
+    html, body { background: #fff !important; }
+    .actions { display: none !important; }
+    .wrap { padding: 0 !important; }
+    .page {
+      width: 100% !important;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+    }
+    .pageInner { padding: 0 !important; }
+    tbody tr { page-break-inside: avoid; }
+    .footerArea { page-break-inside: avoid; }
+    .sigRow { page-break-inside: avoid; }
+    .totalsSection { page-break-inside: avoid; }
+    .header { page-break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  
+  <div class="actions">
+    <button class="actBtn" onclick="window.history.back()">Back</button>
+    <button class="actBtn primary" onclick="window.print()">Print Receipt</button>
+  </div>
+  <div class="page compactPage">
+    <div class="pageInner">
+      
+  <div class="header">
+    
+    <div class="brandBlock">
+      
+      <div class="logoFrame">
+        <img class="logo" src="https://691b854f8f5b539025eb528c15310d16.r2.cloudflarestorage.com/storvex-private/tenant-assets/d52d93af-63d0-4cad-8055-676e0062bff7/logos/logo-1779646079997.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&amp;X-Amz-Credential=39c55fb87c691af2232424ede2f478fb%2F20260525%2Fauto%2Fs3%2Faws4_request&amp;X-Amz-Date=20260525T055634Z&amp;X-Amz-Expires=300&amp;X-Amz-Signature=306f572aaa6fd7282f6c3218e45985f923c1e3b5a186a21e50568171cc9543a4&amp;X-Amz-SignedHeaders=host&amp;x-amz-checksum-mode=ENABLED&amp;x-id=GetObject" alt="Business logo" />
+      </div>
+      <div>
+        <div class="brandName">Gizmocean</div>
+        <div class="brandSub">
+          <div>Tel: 250788123456</div><div>Email: demo@shop.rw</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="docBlock">
+      <div class="docType">Receipt</div>
+      <div class="docNum"># RCT-2026-000012</div>
+      <div class="docMeta">
+        <div>Date: 24/05/2026</div>
+        
+      </div>
+      <span class="badge" style="background:#fef3c7;color:#92400e;border-color:#fcd34d">PARTIAL</span>
+    </div>
+  </div>
+      
+  <div class="infoStrip">
+    <div class="infoCol">
+      <div class="infoLabel">Billed To</div>
+      <div class="infoName">Bob</div>
+      <div class="infoLine">250788123999</div>
+      
+      
+      
+    </div>
+
+    <div class="infoCol">
+      <div class="infoLabel">Payment</div>
+      <div class="infoLine"><span class="infoKey">Type: </span>CREDIT</div><div class="infoLine"><span class="infoKey">Paid: </span>RWF 150,000</div><div class="infoLine"><span class="infoKey">Balance: </span>RWF 30,000</div>
+    </div>
+
+    <div class="infoCol">
+      <div class="infoLabel">Issued By</div>
+      <div class="infoLine"><span class="infoKey">Cashier: </span>Luc Rurangwa</div><div class="infoLine"><span class="infoKey">Selling location: </span>Kigali Tech Store Main Branch</div>
+    </div>
+  </div>
+      
+  <div class="tableWrap">
+    <table>
+      <thead><tr><th class="c">#</th><th>Product</th><th>SKU</th><th class="c">Qty</th><th class="r">Unit Price</th><th class="r">Subtotal</th></tr></thead>
+      <tbody>
+      <tr>
+        <td class="c iNum">1</td>
+        <td>
+          <div class="iName">Samsung Galaxy A14</div>
+          
+        </td>
+        <td class="iMeta">—</td>
+        <td class="c">1</td>
+        <td class="r">180,000</td>
+        <td class="r iAmt">180,000</td>
+      </tr></tbody>
+    </table>
+  </div>
+      
+  <div class="totalsSection">
+    <div class="totalsBox">
+      
+      <div class="totalsRow">
+        <span class="totalsKey">Subtotal</span>
+        <span class="totalsVal">RWF 180,000</span>
+      </div>
+      
+
+      
+      <div class="totalsRow">
+        <span class="totalsKey">Amount Paid</span>
+        <span class="totalsValGreen">RWF 150,000</span>
+      </div>
+
+      
+      <div class="totalsBalance">
+        <span class="totalsBalanceKey">Balance Due</span>
+        <span class="totalsBalanceVal">RWF 30,000</span>
+      </div>
+    </div>
+  </div>
+      
+      
+  <div class="footerArea">
+    <div class="termsBlock">
+      <div class="termsTitle">Terms &amp; Conditions</div>
+      <div class="termsText">Keep this receipt for support and warranty.</div>
+    </div>
+
+    <div class="sigBlock">
+      <div class="sigLine"></div>
+      <div class="sigLabel">Authorized Signature</div>
+      <div class="sigName">Gizmocean</div>
+    </div>
+  </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

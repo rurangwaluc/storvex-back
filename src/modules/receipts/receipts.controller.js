@@ -3,6 +3,10 @@
 const prisma = require("../../config/database");
 const { renderReceiptHtml } = require("../documents/documentRender.service");
 const { buildTenantDocumentBranding } = require("../documents/documentBranding.service");
+const {
+  parsePagination,
+  buildPaginationMeta,
+} = require("../../lib/pagination");
 
 function cleanString(x) {
   const s = x == null ? "" : String(x).trim();
@@ -161,8 +165,22 @@ function mapReceiptPayload(sale, branding = null) {
 
     saleType: sale.saleType || null,
     status: sale.status || null,
+
+    subtotalAmount: Number(sale.subtotalAmount ?? 0),
+    taxableAmount: Number(sale.taxableAmount ?? 0),
+    taxName: sale.taxName || null,
+    taxMode: sale.taxMode || "NONE",
+    taxDisplayMode: sale.taxDisplayMode || "HIDDEN",
+    taxRateBps: Number(sale.taxRateBps ?? 0),
+    taxAmount: Number(sale.taxAmount ?? 0),
+    pricesIncludeTax: Boolean(sale.pricesIncludeTax),
+    showTaxOnCustomerDocuments: Boolean(sale.showTaxOnCustomerDocuments),
+
     total: Number(sale.total || 0),
-    subtotal: items.reduce((sum, it) => sum + Number(it.subtotal || 0), 0),
+    subtotal: Number(
+      sale.subtotalAmount ??
+        items.reduce((sum, it) => sum + Number(it.subtotal || 0), 0)
+    ),
     amountPaid: Number(sale.amountPaid || 0),
     balanceDue: Number(sale.balanceDue || 0),
     refundedTotal: Number(sale.refundedTotal || 0),
@@ -196,6 +214,8 @@ function mapReceiptPayload(sale, branding = null) {
       receiptFooter: branding?.receiptFooter || sale.tenant?.receiptFooter || null,
       documentPrimaryColor: branding?.documentPrimaryColor || "#0F4C81",
       documentAccentColor: branding?.documentAccentColor || "#E8EEF5",
+      documentHeaderDisplay: branding?.documentHeaderDisplay || "LOGO_AND_NAME",
+      documentSizeMode: branding?.documentSizeMode || "AUTO",
       locationName: location?.name || null,
       locationCode: location?.code || null,
       locationAddress: location?.address || null,
@@ -274,6 +294,15 @@ async function findReceiptSale(tenantId, idOrNumber, scope = null) {
       branchId: true,
       createdAt: true,
       total: true,
+      subtotalAmount: true,
+      taxableAmount: true,
+      taxName: true,
+      taxMode: true,
+      taxDisplayMode: true,
+      taxRateBps: true,
+      taxAmount: true,
+      pricesIncludeTax: true,
+      showTaxOnCustomerDocuments: true,
       amountPaid: true,
       balanceDue: true,
       refundedTotal: true,
@@ -417,6 +446,11 @@ async function listReceipts(req, res) {
     const scope = resolveReceiptBranchScope(req);
     const q = cleanString(req.query.q);
 
+    const pagination = parsePagination(req.query, {
+        defaultLimit: 30,
+        maxLimit: 100,
+      });
+
     const where = applyReceiptBranchScope({ tenantId }, scope);
 
     if (q) {
@@ -430,10 +464,13 @@ async function listReceipts(req, res) {
       ];
     }
 
-    const sales = await prisma.sale.findMany({
+    const [total, sales] = await prisma.$transaction([
+    prisma.sale.count({ where }),
+    prisma.sale.findMany({
       where,
       orderBy: [{ createdAt: "desc" }],
-      take: 200,
+      skip: pagination.skip,
+      take: pagination.limit,
       select: {
         id: true,
         branchId: true,
@@ -441,6 +478,15 @@ async function listReceipts(req, res) {
         invoiceNumber: true,
         createdAt: true,
         total: true,
+        subtotalAmount: true,
+        taxableAmount: true,
+        taxName: true,
+        taxMode: true,
+        taxDisplayMode: true,
+        taxRateBps: true,
+        taxAmount: true,
+        pricesIncludeTax: true,
+        showTaxOnCustomerDocuments: true,
         amountPaid: true,
         balanceDue: true,
         refundedTotal: true,
@@ -468,7 +514,8 @@ async function listReceipts(req, res) {
           },
         },
       },
-    });
+      }),
+    ]);
 
     const receipts = sales.map((sale) => ({
       id: sale.id,
@@ -482,6 +529,15 @@ async function listReceipts(req, res) {
       customerPhone: sale.customer?.phone || null,
       cashierName: sale.cashier?.name || null,
       total: Number(sale.total || 0),
+      subtotalAmount: Number(sale.subtotalAmount ?? 0),
+      taxableAmount: Number(sale.taxableAmount ?? 0),
+      taxName: sale.taxName || null,
+      taxMode: sale.taxMode || "NONE",
+      taxDisplayMode: sale.taxDisplayMode || "HIDDEN",
+      taxRateBps: Number(sale.taxRateBps ?? 0),
+      taxAmount: Number(sale.taxAmount ?? 0),
+      pricesIncludeTax: Boolean(sale.pricesIncludeTax),
+      showTaxOnCustomerDocuments: Boolean(sale.showTaxOnCustomerDocuments),
       amountPaid: Number(sale.amountPaid || 0),
       balanceDue: Number(sale.balanceDue || 0),
       refundedTotal: Number(sale.refundedTotal || 0),
@@ -493,6 +549,11 @@ async function listReceipts(req, res) {
     return res.json({
       receipts,
       count: receipts.length,
+      pagination: buildPaginationMeta({
+        page: pagination.page,
+        limit: pagination.limit,
+        total,
+      }),
       branchScope: scope,
     });
   } catch (err) {
@@ -572,6 +633,8 @@ async function printReceiptHtml(req, res) {
         receiptFooter: branding?.receiptFooter || payload.store?.receiptFooter || null,
         documentPrimaryColor: branding?.documentPrimaryColor || "#0F4C81",
         documentAccentColor: branding?.documentAccentColor || "#E8EEF5",
+        documentHeaderDisplay: branding?.documentHeaderDisplay || "LOGO_AND_NAME",
+        documentSizeMode: branding?.documentSizeMode || "AUTO",
         invoiceTerms: branding?.invoiceTerms || null,
         warrantyTerms: branding?.warrantyTerms || null,
         proformaTerms: branding?.proformaTerms || null,
@@ -599,11 +662,20 @@ async function printReceiptHtml(req, res) {
         total: it.subtotal,
       })),
       totals: {
+        currency: "RWF",
+        subtotalAmount: payload.subtotalAmount,
+        taxableAmount: payload.taxableAmount,
+        taxName: payload.taxName,
+        taxMode: payload.taxMode,
+        taxDisplayMode: payload.taxDisplayMode,
+        taxRateBps: payload.taxRateBps,
+        taxAmount: payload.taxAmount,
+        pricesIncludeTax: payload.pricesIncludeTax,
+        showTaxOnCustomerDocuments: payload.showTaxOnCustomerDocuments,
         subtotal: payload.subtotal,
         total: payload.total,
         amountPaid: payload.amountPaid,
         balanceDue: payload.balanceDue,
-        currency: "RWF",
       },
       extra: {
         cashier: payload.cashierName,

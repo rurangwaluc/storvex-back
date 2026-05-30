@@ -3,6 +3,10 @@
 const prisma = require("../../config/database");
 const { renderInvoiceHtml } = require("../documents/documentRender.service");
 const { buildTenantDocumentBranding } = require("../documents/documentBranding.service");
+const {
+  parsePagination,
+  buildPaginationMeta,
+} = require("../../lib/pagination");
 
 function getTenantId(req) {
   return req.user?.tenantId || null;
@@ -133,6 +137,22 @@ function serializeLocation(branch, branding = null) {
     : null;
 }
 
+function taxSaleSelectFields() {
+  return {
+    ...(hasField(prisma.sale, "subtotalAmount") ? { subtotalAmount: true } : {}),
+    ...(hasField(prisma.sale, "taxableAmount") ? { taxableAmount: true } : {}),
+    ...(hasField(prisma.sale, "taxAmount") ? { taxAmount: true } : {}),
+    ...(hasField(prisma.sale, "taxName") ? { taxName: true } : {}),
+    ...(hasField(prisma.sale, "taxMode") ? { taxMode: true } : {}),
+    ...(hasField(prisma.sale, "taxDisplayMode") ? { taxDisplayMode: true } : {}),
+    ...(hasField(prisma.sale, "taxRateBps") ? { taxRateBps: true } : {}),
+    ...(hasField(prisma.sale, "pricesIncludeTax") ? { pricesIncludeTax: true } : {}),
+    ...(hasField(prisma.sale, "showTaxOnCustomerDocuments")
+      ? { showTaxOnCustomerDocuments: true }
+      : {}),
+  };
+}
+
 function saleSelect() {
   return {
     id: true,
@@ -150,6 +170,7 @@ function saleSelect() {
     ...(hasField(prisma.sale, "isCancelled") ? { isCancelled: true } : {}),
     ...(hasField(prisma.sale, "cancelledAt") ? { cancelledAt: true } : {}),
     ...(hasField(prisma.sale, "cancelNote") ? { cancelNote: true } : {}),
+    ...taxSaleSelectFields(),
     ...(hasField(prisma.sale, "branchId")
       ? {
           branch: {
@@ -203,6 +224,73 @@ function saleSelectWithItems() {
   };
 }
 
+function saleItemSubtotal(items = []) {
+  return Array.isArray(items)
+    ? items.reduce((sum, item) => sum + Number(item.total || 0), 0)
+    : 0;
+}
+
+function resolveSubtotalAmount(sale, itemSubtotal) {
+  const storedSubtotal = toMoneyNumber(sale?.subtotalAmount);
+
+  if (storedSubtotal > 0) return storedSubtotal;
+  if (itemSubtotal > 0) return itemSubtotal;
+
+  return toMoneyNumber(sale?.total);
+}
+
+function resolveTaxableAmount(sale, subtotal) {
+  const storedTaxable = toMoneyNumber(sale?.taxableAmount);
+
+  if (storedTaxable > 0) return storedTaxable;
+
+  const taxAmount = toMoneyNumber(sale?.taxAmount);
+
+  if (Boolean(sale?.pricesIncludeTax) && taxAmount > 0 && subtotal > taxAmount) {
+    return subtotal - taxAmount;
+  }
+
+  return subtotal;
+}
+
+function resolveTaxName(sale) {
+  const taxName = cleanString(sale?.taxName);
+  if (taxName) return taxName;
+
+  const mode = String(sale?.taxMode || "NONE").toUpperCase();
+
+  if (mode === "VAT_18") return "VAT 18% included";
+  if (mode === "TURNOVER_3_INTERNAL") return "Turnover tax estimate 3% included";
+  if (mode === "VAT_18_PLUS_TURNOVER_3") return "Tax 21% included";
+  if (mode === "CUSTOM") return "Tax included";
+
+  return null;
+}
+
+function saleTaxSnapshotForPrint(sale, itemSubtotal) {
+  const subtotalAmount = resolveSubtotalAmount(sale, itemSubtotal);
+  const taxableAmount = resolveTaxableAmount(sale, subtotalAmount);
+  const taxMode = sale?.taxMode || "NONE";
+  const taxAmount = toMoneyNumber(sale?.taxAmount);
+
+  return {
+    currency: "RWF",
+    subtotalAmount,
+    taxableAmount,
+    taxName: resolveTaxName(sale),
+    taxMode,
+    taxDisplayMode: sale?.taxDisplayMode || "HIDDEN",
+    taxRateBps: Number(sale?.taxRateBps ?? 0),
+    taxAmount,
+    pricesIncludeTax: Boolean(sale?.pricesIncludeTax),
+    showTaxOnCustomerDocuments: Boolean(sale?.showTaxOnCustomerDocuments),
+    subtotal: subtotalAmount,
+    total: toMoneyNumber(sale?.total) || subtotalAmount,
+    amountPaid: toMoneyNumber(sale?.amountPaid),
+    balanceDue: toMoneyNumber(sale?.balanceDue),
+  };
+}
+
 function mapSaleToInvoiceListRow(sale) {
   return {
     id: sale.id,
@@ -223,6 +311,13 @@ function mapSaleToInvoiceListRow(sale) {
     dueDate: sale.dueDate || null,
     isCancelled: Boolean(sale.isCancelled),
     createdAt: sale.createdAt || null,
+    taxName: resolveTaxName(sale),
+    taxMode: sale.taxMode || "NONE",
+    taxDisplayMode: sale.taxDisplayMode || "HIDDEN",
+    taxRateBps: Number(sale.taxRateBps ?? 0),
+    taxAmount: toMoneyNumber(sale.taxAmount),
+    pricesIncludeTax: Boolean(sale.pricesIncludeTax),
+    showTaxOnCustomerDocuments: Boolean(sale.showTaxOnCustomerDocuments),
   };
 }
 
@@ -248,7 +343,8 @@ function mapSaleToInvoiceDetail(sale, branding) {
       })
     : [];
 
-  const subtotal = items.reduce((sum, item) => sum + Number(item.total || 0), 0);
+  const itemSubtotal = saleItemSubtotal(items);
+  const totals = saleTaxSnapshotForPrint(sale, itemSubtotal);
 
   return {
     invoice: {
@@ -261,10 +357,19 @@ function mapSaleToInvoiceDetail(sale, branding) {
       createdAt: sale.createdAt || null,
       saleType: sale.saleType || "CASH",
       status: sale.status || null,
-      total: toMoneyNumber(sale.total),
-      subtotal,
-      amountPaid: toMoneyNumber(sale.amountPaid),
-      balanceDue: toMoneyNumber(sale.balanceDue),
+      total: totals.total,
+      subtotal: totals.subtotal,
+      subtotalAmount: totals.subtotalAmount,
+      taxableAmount: totals.taxableAmount,
+      taxName: totals.taxName,
+      taxMode: totals.taxMode,
+      taxDisplayMode: totals.taxDisplayMode,
+      taxRateBps: totals.taxRateBps,
+      taxAmount: totals.taxAmount,
+      pricesIncludeTax: totals.pricesIncludeTax,
+      showTaxOnCustomerDocuments: totals.showTaxOnCustomerDocuments,
+      amountPaid: totals.amountPaid,
+      balanceDue: totals.balanceDue,
       refundedTotal: toMoneyNumber(sale.refundedTotal),
       dueDate: sale.dueDate || null,
       isCancelled: Boolean(sale.isCancelled),
@@ -292,6 +397,8 @@ function mapSaleToInvoiceDetail(sale, branding) {
             receiptFooter: branding.receiptFooter || null,
             documentPrimaryColor: branding.documentPrimaryColor || "#1F365C",
             documentAccentColor: branding.documentAccentColor || "#D8D2C2",
+            documentHeaderDisplay: branding.documentHeaderDisplay || "LOGO_AND_NAME",
+            documentSizeMode: branding.documentSizeMode || "AUTO",
             invoiceTerms: branding.invoiceTerms || null,
             warrantyTerms: branding.warrantyTerms || null,
             proformaTerms: branding.proformaTerms || null,
@@ -317,13 +424,17 @@ async function listInvoices(req, res) {
 
     const scope = resolveInvoiceBranchScope(req);
     const q = cleanString(req.query.q);
+    const pagination = parsePagination(req.query, {
+      defaultLimit: 30,
+      maxLimit: 100,
+    });
 
     const where = applyInvoiceBranchScope(
       {
         tenantId,
         ...saleDraftWhereFalse(),
       },
-      scope
+      scope,
     );
 
     if (q) {
@@ -341,16 +452,25 @@ async function listInvoices(req, res) {
       ];
     }
 
-    const rows = await prisma.sale.findMany({
-      where,
-      orderBy: hasField(prisma.sale, "createdAt") ? [{ createdAt: "desc" }] : [{ id: "desc" }],
-      take: 200,
-      select: saleSelect(),
-    });
+    const [total, rows] = await prisma.$transaction([
+      prisma.sale.count({ where }),
+      prisma.sale.findMany({
+        where,
+        orderBy: hasField(prisma.sale, "createdAt") ? [{ createdAt: "desc" }] : [{ id: "desc" }],
+        skip: pagination.skip,
+        take: pagination.limit,
+        select: saleSelect(),
+      }),
+    ]);
 
     return res.json({
       invoices: rows.map(mapSaleToInvoiceListRow),
       count: rows.length,
+      pagination: buildPaginationMeta({
+        page: pagination.page,
+        limit: pagination.limit,
+        total,
+      }),
       branchScope: scope,
     });
   } catch (err) {
@@ -385,7 +505,7 @@ async function getInvoice(req, res) {
           ...saleDraftWhereFalse(),
           OR: [{ id }, ...(hasField(prisma.sale, "invoiceNumber") ? [{ invoiceNumber: id }] : [])],
         },
-        scope
+        scope,
       ),
       select: saleSelectWithItems(),
     });
@@ -432,7 +552,7 @@ async function printInvoiceHtml(req, res) {
           ...saleDraftWhereFalse(),
           OR: [{ id }, ...(hasField(prisma.sale, "invoiceNumber") ? [{ invoiceNumber: id }] : [])],
         },
-        scope
+        scope,
       ),
       select: saleSelectWithItems(),
     });
@@ -459,7 +579,9 @@ async function printInvoiceHtml(req, res) {
       };
     });
 
-    const subtotal = items.reduce((sum, item) => sum + Number(item.total || 0), 0);
+    const itemSubtotal = saleItemSubtotal(items);
+    const printTotals = saleTaxSnapshotForPrint(sale, itemSubtotal);
+
     const sellingLocation =
       branding?.sellingLocation ||
       branding?.storeLocation ||
@@ -478,6 +600,8 @@ async function printInvoiceHtml(req, res) {
         receiptFooter: branding?.receiptFooter || null,
         documentPrimaryColor: branding?.documentPrimaryColor || "#1F365C",
         documentAccentColor: branding?.documentAccentColor || "#D8D2C2",
+        documentHeaderDisplay: branding?.documentHeaderDisplay || "LOGO_AND_NAME",
+        documentSizeMode: branding?.documentSizeMode || "AUTO",
         invoiceTerms: branding?.invoiceTerms || null,
         warrantyTerms: branding?.warrantyTerms || null,
         proformaTerms: branding?.proformaTerms || null,
@@ -507,13 +631,7 @@ async function printInvoiceHtml(req, res) {
             address: null,
           },
       items,
-      totals: {
-        currency: "RWF",
-        subtotal,
-        total: toMoneyNumber(sale.total),
-        amountPaid: toMoneyNumber(sale.amountPaid),
-        balanceDue: toMoneyNumber(sale.balanceDue),
-      },
+      totals: printTotals,
       extra: {
         cashier: sale.cashier?.name || "",
         status: sale.status || "INVOICE",

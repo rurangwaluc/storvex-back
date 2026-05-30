@@ -47,6 +47,18 @@ const securityRoutes = require("./modules/settings/security.routes");
 
 const platformRoutes = require("./modules/platform/platform.routes");
 const platformAuthRoutes = require("./modules/platform/platform.auth.routes");
+const platformTenantRoutes = require("./modules/platform/platform.tenants.routes");
+const platformUsersRoutes = require("./modules/platform/platform.users.routes");
+const platformAuditRoutes = require("./modules/platform/platform.audit.routes");
+const platformBillingRoutes = require("./modules/platform/platform.billing.routes");
+const platformSupportRoutes = require("./modules/platform/platform.support.routes");
+const platformSupportAttachmentsRoutes = require("./modules/supportTickets/platformSupportAttachments.routes");
+
+const supportTicketsRoutes = require("./modules/supportTickets/supportTickets.routes");
+const platformSupportTicketsRoutes = require("./modules/supportTickets/platformSupportTickets.routes");
+const supportAttachmentsRoutes = require("./modules/supportTickets/supportAttachments.routes");
+
+
 
 const app = express();
 
@@ -78,8 +90,18 @@ app.use("/api/auth", authRoutes);
 app.use("/api/auth/permissions", permissionsRoutes);
 
 // Platform
-app.use("/api/platform", platformRoutes);
+// Specific platform routes must be mounted before the broad /api/platform route.
+// Otherwise /api/platform can catch /api/platform/users before platformUsersRoutes runs.
 app.use("/api/platform/auth", platformAuthRoutes);
+app.use("/api/platform/audit", platformAuditRoutes);
+app.use("/api/platform/tenants", platformTenantRoutes);
+app.use("/api/platform/users", platformUsersRoutes);
+app.use("/api/platform/billing", platformBillingRoutes);
+app.use("/api/platform/support", platformSupportRoutes);
+app.use("/api/platform/support/tickets", platformSupportTicketsRoutes);
+app.use("/api/platform/support/attachments", platformSupportAttachmentsRoutes);
+app.use("/api/support/attachments", supportAttachmentsRoutes);
+app.use("/api/platform", platformRoutes);
 
 // Tenant / workspace-level modules
 app.use("/api/tenants", tenantRoutes);
@@ -90,6 +112,13 @@ app.use("/api/expenses", expenseRoutes);
 app.use("/api/billing", billingRoutes);
 app.use("/api/suppliers", supplierRoutes);
 app.use("/api/branches", branchesRoutes);
+
+app.use(
+  "/api/support/tickets",
+  authenticate,
+  requireTenant,
+  supportTicketsRoutes
+);
 
 // Store module
 // Auth + tenant + active subscription at mount level.

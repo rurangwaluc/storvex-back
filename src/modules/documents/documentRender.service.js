@@ -14,6 +14,10 @@ function cleanStr(value) {
   return s || "";
 }
 
+function oneLine(value) {
+  return cleanStr(value).replace(/\s+/g, " ");
+}
+
 function normalizeHexColor(input, fallback = "#1a56db") {
   const value = cleanStr(input);
   if (!value) return fallback;
@@ -53,7 +57,10 @@ function rgba(hex, alpha = 1) {
 }
 
 function money(value, currency = "RWF") {
-  return `${currency} ${Number(value || 0).toLocaleString()}`;
+  const safeCurrency = oneLine(currency || "RWF");
+  const amount = Number(value || 0);
+
+  return `${safeCurrency} ${Number.isFinite(amount) ? amount.toLocaleString() : "0"}`;
 }
 
 function fmtDate(value) {
@@ -94,28 +101,33 @@ function fmtDateTime(value) {
   }
 }
 
+function toSafeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function hasOwnValue(obj, key) {
+  return obj && Object.prototype.hasOwnProperty.call(obj, key) && obj[key] !== undefined;
+}
+
 function getLocationName(payload = {}) {
-  return cleanStr(
+  return oneLine(
     payload.sellingLocation ||
       payload.storeLocation ||
       payload.locationName ||
       payload.location ||
       payload.branchName ||
       payload.branch ||
-      ""
+      "",
   );
 }
 
-function getLocationCode(payload = {}) {
-  return cleanStr(payload.locationCode || payload.storeCode || payload.branchCode || "");
-}
-
 function getLocationLabel(extra = {}) {
-  return cleanStr(extra.locationLabel || "Selling location");
+  return oneLine(extra.locationLabel || "Selling location");
 }
 
 function sanitizeInfoKey(key) {
-  const normalized = cleanStr(key);
+  const normalized = oneLine(key);
 
   if (!normalized) return "";
 
@@ -140,9 +152,9 @@ function normalizeInfoRows(rows = []) {
       if (!Array.isArray(row)) return null;
 
       const key = sanitizeInfoKey(row[0]);
-      const value = row[1];
+      const value = oneLine(row[1]);
 
-      if (!key || value === undefined || value === null || value === "") return null;
+      if (!key || !value) return null;
 
       return [key, value];
     })
@@ -158,10 +170,10 @@ function normalizeItems(items = []) {
     const total = Number(item.total ?? quantity * unitPrice);
 
     return {
-      productName: cleanStr(item.productName || item.name || item.product || "—"),
-      serial: cleanStr(item.serial || item.imei1 || ""),
-      sku: cleanStr(item.sku || ""),
-      barcode: cleanStr(item.barcode || ""),
+      productName: oneLine(item.productName || item.name || item.product || "—"),
+      serial: oneLine(item.serial || item.imei1 || ""),
+      sku: oneLine(item.sku || ""),
+      barcode: oneLine(item.barcode || ""),
       quantity,
       unitPrice,
       total,
@@ -169,13 +181,229 @@ function normalizeItems(items = []) {
   });
 }
 
-function computeTotals(items = [], provided = {}, fallbackCurrency = "RWF") {
+function normalizeHeaderDisplay(value) {
+  const mode = cleanStr(value || "LOGO_AND_NAME").toUpperCase();
+
+  if (mode === "LOGO_ONLY") return "LOGO_ONLY";
+  if (mode === "NAME_ONLY") return "NAME_ONLY";
+
+  return "LOGO_AND_NAME";
+}
+
+function normalizeDocumentSizeMode(value) {
+  const mode = cleanStr(value || "AUTO").toUpperCase();
+
+  if (mode === "COMPACT") return "COMPACT";
+  if (mode === "STANDARD") return "STANDARD";
+
+  return "AUTO";
+}
+
+function resolveDocumentSizeMode(tenant = {}, items = []) {
+  const mode = normalizeDocumentSizeMode(tenant.documentSizeMode);
+
+  if (mode !== "AUTO") return mode;
+
+  return Array.isArray(items) && items.length <= 3 ? "COMPACT" : "STANDARD";
+}
+
+function normalizeTaxMode(value) {
+  const mode = cleanStr(value || "NONE").toUpperCase();
+
+  if (
+    mode === "NONE" ||
+    mode === "VAT_18" ||
+    mode === "TURNOVER_3_INTERNAL" ||
+    mode === "VAT_18_PLUS_TURNOVER_3" ||
+    mode === "CUSTOM"
+  ) {
+    return mode;
+  }
+
+  return "NONE";
+}
+
+function normalizeTaxDisplayMode(value) {
+  const mode = cleanStr(value || "HIDDEN").toUpperCase();
+
+  if (mode === "HIDDEN" || mode === "CUSTOMER_FACING" || mode === "INTERNAL_ONLY") {
+    return mode;
+  }
+
+  return "HIDDEN";
+}
+
+function defaultTaxRateBps(mode, fallback = 0) {
+  if (mode === "VAT_18") return 1800;
+  if (mode === "TURNOVER_3_INTERNAL") return 300;
+  if (mode === "VAT_18_PLUS_TURNOVER_3") return 2100;
+
+  return Number(fallback || 0);
+}
+
+function defaultTaxName(mode, fallback = "") {
+  const cleanFallback = oneLine(fallback);
+  if (cleanFallback) return cleanFallback;
+
+  if (mode === "VAT_18") return "VAT 18% included";
+  if (mode === "TURNOVER_3_INTERNAL") return "Turnover tax estimate 3% included";
+  if (mode === "VAT_18_PLUS_TURNOVER_3") return "Tax 21% included";
+  if (mode === "CUSTOM") return "Tax included";
+
+  return "";
+}
+
+function clampRateBps(value, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(10000, Math.floor(n)));
+}
+
+function resolveTaxSettings(tenant = {}, provided = {}) {
+  const taxMode = normalizeTaxMode(provided.taxMode || tenant.taxMode);
+  const taxDisplayMode = normalizeTaxDisplayMode(
+    provided.taxDisplayMode || tenant.taxDisplayMode,
+  );
+
+  const explicitRate = Number(
+    provided.taxRateBps ?? tenant.taxRateBps ?? defaultTaxRateBps(taxMode, 0),
+  );
+
+  const rateBps = Number.isFinite(explicitRate)
+    ? Math.max(0, Math.min(10000, Math.floor(explicitRate)))
+    : 0;
+
+  const showTaxOnCustomerDocuments = Boolean(
+    provided.showTaxOnCustomerDocuments ?? tenant.showTaxOnCustomerDocuments,
+  );
+
+  const customerFacing =
+    taxDisplayMode === "CUSTOMER_FACING" &&
+    showTaxOnCustomerDocuments &&
+    taxMode !== "NONE" &&
+    rateBps > 0;
+
+  return {
+    taxMode,
+    taxDisplayMode,
+    taxName: defaultTaxName(taxMode, oneLine(provided.taxName || tenant.taxName)),
+    taxRateBps: rateBps,
+    pricesIncludeTax: Boolean(provided.pricesIncludeTax ?? tenant.pricesIncludeTax),
+    showTaxOnCustomerDocuments,
+    customerFacing,
+  };
+}
+
+function hasStoredSaleTaxSnapshot(provided = {}) {
+  return (
+    hasOwnValue(provided, "subtotalAmount") ||
+    hasOwnValue(provided, "taxableAmount") ||
+    hasOwnValue(provided, "taxAmount") ||
+    hasOwnValue(provided, "taxMode") ||
+    hasOwnValue(provided, "taxDisplayMode") ||
+    hasOwnValue(provided, "taxRateBps") ||
+    hasOwnValue(provided, "pricesIncludeTax") ||
+    hasOwnValue(provided, "showTaxOnCustomerDocuments")
+  );
+}
+
+function computeTotalsFromSaleSnapshot(items = [], provided = {}, fallbackCurrency = "RWF") {
+  const itemSubtotal = items.reduce((sum, item) => sum + Number(item.total || 0), 0);
+
+  const taxMode = normalizeTaxMode(provided.taxMode);
+  const taxDisplayMode = normalizeTaxDisplayMode(provided.taxDisplayMode);
+  const taxRateBps = clampRateBps(provided.taxRateBps, defaultTaxRateBps(taxMode, 0));
+  const taxAmount = toSafeNumber(provided.taxAmount, 0);
+
+  const storedSubtotal = hasOwnValue(provided, "subtotalAmount")
+    ? toSafeNumber(provided.subtotalAmount, 0)
+    : null;
+
+  const providedSubtotal = hasOwnValue(provided, "subtotal")
+    ? toSafeNumber(provided.subtotal, itemSubtotal)
+    : null;
+
+  const subtotal =
+    storedSubtotal && storedSubtotal > 0
+      ? storedSubtotal
+      : providedSubtotal && providedSubtotal > 0
+        ? providedSubtotal
+        : itemSubtotal > 0
+          ? itemSubtotal
+          : storedSubtotal ?? providedSubtotal ?? 0;
+
+  const taxableSubtotal = hasOwnValue(provided, "taxableAmount")
+    ? toSafeNumber(provided.taxableAmount, subtotal)
+    : provided.pricesIncludeTax
+      ? Math.max(0, subtotal - taxAmount)
+      : subtotal;
+
+  const total = hasOwnValue(provided, "total")
+    ? toSafeNumber(provided.total, subtotal + taxAmount)
+    : provided.pricesIncludeTax
+      ? subtotal
+      : subtotal + taxAmount;
+
+  const amountPaid = toSafeNumber(provided.amountPaid, 0);
+
+  const balanceDue = hasOwnValue(provided, "balanceDue")
+    ? toSafeNumber(provided.balanceDue, Math.max(0, total - amountPaid))
+    : Math.max(0, total - amountPaid);
+
+  const showTaxOnCustomerDocuments = Boolean(provided.showTaxOnCustomerDocuments);
+  const showTaxLine = taxMode !== "NONE" && taxAmount > 0;
+
+  return {
+    currency: oneLine(provided.currency || fallbackCurrency || "RWF"),
+    subtotal,
+    taxableSubtotal,
+    taxAmount,
+    taxName: defaultTaxName(taxMode, provided.taxName),
+    taxRateBps,
+    taxMode,
+    taxDisplayMode,
+    pricesIncludeTax: Boolean(provided.pricesIncludeTax),
+    showTaxOnCustomerDocuments,
+    showTaxLine,
+    total,
+    amountPaid,
+    balanceDue,
+  };
+}
+
+function computeTotals(items = [], provided = {}, fallbackCurrency = "RWF", tenant = {}) {
+  if (hasStoredSaleTaxSnapshot(provided)) {
+    return computeTotalsFromSaleSnapshot(items, provided, fallbackCurrency);
+  }
+
   const subtotal =
     provided.subtotal != null
       ? Number(provided.subtotal || 0)
       : items.reduce((sum, item) => sum + Number(item.total || 0), 0);
 
-  const total = provided.total != null ? Number(provided.total || 0) : subtotal;
+  const taxSettings = resolveTaxSettings(tenant, provided);
+
+  let taxableSubtotal = subtotal;
+  let taxAmount = 0;
+
+  if (taxSettings.customerFacing) {
+    if (taxSettings.pricesIncludeTax) {
+      taxAmount = Math.round(
+        (subtotal * taxSettings.taxRateBps) / (10000 + taxSettings.taxRateBps),
+      );
+      taxableSubtotal = Math.max(0, subtotal - taxAmount);
+    } else {
+      taxAmount = Math.round((subtotal * taxSettings.taxRateBps) / 10000);
+    }
+  }
+
+  const computedTotal = taxSettings.customerFacing
+    ? taxSettings.pricesIncludeTax
+      ? subtotal
+      : subtotal + taxAmount
+    : subtotal;
+
+  const total = provided.total != null ? Number(provided.total || 0) : computedTotal;
   const amountPaid = Number(provided.amountPaid || 0);
 
   const balanceDue =
@@ -184,8 +412,17 @@ function computeTotals(items = [], provided = {}, fallbackCurrency = "RWF") {
       : Math.max(0, total - amountPaid);
 
   return {
-    currency: cleanStr(provided.currency || fallbackCurrency || "RWF"),
+    currency: oneLine(provided.currency || fallbackCurrency || "RWF"),
     subtotal,
+    taxableSubtotal,
+    taxAmount,
+    taxName: taxSettings.taxName,
+    taxRateBps: taxSettings.taxRateBps,
+    taxMode: taxSettings.taxMode,
+    taxDisplayMode: taxSettings.taxDisplayMode,
+    pricesIncludeTax: taxSettings.pricesIncludeTax,
+    showTaxOnCustomerDocuments: taxSettings.showTaxOnCustomerDocuments,
+    showTaxLine: Number(taxAmount || 0) > 0 && taxSettings.taxMode !== "NONE",
     total,
     amountPaid,
     balanceDue,
@@ -195,7 +432,7 @@ function computeTotals(items = [], provided = {}, fallbackCurrency = "RWF") {
 function resolveBrandTheme(tenant = {}, overrides = {}) {
   const primary = normalizeHexColor(
     overrides.primaryColor || tenant.documentPrimaryColor || tenant.brandColor,
-    "#1a56db"
+    "#1a56db",
   );
 
   return {
@@ -219,17 +456,65 @@ function resolveBrandTheme(tenant = {}, overrides = {}) {
 }
 
 function logoHtml(tenant, theme) {
-  if (tenant?.logoSignedUrl) {
-    return `<img class="logo" src="${esc(tenant.logoSignedUrl)}" alt="Logo" />`;
-  }
+  const logoUrl = tenant?.logoSignedUrl || tenant?.logoUrl;
 
-  if (tenant?.logoUrl) {
-    return `<img class="logo" src="${esc(tenant.logoUrl)}" alt="Logo" />`;
+  if (logoUrl) {
+    return `
+      <div class="logoFrame">
+        <img class="logo" src="${esc(logoUrl)}" alt="Business logo" />
+      </div>`;
   }
 
   const letter = cleanStr(tenant?.name || "S").charAt(0).toUpperCase() || "S";
 
   return `<div class="logoFallback" style="background:${theme.primary}">${esc(letter)}</div>`;
+}
+
+function renderBrandContactLines(tenant) {
+  const lines = [];
+
+  if (tenant?.receiptHeader) lines.push(tenant.receiptHeader);
+  if (tenant?.address) lines.push(tenant.address);
+  if (tenant?.phone) lines.push(`Tel: ${tenant.phone}`);
+  if (tenant?.email) lines.push(`Email: ${tenant.email}`);
+  if (tenant?.tin) lines.push(`TIN: ${tenant.tin}`);
+
+  return lines.map((line) => `<div>${esc(oneLine(line))}</div>`).join("");
+}
+
+function renderBrandIdentity(tenant, theme) {
+  const display = normalizeHeaderDisplay(tenant?.documentHeaderDisplay);
+  const hasLogo = Boolean(tenant?.logoSignedUrl || tenant?.logoUrl);
+
+  if (display === "LOGO_ONLY" && hasLogo) {
+    return `
+      <div class="brandBlock brandBlockLogoOnly">
+        ${logoHtml(tenant, theme)}
+      </div>`;
+  }
+
+  if (display === "NAME_ONLY") {
+    return `
+      <div class="brandBlock">
+        <div>
+          <div class="brandName">${esc(oneLine(tenant?.name || "Business"))}</div>
+          <div class="brandSub">
+            ${renderBrandContactLines(tenant)}
+          </div>
+        </div>
+      </div>`;
+  }
+
+  return `
+    <div class="brandBlock">
+      ${logoHtml(tenant, theme)}
+      <div>
+        <div class="brandName">${esc(oneLine(tenant?.name || "Business"))}</div>
+        <div class="brandSub">
+          ${renderBrandContactLines(tenant)}
+        </div>
+      </div>
+    </div>`;
 }
 
 function badgeHtml(status, theme) {
@@ -244,7 +529,9 @@ function badgeHtml(status, theme) {
     bg = "#d1fae5";
     color = "#065f46";
     border = "#6ee7b7";
-  } else if (["PARTIAL", "PARTIALLY PAID", "DRAFT", "PENDING", "PROFORMA", "INVOICE"].includes(value)) {
+  } else if (
+    ["PARTIAL", "PARTIALLY PAID", "DRAFT", "PENDING", "PROFORMA", "INVOICE"].includes(value)
+  ) {
     bg = "#fef3c7";
     color = "#92400e";
     border = "#fcd34d";
@@ -333,26 +620,44 @@ function buildStyles(theme) {
     align-items: flex-start;
     gap: 14px;
     min-width: 0;
+    max-width: 56%;
+  }
+
+  .brandBlockLogoOnly { max-width: 44%; }
+
+  .logoFrame {
+    width: 64px;
+    height: 64px;
+    flex-shrink: 0;
+    border-radius: 14px;
+    border: 1px solid ${theme.line};
+    background: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    padding: 6px;
   }
 
   .logo {
-    width: 52px;
-    height: 52px;
-    border-radius: 12px;
-    object-fit: cover;
-    flex-shrink: 0;
-    border: 1px solid ${theme.line};
+    display: block;
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    object-position: center;
   }
 
   .logoFallback {
-    width: 52px;
-    height: 52px;
-    border-radius: 12px;
+    width: 64px;
+    height: 64px;
+    border-radius: 14px;
     display: flex;
     align-items: center;
     justify-content: center;
     color: #fff;
-    font-size: 20px;
+    font-size: 22px;
     font-weight: 900;
     flex-shrink: 0;
   }
@@ -363,10 +668,11 @@ function buildStyles(theme) {
     letter-spacing: -0.5px;
     color: ${theme.primary};
     line-height: 1.1;
+    overflow-wrap: anywhere;
   }
 
   .brandSub {
-    margin-top: 3px;
+    margin-top: 5px;
     font-size: 12px;
     color: ${theme.muted};
     line-height: 1.5;
@@ -377,6 +683,7 @@ function buildStyles(theme) {
   .docBlock {
     text-align: right;
     flex-shrink: 0;
+    max-width: 40%;
   }
 
   .docType {
@@ -386,6 +693,7 @@ function buildStyles(theme) {
     text-transform: uppercase;
     color: ${theme.ink};
     line-height: 1;
+    white-space: nowrap;
   }
 
   .docNum {
@@ -393,6 +701,7 @@ function buildStyles(theme) {
     font-size: 14px;
     font-weight: 700;
     color: ${theme.primary};
+    overflow-wrap: anywhere;
   }
 
   .docMeta {
@@ -428,6 +737,7 @@ function buildStyles(theme) {
   .infoCol {
     padding: 16px 18px;
     border-right: 1px solid ${theme.line};
+    min-width: 0;
   }
 
   .infoCol:last-child { border-right: none; }
@@ -445,14 +755,36 @@ function buildStyles(theme) {
     font-size: 15px;
     font-weight: 800;
     color: ${theme.ink};
-    margin-bottom: 4px;
+    margin-bottom: 7px;
     line-height: 1.3;
+    overflow-wrap: anywhere;
   }
 
   .infoLine {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+    padding: 4px 0;
     font-size: 12.5px;
     color: ${theme.inkSoft};
-    line-height: 1.6;
+    line-height: 1.45;
+  }
+
+  .infoKey {
+    display: block;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #94a3b8;
+    white-space: nowrap;
+  }
+
+  .infoValue {
+    display: block;
+    font-weight: 700;
+    color: ${theme.inkSoft};
+    overflow-wrap: break-word;
   }
 
   .tableWrap {
@@ -526,30 +858,54 @@ function buildStyles(theme) {
     margin-bottom: 28px;
   }
 
-  .totalsBox { width: 280px; }
+  .totalsBox {
+    width: 430px;
+    max-width: 100%;
+  }
 
   .totalsRow {
-    display: flex;
-    justify-content: space-between;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
     align-items: center;
+    column-gap: 18px;
     padding: 7px 0;
     font-size: 13px;
     border-bottom: 1px solid ${theme.line};
-    gap: 12px;
   }
 
   .totalsRow:last-child { border-bottom: none; }
 
-  .totalsKey { color: ${theme.muted}; }
-  .totalsVal { font-weight: 800; color: ${theme.ink}; }
-  .totalsValGreen { font-weight: 800; color: ${theme.green}; }
+  .totalsBox > .totalsRow:nth-last-child(2) {
+    border-bottom: none;
+  }
+
+  .totalsKey {
+    color: ${theme.muted};
+    white-space: nowrap;
+    overflow: visible;
+    text-overflow: clip;
+  }
+
+  .totalsVal {
+    font-weight: 800;
+    color: ${theme.ink};
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  .totalsValGreen {
+    font-weight: 800;
+    color: ${theme.green};
+    text-align: right;
+    white-space: nowrap;
+  }
 
   .totalsBalance {
-    display: flex;
-    justify-content: space-between;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
     align-items: center;
+    column-gap: 18px;
     padding: 11px 0 4px;
-    gap: 12px;
     border-top: 2px solid ${theme.line};
     margin-top: 4px;
   }
@@ -559,6 +915,7 @@ function buildStyles(theme) {
     font-weight: 900;
     color: ${theme.amber};
     letter-spacing: -0.2px;
+    white-space: nowrap;
   }
 
   .totalsBalanceVal {
@@ -566,6 +923,9 @@ function buildStyles(theme) {
     font-weight: 900;
     color: ${theme.amber};
     letter-spacing: -0.5px;
+    text-align: right;
+    white-space: nowrap;
+    word-spacing: 2px;
   }
 
   .footerArea {
@@ -578,7 +938,15 @@ function buildStyles(theme) {
     border-top: 1px solid ${theme.line};
   }
 
+  .footerArea.noFooterSignature {
+    display: block;
+  }
+
   .termsBlock { max-width: 52%; }
+
+  .footerArea.noFooterSignature .termsBlock {
+    max-width: 100%;
+  }
 
   .termsTitle {
     font-size: 11px;
@@ -658,11 +1026,57 @@ function buildStyles(theme) {
     color: ${theme.muted};
   }
 
+  .compactPage .pageInner { padding: 30px 38px 38px; }
+
+  .compactPage .header {
+    padding-bottom: 18px;
+    margin-bottom: 20px;
+  }
+
+  .compactPage .logoFrame,
+  .compactPage .logoFallback {
+    width: 54px;
+    height: 54px;
+    border-radius: 12px;
+  }
+
+  .compactPage .brandBlockLogoOnly .logoFrame {
+    width: 76px;
+    height: 76px;
+    border-radius: 16px;
+  }
+
+  .compactPage .brandName { font-size: 23px; }
+  .compactPage .brandSub { font-size: 11.5px; }
+  .compactPage .docType { font-size: 32px; }
+  .compactPage .infoStrip { margin-bottom: 20px; }
+  .compactPage .infoCol { padding: 13px 15px; }
+  .compactPage tbody td { padding: 10px 12px; }
+  .compactPage thead th { padding: 9px 12px; }
+  .compactPage .tableWrap { margin-bottom: 18px; }
+  .compactPage .totalsSection { margin-bottom: 18px; }
+  .compactPage .footerArea {
+    margin-top: 18px;
+    padding-top: 18px;
+  }
+
+  .brandBlockLogoOnly .logoFrame {
+    width: 92px;
+    height: 92px;
+    border-radius: 18px;
+  }
+
+  .brandBlockLogoOnly .logo {
+    max-width: 100%;
+    max-height: 100%;
+  }
+
   @media screen and (max-width: 750px) {
     .wrap { padding: 12px 8px 24px; }
     .actions, .page { width: 100%; }
     .pageInner { padding: 24px 20px 36px; }
     .header { flex-direction: column; gap: 16px; }
+    .brandBlock, .docBlock { max-width: 100%; }
     .docBlock { text-align: left; }
     .infoStrip { grid-template-columns: 1fr; }
     .infoCol { border-right: none; border-bottom: 1px solid ${theme.line}; }
@@ -695,6 +1109,7 @@ function buildStyles(theme) {
     .footerArea { page-break-inside: avoid; }
     .sigRow { page-break-inside: avoid; }
     .totalsSection { page-break-inside: avoid; }
+    .header { page-break-inside: avoid; }
   }
 </style>`;
 }
@@ -708,14 +1123,14 @@ function renderActions(title) {
 }
 
 function getDocNumber(document = {}) {
-  return cleanStr(
+  return oneLine(
     document.number ||
       document.invoiceNumber ||
       document.receiptNumber ||
       document.proformaNumber ||
       document.deliveryNoteNumber ||
       document.warrantyNumber ||
-      "—"
+      "—",
   );
 }
 
@@ -725,27 +1140,7 @@ function renderHeader({ tenant, document, title, extra, theme }) {
 
   return `
   <div class="header">
-    <div class="brandBlock">
-      ${logoHtml(tenant, theme)}
-      <div>
-        <div class="brandName">${esc(cleanStr(tenant.name || "Business"))}</div>
-        <div class="brandSub">
-          ${tenant.receiptHeader ? `<div>${esc(tenant.receiptHeader)}</div>` : ""}
-          ${tenant.address ? `<div>${esc(tenant.address)}</div>` : ""}
-          ${
-            tenant.phone || tenant.email
-              ? `<div>${[
-                  tenant.phone ? `Tel: ${esc(tenant.phone)}` : "",
-                  tenant.email ? `Email: ${esc(tenant.email)}` : "",
-                ]
-                  .filter(Boolean)
-                  .join(" · ")}</div>`
-              : ""
-          }
-          ${tenant.tin ? `<div>TIN: ${esc(tenant.tin)}</div>` : ""}
-        </div>
-      </div>
-    </div>
+    ${renderBrandIdentity(tenant, theme)}
 
     <div class="docBlock">
       <div class="docType">${esc(title)}</div>
@@ -771,11 +1166,11 @@ function renderInfoStrip({ customer, extra }) {
   <div class="infoStrip">
     <div class="infoCol">
       <div class="infoLabel">${esc(col1Label)}</div>
-      <div class="infoName">${esc(cleanStr(customer?.name || "Walk-in Customer"))}</div>
-      ${customer?.phone ? `<div class="infoLine">${esc(customer.phone)}</div>` : ""}
-      ${customer?.email ? `<div class="infoLine">${esc(customer.email)}</div>` : ""}
-      ${customer?.address ? `<div class="infoLine">${esc(customer.address)}</div>` : ""}
-      ${customer?.tin ? `<div class="infoLine">TIN: ${esc(customer.tin)}</div>` : ""}
+      <div class="infoName">${esc(oneLine(customer?.name || "Walk-in Customer"))}</div>
+      ${customer?.phone ? `<div class="infoLine"><span class="infoValue">${esc(oneLine(customer.phone))}</span></div>` : ""}
+      ${customer?.email ? `<div class="infoLine"><span class="infoValue">${esc(oneLine(customer.email))}</span></div>` : ""}
+      ${customer?.address ? `<div class="infoLine"><span class="infoValue">${esc(oneLine(customer.address))}</span></div>` : ""}
+      ${customer?.tin ? `<div class="infoLine"><span class="infoKey">TIN</span><span class="infoValue">${esc(oneLine(customer.tin))}</span></div>` : ""}
     </div>
 
     <div class="infoCol">
@@ -783,7 +1178,7 @@ function renderInfoStrip({ customer, extra }) {
       ${col2Lines
         .map(
           ([key, value]) =>
-            `<div class="infoLine"><span style="color:#94a3b8">${esc(key)}: </span>${esc(String(value))}</div>`
+            `<div class="infoLine"><span class="infoKey">${esc(key)}</span><span class="infoValue">${esc(String(value))}</span></div>`,
         )
         .join("")}
     </div>
@@ -793,11 +1188,31 @@ function renderInfoStrip({ customer, extra }) {
       ${col3Lines
         .map(
           ([key, value]) =>
-            `<div class="infoLine"><span style="color:#94a3b8">${esc(key)}: </span>${esc(String(value))}</div>`
+            `<div class="infoLine"><span class="infoKey">${esc(key)}</span><span class="infoValue">${esc(String(value))}</span></div>`,
         )
         .join("")}
     </div>
   </div>`;
+}
+
+function renderItemMeta(item) {
+  const parts = [];
+
+  if (item.serial) parts.push(`<div>Serial: ${esc(item.serial)}</div>`);
+  if (item.sku) parts.push(`<div>SKU: ${esc(item.sku)}</div>`);
+  if (item.barcode) parts.push(`<div>Barcode: ${esc(item.barcode)}</div>`);
+
+  if (!parts.length) return "";
+
+  return `<div class="iMeta">${parts.join("")}</div>`;
+}
+
+function renderNonPriceDetails(item) {
+  if (item.sku) return `SKU: ${item.sku}`;
+  if (item.barcode) return `Barcode: ${item.barcode}`;
+  if (item.serial) return "Serial recorded";
+
+  return "Recorded";
 }
 
 function renderTable({ items, totals, showPrices }) {
@@ -814,17 +1229,7 @@ function renderTable({ items, totals, showPrices }) {
         <td class="c iNum">${index + 1}</td>
         <td>
           <div class="iName">${esc(item.productName || "—")}</div>
-          ${
-            item.serial || item.sku || item.barcode
-              ? `<div class="iMeta">${[
-                  item.serial ? `Serial: ${esc(item.serial)}` : "",
-                  item.sku ? `SKU: ${esc(item.sku)}` : "",
-                  item.barcode ? `Barcode: ${esc(item.barcode)}` : "",
-                ]
-                  .filter(Boolean)
-                  .join(" · ")}</div>`
-              : ""
-          }
+          ${renderItemMeta(item)}
         </td>
         <td class="iMeta">${esc(item.sku || item.barcode || "—")}</td>
         <td class="c">${esc(String(item.quantity))}</td>
@@ -838,19 +1243,9 @@ function renderTable({ items, totals, showPrices }) {
         <td class="c iNum">${index + 1}</td>
         <td>
           <div class="iName">${esc(item.productName || "—")}</div>
-          ${
-            item.serial || item.sku || item.barcode
-              ? `<div class="iMeta">${[
-                  item.serial ? `Serial: ${esc(item.serial)}` : "",
-                  item.sku ? `SKU: ${esc(item.sku)}` : "",
-                  item.barcode ? `Barcode: ${esc(item.barcode)}` : "",
-                ]
-                  .filter(Boolean)
-                  .join(" · ")}</div>`
-              : ""
-          }
+          ${renderItemMeta(item)}
         </td>
-        <td class="iMeta">${esc(item.serial || item.sku || item.barcode || "—")}</td>
+        <td class="iMeta">${esc(renderNonPriceDetails(item))}</td>
         <td class="c">${esc(String(item.quantity))}</td>
       </tr>`;
         })
@@ -871,28 +1266,49 @@ function renderTotals({ totals, showPrices, showPaymentSummary }) {
     return `
     <div class="totalsSection">
       <div class="totalsBox">
-        <div class="totalsRow">
-          <span class="totalsKey">Items</span>
-          <span class="totalsVal">${esc(String(totals._itemCount || 0))}</span>
-        </div>
         <div class="totalsBalance">
-          <span class="totalsBalanceKey">Total</span>
-          <span class="totalsBalanceVal">${esc(money(totals.total, totals.currency))}</span>
+          <span class="totalsBalanceKey">${esc(totals._itemCountLabel || "Items")}</span>
+          <span class="totalsBalanceVal">${esc(String(totals._itemCount || 0))}</span>
         </div>
       </div>
     </div>`;
   }
 
   const paid = Number(totals.amountPaid || 0);
-  const balance = Number(totals.balanceDue || 0);
 
   return `
   <div class="totalsSection">
     <div class="totalsBox">
+      ${
+        totals.showTaxLine && totals.pricesIncludeTax
+          ? `
+      <div class="totalsRow">
+        <span class="totalsKey">Subtotal before tax</span>
+        <span class="totalsVal">${esc(money(totals.taxableSubtotal, totals.currency))}</span>
+      </div>
+      <div class="totalsRow">
+        <span class="totalsKey">${esc(totals.taxName || "Tax included")}</span>
+        <span class="totalsVal">${esc(money(totals.taxAmount, totals.currency))}</span>
+      </div>
+      <div class="totalsRow">
+        <span class="totalsKey">Subtotal</span>
+        <span class="totalsVal">${esc(money(totals.subtotal, totals.currency))}</span>
+      </div>`
+          : `
       <div class="totalsRow">
         <span class="totalsKey">Subtotal</span>
         <span class="totalsVal">${esc(money(totals.subtotal, totals.currency))}</span>
       </div>
+      ${
+        totals.showTaxLine
+          ? `
+      <div class="totalsRow">
+        <span class="totalsKey">${esc(totals.taxName || "Tax")}</span>
+        <span class="totalsVal">${esc(money(totals.taxAmount, totals.currency))}</span>
+      </div>`
+          : ""
+      }`
+      }
 
       ${
         showPaymentSummary && paid > 0
@@ -904,19 +1320,10 @@ function renderTotals({ totals, showPrices, showPaymentSummary }) {
           : ""
       }
 
-      ${
-        showPaymentSummary && balance > 0
-          ? `
-      <div class="totalsBalance">
-        <span class="totalsBalanceKey">Balance Due</span>
-        <span class="totalsBalanceVal">${esc(money(balance, totals.currency))}</span>
-      </div>`
-          : `
       <div class="totalsBalance">
         <span class="totalsBalanceKey">Total</span>
         <span class="totalsBalanceVal">${esc(money(totals.total, totals.currency))}</span>
-      </div>`
-      }
+      </div>
     </div>
   </div>`;
 }
@@ -926,27 +1333,34 @@ function renderFooter({ tenant, extra }) {
     extra?.notes ||
       extra?.terms ||
       tenant?.receiptFooter ||
-      "Thank you for your business.\nKeep this document for your records."
+      "Thank you for your business.\nKeep this document for your records.",
   );
 
+  const hideFooterSignature = Boolean(extra?.hideFooterSignature);
+
   return `
-  <div class="footerArea">
+  <div class="footerArea${hideFooterSignature ? " noFooterSignature" : ""}">
     <div class="termsBlock">
       <div class="termsTitle">Terms &amp; Conditions</div>
       <div class="termsText">${esc(terms)}</div>
     </div>
 
+    ${
+      hideFooterSignature
+        ? ""
+        : `
     <div class="sigBlock">
       <div class="sigLine"></div>
       <div class="sigLabel">Authorized Signature</div>
-      <div class="sigName">${esc(cleanStr(tenant?.name || "Business"))}</div>
-    </div>
+      <div class="sigName">${esc(oneLine(tenant?.name || "Business"))}</div>
+    </div>`
+    }
   </div>`;
 }
 
 function renderSigRow({ extra }) {
-  const left = cleanStr(extra?.preparedBy || extra?.cashier || extra?.deliveredBy || extra?.issuedBy || "Staff");
-  const right = cleanStr(extra?.approvedBy || extra?.receivedBy || "Authorised Signature");
+  const left = oneLine(extra?.preparedBy || extra?.cashier || extra?.deliveredBy || extra?.issuedBy || "Staff");
+  const right = oneLine(extra?.approvedBy || extra?.receivedBy || "Authorised Signature");
 
   return `
   <div class="sigRow">
@@ -979,15 +1393,26 @@ function buildPage({
   theme: themeOverride,
 }) {
   const normalizedItems = normalizeItems(items);
-  const normalizedTotals = computeTotals(normalizedItems, totals, extra?.currency || "RWF");
+
+  const normalizedTotals = computeTotals(
+    normalizedItems,
+    totals,
+    extra?.currency || "RWF",
+    tenant,
+  );
+
   normalizedTotals._itemCount = normalizedItems.length;
+  normalizedTotals._itemCountLabel = totals._itemCountLabel || extra.itemCountLabel || "Items";
 
   const theme = resolveBrandTheme(tenant, themeOverride || {});
+  const sizeMode = resolveDocumentSizeMode(tenant, normalizedItems);
+  const pageClass = sizeMode === "COMPACT" ? "page compactPage" : "page";
 
   const effectiveExtra = {
-    ...extra,
-    status: badgeText || extra?.status || null,
-  };
+  ...extra,
+  status: badgeText || extra?.status || null,
+  hideFooterSignature: Boolean(extra?.hideFooterSignature || showSignature),
+};
 
   return `<!doctype html>
 <html lang="en">
@@ -1002,7 +1427,7 @@ function buildPage({
 <body>
 <div class="wrap">
   ${renderActions(title)}
-  <div class="page">
+  <div class="${pageClass}">
     <div class="pageInner">
       ${renderHeader({ tenant, document, title, extra: effectiveExtra, theme })}
       ${renderInfoStrip({ customer, extra: effectiveExtra })}
@@ -1018,9 +1443,9 @@ function buildPage({
 }
 
 function renderReceiptHtml(payload) {
-  const saleType = cleanStr(payload.extra?.saleType || "CASH");
-  const status = cleanStr(payload.extra?.status || "PAID");
-  const cashier = cleanStr(payload.extra?.cashier || "—");
+  const saleType = oneLine(payload.extra?.saleType || "CASH");
+  const status = oneLine(payload.extra?.status || "PAID");
+  const cashier = oneLine(payload.extra?.cashier || "—");
   const paid = Number(payload.totals?.amountPaid || 0);
   const balance = Number(payload.totals?.balanceDue || 0);
   const sellingLocation = getLocationName({
@@ -1059,11 +1484,11 @@ function renderReceiptHtml(payload) {
 }
 
 function renderInvoiceHtml(payload) {
-  const status = cleanStr(payload.extra?.status || "INVOICE");
-  const cashier = cleanStr(payload.extra?.cashier || "—");
+  const status = oneLine(payload.extra?.status || "INVOICE");
+  const cashier = oneLine(payload.extra?.cashier || "—");
   const paid = Number(payload.totals?.amountPaid || 0);
   const balance = Number(payload.totals?.balanceDue || 0);
-  const saleRef = cleanStr(payload.extra?.saleRef || "—");
+  const saleRef = oneLine(payload.extra?.saleRef || "—");
   const sellingLocation = getLocationName({
     ...payload.tenant,
     ...payload.extra,
@@ -1086,7 +1511,7 @@ function renderInvoiceHtml(payload) {
       dueDate: payload.extra?.dueDate,
       col2Label: "Payment",
       col2Lines: [
-        ["Sale Type", cleanStr(payload.extra?.saleType || "CREDIT")],
+        ["Sale Type", oneLine(payload.extra?.saleType || "CREDIT")],
         ["Paid", money(paid, payload.totals?.currency || "RWF")],
         ["Balance", money(balance, payload.totals?.currency || "RWF")],
       ],
@@ -1108,9 +1533,9 @@ function renderInvoiceHtml(payload) {
 }
 
 function renderProformaHtml(payload) {
-  const preparedBy = cleanStr(payload.extra?.preparedBy || payload.extra?.cashier || "—");
+  const preparedBy = oneLine(payload.extra?.preparedBy || payload.extra?.cashier || "—");
   const validUntil = payload.extra?.validUntil ? fmtDate(payload.extra.validUntil) : "—";
-  const reference = cleanStr(payload.extra?.reference || "—");
+  const reference = oneLine(payload.extra?.reference || "—");
   const sellingLocation = getLocationName({
     ...payload.tenant,
     ...payload.extra,
@@ -1166,7 +1591,11 @@ function renderDeliveryNoteHtml(payload) {
     document: payload.document,
     customer: payload.customer,
     items: payload.items,
-    totals: payload.totals,
+    totals: {
+      ...(payload.totals || {}),
+      _itemCount: Array.isArray(payload.items) ? payload.items.length : 0,
+      _itemCountLabel: "Delivered items",
+    },
     badgeText,
     showPrices: false,
     showPaymentSummary: false,
@@ -1174,15 +1603,15 @@ function renderDeliveryNoteHtml(payload) {
     theme: payload.theme || { primaryColor: payload.tenant?.documentPrimaryColor },
     extra: {
       customerTitle: "Delivered To",
-      col2Label: "Delivery Info",
+      col2Label: "Delivery details",
       col2Lines: [
         ["Delivered By", deliveredBy],
         ["Received By", receivedBy],
         ["Receiver Phone", receivedByPhone],
       ],
-      col3Label: "Store Location",
+      col3Label: "Store details",
       col3Lines: [
-        [getLocationLabel(payload.extra) || "Store location", sellingLocation || "—"],
+        ["Store location", sellingLocation || "—"],
         ["Date", fmtDate(payload.document?.date || payload.document?.createdAt)],
       ],
       notes:
@@ -1191,12 +1620,14 @@ function renderDeliveryNoteHtml(payload) {
         "Please confirm that all delivered items were received in good condition.",
       preparedBy: deliveredBy,
       approvedBy: receivedBy || "Receiver Signature",
+      itemCountLabel: "Delivered items",
+      hideFooterSignature: true,
     },
   });
 }
 
 function renderWarrantyHtml(payload) {
-  const issuedBy = cleanStr(payload.extra?.issuedBy || payload.extra?.cashier || "—");
+  const issuedBy = oneLine(payload.extra?.issuedBy || payload.extra?.cashier || "—");
   const startDate = payload.extra?.startDate ? fmtDate(payload.extra.startDate) : "—";
   const endDate = payload.extra?.endDate ? fmtDate(payload.extra.endDate) : "—";
   const sellingLocation = getLocationName({
@@ -1210,7 +1641,11 @@ function renderWarrantyHtml(payload) {
     document: payload.document,
     customer: payload.customer,
     items: payload.items,
-    totals: payload.totals,
+    totals: {
+      ...(payload.totals || {}),
+      _itemCount: Array.isArray(payload.items) ? payload.items.length : 0,
+      _itemCountLabel: "Items covered",
+    },
     badgeText: "WARRANTY",
     showPrices: false,
     showPaymentSummary: false,
@@ -1235,6 +1670,8 @@ function renderWarrantyHtml(payload) {
         "Warranty is void if the product is physically damaged or tampered with.",
       preparedBy: issuedBy,
       approvedBy: payload.customer?.name || "Customer Signature",
+      itemCountLabel: "Items covered",
+      hideFooterSignature: true,
     },
   });
 }
@@ -1261,3 +1698,4 @@ module.exports = {
   renderDeliveryNoteHtml,
   renderWarrantyHtml,
 };
+

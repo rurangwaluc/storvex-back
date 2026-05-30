@@ -7,8 +7,7 @@ const {
   setMainBranch,
   archiveBranch,
   reactivateBranch,
-  assignStaffToBranch,
-  removeStaffFromBranch,
+  updateBranchStaff,
 } = require("./branches.service");
 
 function cleanString(value) {
@@ -57,7 +56,7 @@ async function getBranches(req, res) {
     });
   } catch (err) {
     console.error("getBranches error:", err);
-    return sendError(res, err, "Failed to load branches");
+    return sendError(res, err, "Failed to load store locations");
   }
 }
 
@@ -74,7 +73,7 @@ async function getBranchUsage(req, res) {
     return res.json(result);
   } catch (err) {
     console.error("getBranchUsage error:", err);
-    return sendError(res, err, "Failed to load branch usage");
+    return sendError(res, err, "Failed to load location usage");
   }
 }
 
@@ -98,11 +97,11 @@ async function createBranchHandler(req, res) {
     } = req.body || {};
 
     if (!cleanString(name)) {
-      return res.status(400).json({ message: "Branch name is required" });
+      return res.status(400).json({ message: "Location name is required" });
     }
 
     if (!cleanString(code)) {
-      return res.status(400).json({ message: "Branch code is required" });
+      return res.status(400).json({ message: "Location code is required" });
     }
 
     const result = await createBranch({
@@ -120,12 +119,12 @@ async function createBranchHandler(req, res) {
     });
 
     return res.status(201).json({
-      message: "Branch created successfully",
+      message: "Store location created successfully",
       ...result,
     });
   } catch (err) {
     console.error("createBranchHandler error:", err);
-    return sendError(res, err, "Failed to create branch");
+    return sendError(res, err, "Failed to create store location");
   }
 }
 
@@ -139,7 +138,7 @@ async function updateBranchHandler(req, res) {
     }
 
     if (!branchId) {
-      return res.status(400).json({ message: "branchId is required" });
+      return res.status(400).json({ message: "Location is required" });
     }
 
     const result = await updateBranch({
@@ -151,12 +150,12 @@ async function updateBranchHandler(req, res) {
     });
 
     return res.json({
-      message: "Branch updated successfully",
+      message: "Store location updated successfully",
       ...result,
     });
   } catch (err) {
     console.error("updateBranchHandler error:", err);
-    return sendError(res, err, "Failed to update branch");
+    return sendError(res, err, "Failed to update store location");
   }
 }
 
@@ -170,7 +169,7 @@ async function setMainBranchHandler(req, res) {
     }
 
     if (!branchId) {
-      return res.status(400).json({ message: "branchId is required" });
+      return res.status(400).json({ message: "Location is required" });
     }
 
     const result = await setMainBranch({
@@ -181,12 +180,12 @@ async function setMainBranchHandler(req, res) {
     });
 
     return res.json({
-      message: "Main branch updated successfully",
+      message: "Main store location updated successfully",
       ...result,
     });
   } catch (err) {
     console.error("setMainBranchHandler error:", err);
-    return sendError(res, err, "Failed to set main branch");
+    return sendError(res, err, "Failed to set main store location");
   }
 }
 
@@ -200,7 +199,7 @@ async function archiveBranchHandler(req, res) {
     }
 
     if (!branchId) {
-      return res.status(400).json({ message: "branchId is required" });
+      return res.status(400).json({ message: "Location is required" });
     }
 
     const result = await archiveBranch({
@@ -211,12 +210,12 @@ async function archiveBranchHandler(req, res) {
     });
 
     return res.json({
-      message: "Branch archived successfully",
+      message: "Store location archived successfully",
       ...result,
     });
   } catch (err) {
     console.error("archiveBranchHandler error:", err);
-    return sendError(res, err, "Failed to archive branch");
+    return sendError(res, err, "Failed to archive store location");
   }
 }
 
@@ -230,7 +229,7 @@ async function reactivateBranchHandler(req, res) {
     }
 
     if (!branchId) {
-      return res.status(400).json({ message: "branchId is required" });
+      return res.status(400).json({ message: "Location is required" });
     }
 
     const result = await reactivateBranch({
@@ -241,12 +240,12 @@ async function reactivateBranchHandler(req, res) {
     });
 
     return res.json({
-      message: "Branch reactivated successfully",
+      message: "Store location reactivated successfully",
       ...result,
     });
   } catch (err) {
     console.error("reactivateBranchHandler error:", err);
-    return sendError(res, err, "Failed to reactivate branch");
+    return sendError(res, err, "Failed to reactivate store location");
   }
 }
 
@@ -261,35 +260,39 @@ async function assignStaffToBranchHandler(req, res) {
     }
 
     if (!branchId) {
-      return res.status(400).json({ message: "branchId is required" });
+      return res.status(400).json({ message: "Location is required" });
     }
 
     if (!staffUserId) {
-      return res.status(400).json({ message: "userId is required" });
+      return res.status(400).json({ message: "Staff member is required" });
     }
 
-    const result = await assignStaffToBranch({
+    const result = await updateBranchStaff({
       tenantId,
       actorUserId,
       actorRole,
       branchId,
-      staffUserId,
-      isDefault: Boolean(req.body?.isDefault),
-      canOperate:
-        typeof req.body?.canOperate === "boolean" ? req.body.canOperate : true,
-      canViewReports:
-        typeof req.body?.canViewReports === "boolean"
-          ? req.body.canViewReports
-          : false,
+      assignments: [
+        {
+          userId: staffUserId,
+          isDefault: Boolean(req.body?.isDefault),
+          canOperate:
+            typeof req.body?.canOperate === "boolean" ? req.body.canOperate : true,
+          canViewReports:
+            typeof req.body?.canViewReports === "boolean"
+              ? req.body.canViewReports
+              : false,
+        },
+      ],
     });
 
     return res.json({
-      message: "Staff assigned to branch successfully",
-      ...result,
+      message: "Staff access updated successfully",
+      assignments: result,
     });
   } catch (err) {
     console.error("assignStaffToBranchHandler error:", err);
-    return sendError(res, err, "Failed to assign staff to branch");
+    return sendError(res, err, "Failed to update staff location access");
   }
 }
 
@@ -298,7 +301,10 @@ async function removeStaffFromBranchHandler(req, res) {
     const { tenantId, actorUserId, actorRole } = getActor(req);
     const branchId = cleanString(req.params.branchId || req.params.id);
     const staffUserId = cleanString(
-      req.params.userId || req.params.staffUserId || req.body?.userId || req.body?.staffUserId
+      req.params.userId ||
+        req.params.staffUserId ||
+        req.body?.userId ||
+        req.body?.staffUserId,
     );
 
     if (!tenantId || !actorUserId || !actorRole) {
@@ -306,28 +312,28 @@ async function removeStaffFromBranchHandler(req, res) {
     }
 
     if (!branchId) {
-      return res.status(400).json({ message: "branchId is required" });
+      return res.status(400).json({ message: "Location is required" });
     }
 
     if (!staffUserId) {
-      return res.status(400).json({ message: "userId is required" });
+      return res.status(400).json({ message: "Staff member is required" });
     }
 
-    const result = await removeStaffFromBranch({
+    const result = await updateBranchStaff({
       tenantId,
       actorUserId,
       actorRole,
       branchId,
-      staffUserId,
+      assignments: [],
     });
 
     return res.json({
-      message: "Staff removed from branch successfully",
-      ...result,
+      message: "Staff access removed successfully",
+      assignments: result,
     });
   } catch (err) {
     console.error("removeStaffFromBranchHandler error:", err);
-    return sendError(res, err, "Failed to remove staff from branch");
+    return sendError(res, err, "Failed to remove staff location access");
   }
 }
 

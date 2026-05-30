@@ -1,4 +1,3 @@
-// backend/src/modules/documents/documentBranding.service.js
 "use strict";
 
 const { signGetUrl } = require("../../utils/r2");
@@ -22,7 +21,7 @@ function pickFirst(...values) {
 }
 
 function buildLocationText(...parts) {
-  return parts.map(cleanString).filter(Boolean).join(" • ") || null;
+  return parts.map(cleanString).filter(Boolean).join(", ") || null;
 }
 
 function buildDocumentSettingsSelect(prisma) {
@@ -44,6 +43,38 @@ function buildDocumentSettingsSelect(prisma) {
 
     ...(hasField(prisma.tenantDocumentSettings, "documentAccentColor")
       ? { documentAccentColor: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "documentHeaderDisplay")
+      ? { documentHeaderDisplay: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "documentSizeMode")
+      ? { documentSizeMode: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "taxMode")
+      ? { taxMode: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "taxDisplayMode")
+      ? { taxDisplayMode: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "taxName")
+      ? { taxName: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "taxRateBps")
+      ? { taxRateBps: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "pricesIncludeTax")
+      ? { pricesIncludeTax: true }
+      : {}),
+
+    ...(hasField(prisma.tenantDocumentSettings, "showTaxOnCustomerDocuments")
+      ? { showTaxOnCustomerDocuments: true }
       : {}),
 
     ...(hasField(prisma.tenantDocumentSettings, "receiptPrefix")
@@ -158,14 +189,23 @@ async function findBranch(prisma, tenantId, locationId) {
 }
 
 function serializeLocation({ branch, tenant }) {
-  const tenantLocation = buildLocationText(tenant?.sector, tenant?.district, tenant?.address);
-  const branchLocation = buildLocationText(branch?.sector, branch?.district, branch?.address);
+  const tenantLocation = buildLocationText(
+    tenant?.sector,
+    tenant?.district,
+    tenant?.address,
+  );
+
+  const branchLocation = buildLocationText(
+    branch?.sector,
+    branch?.district,
+    branch?.address,
+  );
 
   const locationName = pickFirst(
     branch?.name,
     branch?.code,
     tenant?.name,
-    "Main store"
+    "Main store",
   );
 
   const locationCode = cleanString(branch?.code);
@@ -177,12 +217,9 @@ function serializeLocation({ branch, tenant }) {
   return {
     id: branch?.id || null,
 
-    // Keep these for backend/frontend compatibility only.
-    // Do not print them directly as tenant-facing labels.
     branchName: branch?.name || null,
     branchCode: branch?.code || null,
 
-    // Business-friendly document fields.
     locationName,
     locationCode,
     locationStatus,
@@ -193,6 +230,49 @@ function serializeLocation({ branch, tenant }) {
     storeLocation: locationName,
     isMainLocation: Boolean(branch?.isMain),
   };
+}
+
+function normalizeHeaderDisplay(value) {
+  const mode = String(value || "LOGO_AND_NAME").trim().toUpperCase();
+
+  if (mode === "LOGO_ONLY") return "LOGO_ONLY";
+  if (mode === "NAME_ONLY") return "NAME_ONLY";
+
+  return "LOGO_AND_NAME";
+}
+
+function normalizeDocumentSizeMode(value) {
+  const mode = String(value || "AUTO").trim().toUpperCase();
+
+  if (mode === "COMPACT") return "COMPACT";
+  if (mode === "STANDARD") return "STANDARD";
+
+  return "AUTO";
+}
+
+function normalizeTaxMode(value) {
+  const mode = String(value || "NONE").trim().toUpperCase();
+
+  if (
+    mode === "VAT_18" ||
+    mode === "TURNOVER_3_INTERNAL" ||
+    mode === "VAT_18_PLUS_TURNOVER_3" ||
+    mode === "CUSTOM"
+  ) {
+    return mode;
+  }
+
+  return "NONE";
+}
+
+function normalizeTaxDisplayMode(value) {
+  const mode = String(value || "HIDDEN").trim().toUpperCase();
+
+  if (mode === "CUSTOMER_FACING" || mode === "INTERNAL_ONLY") {
+    return mode;
+  }
+
+  return "HIDDEN";
 }
 
 async function buildTenantDocumentBranding(prisma, tenantId, locationId = null) {
@@ -216,7 +296,11 @@ async function buildTenantDocumentBranding(prisma, tenantId, locationId = null) 
   const location = serializeLocation({ branch, tenant });
   const settings = tenant.documentSettings || {};
 
-  const tenantLocation = buildLocationText(tenant.sector, tenant.district, tenant.address);
+  const tenantLocation = buildLocationText(
+    tenant.sector,
+    tenant.district,
+    tenant.address,
+  );
 
   return {
     id: tenant.id,
@@ -244,6 +328,16 @@ async function buildTenantDocumentBranding(prisma, tenantId, locationId = null) 
     documentPrimaryColor: settings.documentPrimaryColor || "#0F4C81",
     documentAccentColor: settings.documentAccentColor || "#E8EEF5",
 
+    documentHeaderDisplay: normalizeHeaderDisplay(settings.documentHeaderDisplay),
+    documentSizeMode: normalizeDocumentSizeMode(settings.documentSizeMode),
+
+    taxMode: normalizeTaxMode(settings.taxMode),
+    taxDisplayMode: normalizeTaxDisplayMode(settings.taxDisplayMode),
+    taxName: settings.taxName || null,
+    taxRateBps: Number(settings.taxRateBps || 0),
+    pricesIncludeTax: Boolean(settings.pricesIncludeTax),
+    showTaxOnCustomerDocuments: Boolean(settings.showTaxOnCustomerDocuments),
+
     invoiceTerms: settings.invoiceTerms || null,
     warrantyTerms: settings.warrantyTerms || null,
     proformaTerms: settings.proformaTerms || null,
@@ -270,9 +364,6 @@ async function buildTenantDocumentBranding(prisma, tenantId, locationId = null) 
     storeLocation: location.storeLocation,
     isMainLocation: location.isMainLocation,
 
-    // Compatibility for existing receipt/invoice rendering code.
-    // These are data fields only; tenant-facing labels must use
-    // "Selling location" or "Store location".
     branchName: location.branchName,
     branchCode: location.branchCode,
   };

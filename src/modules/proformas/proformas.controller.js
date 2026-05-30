@@ -4,6 +4,10 @@ const prisma = require("../../config/database");
 const { renderProformaHtml } = require("../documents/documentRender.service");
 const { reserveProformaDocumentNumberTx } = require("../documents/documentNumber.service");
 const { buildTenantDocumentBranding } = require("../documents/documentBranding.service");
+const {
+  parsePagination,
+  buildPaginationMeta,
+} = require("../../lib/pagination");
 
 function getTenantId(req) {
   return req.user?.tenantId || null;
@@ -26,6 +30,14 @@ function cleanString(value) {
   return s || null;
 }
 
+function oneLine(value) {
+  const s = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return s || null;
+}
+
 function toInt(value, fallback = NaN) {
   const n = Number(value);
   return Number.isFinite(n) ? Math.floor(n) : fallback;
@@ -42,28 +54,56 @@ function normalizeStatus(value) {
   return null;
 }
 
+function polishedProductName(value) {
+  const clean = oneLine(value) || "—";
+
+  if (clean === "—") return clean;
+
+  const hasUppercase = /[A-Z]/.test(clean);
+  const hasLowercase = /[a-z]/.test(clean);
+
+  if (hasLowercase && !hasUppercase) {
+    return clean
+      .split(" ")
+      .map((part) => {
+        if (!part) return part;
+        return `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
+      })
+      .join(" ");
+  }
+
+  return clean;
+}
+
 function getLocationName(location) {
   if (!location) return null;
 
-  const name = cleanString(location.name);
-  const code = cleanString(location.code);
+  const name = oneLine(location.name);
+  const code = oneLine(location.code);
 
-  if (name && code) return `${name} (${code})`;
   if (name) return name;
   if (code) return code;
 
   return null;
 }
 
+function getLocationCode(location) {
+  if (!location) return null;
+  return oneLine(location.code);
+}
+
 function serializeSellingLocation(location) {
   if (!location) return null;
 
+  const name = getLocationName(location);
+  const code = getLocationCode(location);
+
   return {
-    name: location.name || null,
-    code: location.code || null,
+    name,
+    code,
     status: location.status || null,
     isMain: Boolean(location.isMain),
-    label: getLocationName(location),
+    label: name,
   };
 }
 
@@ -247,7 +287,6 @@ function mapProformaListRow(proforma) {
     itemsCount: Array.isArray(proforma.items) ? proforma.items.length : 0,
     createdAt: proforma.createdAt,
     updatedAt: proforma.updatedAt,
-
     sellingLocation,
     storeLocation: sellingLocation,
   };
@@ -258,11 +297,11 @@ function mapProformaDetail(proforma, tenant) {
     serializeSellingLocation(proforma.branch) ||
     (tenant?.sellingLocation
       ? {
-          name: tenant.sellingLocation,
+          name: oneLine(tenant.sellingLocation),
           code: null,
           status: null,
           isMain: false,
-          label: tenant.sellingLocation,
+          label: oneLine(tenant.sellingLocation),
         }
       : null);
 
@@ -332,6 +371,8 @@ function mapProformaDetail(proforma, tenant) {
             receiptFooter: tenant.receiptFooter || null,
             documentPrimaryColor: tenant.documentPrimaryColor || "#1F365C",
             documentAccentColor: tenant.documentAccentColor || "#D8D2C2",
+            documentHeaderDisplay: tenant.documentHeaderDisplay || "LOGO_AND_NAME",
+            documentSizeMode: tenant.documentSizeMode || "AUTO",
             invoiceTerms: tenant.invoiceTerms || null,
             warrantyTerms: tenant.warrantyTerms || null,
             proformaTerms: tenant.proformaTerms || null,
@@ -346,7 +387,7 @@ function mapProformaDetail(proforma, tenant) {
             id: item.id,
             proformaId: item.proformaId,
             productId: item.productId || null,
-            productName: item.productName,
+            productName: polishedProductName(item.productName),
             serial: item.serial || null,
             quantity: Number(item.quantity || 0),
             unitPrice: Number(item.unitPrice || 0),
@@ -355,7 +396,7 @@ function mapProformaDetail(proforma, tenant) {
             product: item.product
               ? {
                   id: item.product.id,
-                  name: item.product.name || null,
+                  name: polishedProductName(item.product.name),
                   sku: item.product.sku || null,
                   barcode: item.product.barcode || null,
                   serial: item.product.serial || null,
@@ -432,6 +473,11 @@ async function listProformas(req, res) {
     const q = cleanString(req.query.q);
     const status = normalizeStatus(req.query.status);
 
+    const pagination = parsePagination(req.query, {
+      defaultLimit: 30,
+      maxLimit: 100,
+    });
+
     const where = applyProformaBranchScope({ tenantId }, scope);
 
     if (status) {
@@ -450,50 +496,59 @@ async function listProformas(req, res) {
       ];
     }
 
-    const rows = await prisma.proforma.findMany({
-      where,
-      orderBy: [{ createdAt: "desc" }],
-      take: 200,
-      select: {
-        id: true,
-        ...(typeof prisma.proforma.fields?.branchId !== "undefined" ? { branchId: true } : {}),
-        ...(typeof prisma.proforma.fields?.branchId !== "undefined"
-          ? {
-              branch: {
-                select: {
-                  id: true,
-                  name: true,
-                  code: true,
-                  status: true,
-                  isMain: true,
+    const [total, rows] = await prisma.$transaction([
+      prisma.proforma.count({ where }),
+      prisma.proforma.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }],
+        skip: pagination.skip,
+        take: pagination.limit,
+        select: {
+          id: true,
+          ...(typeof prisma.proforma.fields?.branchId !== "undefined" ? { branchId: true } : {}),
+          ...(typeof prisma.proforma.fields?.branchId !== "undefined"
+            ? {
+                branch: {
+                  select: {
+                    id: true,
+                    name: true,
+                    code: true,
+                    status: true,
+                    isMain: true,
+                  },
                 },
-              },
-            }
-          : {}),
-        number: true,
-        status: true,
-        customerName: true,
-        customerPhone: true,
-        customerEmail: true,
-        subtotal: true,
-        total: true,
-        currency: true,
-        validUntil: true,
-        preparedBy: true,
-        reference: true,
-        convertedToSaleId: true,
-        convertedAt: true,
-        createdAt: true,
-        updatedAt: true,
-        items: {
-          select: { id: true },
+              }
+            : {}),
+          number: true,
+          status: true,
+          customerName: true,
+          customerPhone: true,
+          customerEmail: true,
+          subtotal: true,
+          total: true,
+          currency: true,
+          validUntil: true,
+          preparedBy: true,
+          reference: true,
+          convertedToSaleId: true,
+          convertedAt: true,
+          createdAt: true,
+          updatedAt: true,
+          items: {
+            select: { id: true },
+          },
         },
-      },
-    });
+      }),
+    ]);
 
     return res.json({
       proformas: rows.map(mapProformaListRow),
       count: rows.length,
+      pagination: buildPaginationMeta({
+        page: pagination.page,
+        limit: pagination.limit,
+        total,
+      }),
     });
   } catch (error) {
     const handled = sendLocationError(res, error);
@@ -616,7 +671,7 @@ async function createProforma(req, res) {
 
         return {
           productId: cleanString(item.productId),
-          productName: cleanString(item.productName),
+          productName: polishedProductName(item.productName),
           serial: cleanString(item.serial),
           quantity,
           unitPrice,
@@ -658,9 +713,7 @@ async function createProforma(req, res) {
         data: createData,
         select: {
           id: true,
-          ...(typeof tx.proforma.fields?.branchId !== "undefined"
-            ? { branchId: true }
-            : {}),
+          ...(typeof tx.proforma.fields?.branchId !== "undefined" ? { branchId: true } : {}),
           number: true,
           status: true,
           customerName: true,
@@ -732,7 +785,7 @@ async function getProforma(req, res) {
           tenantId,
           OR: [{ id }, { number: id }],
         },
-        scope
+        scope,
       ),
       include: proformaInclude(),
     });
@@ -744,7 +797,7 @@ async function getProforma(req, res) {
     const tenant = await buildTenantDocumentBranding(
       prisma,
       tenantId,
-      proforma.branchId || null
+      proforma.branchId || null,
     );
 
     return res.json(mapProformaDetail(proforma, tenant));
@@ -778,7 +831,7 @@ async function updateProforma(req, res) {
           tenantId,
           OR: [{ id }, { number: id }],
         },
-        scope
+        scope,
       ),
       select: {
         id: true,
@@ -860,7 +913,7 @@ async function updateProforma(req, res) {
 
           return {
             productId: cleanString(item.productId),
-            productName: cleanString(item.productName),
+            productName: polishedProductName(item.productName),
             serial: cleanString(item.serial),
             quantity,
             unitPrice,
@@ -976,7 +1029,7 @@ async function deleteProforma(req, res) {
           tenantId,
           OR: [{ id }, { number: id }],
         },
-        scope
+        scope,
       ),
       select: {
         id: true,
@@ -1035,7 +1088,7 @@ async function printProformaHtml(req, res) {
           tenantId,
           OR: [{ id }, { number: id }],
         },
-        scope
+        scope,
       ),
       include: {
         ...(typeof prisma.proforma.fields?.branchId !== "undefined"
@@ -1084,16 +1137,37 @@ async function printProformaHtml(req, res) {
     const tenant = await buildTenantDocumentBranding(
       prisma,
       tenantId,
-      proforma.branchId || null
+      proforma.branchId || null,
     );
 
-    const sellingLocation = getLocationName(proforma.branch) || tenant?.sellingLocation || null;
+    const sellingLocation =
+      getLocationName(proforma.branch) ||
+      oneLine(tenant?.sellingLocation) ||
+      oneLine(tenant?.storeLocation) ||
+      oneLine(tenant?.locationName) ||
+      null;
+
+    const items = (proforma.items || []).map((item) => ({
+      productName: polishedProductName(item.productName || item.product?.name || "—"),
+      serial: item.serial || item.product?.serial || null,
+      sku: item.product?.sku || null,
+      barcode: item.product?.barcode || null,
+      quantity: Number(item.quantity || 0),
+      unitPrice: Number(item.unitPrice || 0),
+      price: Number(item.unitPrice || 0),
+      total: Number(item.total || 0),
+    }));
+
+    const subtotalFromItems = items.reduce((sum, item) => sum + Number(item.total || 0), 0);
+    const subtotal = Number(proforma.subtotal || 0) || subtotalFromItems;
+    const total = Number(proforma.total || 0) || subtotal;
 
     const html = renderProformaHtml({
       tenant: {
         ...tenant,
         sellingLocation,
         storeLocation: sellingLocation,
+        locationName: sellingLocation,
       },
       document: {
         number: proforma.number,
@@ -1102,37 +1176,33 @@ async function printProformaHtml(req, res) {
       },
       customer: proforma.customer
         ? {
-            name: proforma.customer.name,
-            phone: proforma.customer.phone,
+            name: proforma.customer.name || proforma.customerName || "Walk-in Customer",
+            phone: proforma.customer.phone || proforma.customerPhone || null,
+            email: proforma.customer.email || proforma.customerEmail || null,
             address: proforma.customer.address || proforma.customerAddress || null,
           }
         : {
-            name: proforma.customerName,
-            phone: proforma.customerPhone,
-            address: proforma.customerAddress,
+            name: proforma.customerName || "Walk-in Customer",
+            phone: proforma.customerPhone || null,
+            email: proforma.customerEmail || null,
+            address: proforma.customerAddress || null,
           },
-      items: (proforma.items || []).map((item) => ({
-        productName: item.productName || item.product?.name || "—",
-        serial: item.serial || item.product?.serial || null,
-        sku: item.product?.sku || null,
-        barcode: item.product?.barcode || null,
-        quantity: Number(item.quantity || 0),
-        unitPrice: Number(item.unitPrice || 0),
-        price: Number(item.unitPrice || 0),
-        total: Number(item.total || 0),
-      })),
+      items,
       totals: {
-        subtotal: Number(proforma.subtotal || 0),
-        total: Number(proforma.total || 0),
+        subtotal,
+        total,
         amountPaid: 0,
-        balanceDue: Number(proforma.total || 0),
+        balanceDue: 0,
         currency: proforma.currency || "RWF",
       },
       extra: {
-        notes: proforma.notes,
-        preparedBy: proforma.preparedBy,
+        notes:
+          proforma.notes ||
+          tenant?.proformaTerms ||
+          "This proforma is not a final invoice and does not confirm payment.",
+        preparedBy: oneLine(proforma.preparedBy) || "Store staff",
         validUntil: proforma.validUntil,
-        reference: proforma.reference,
+        reference: oneLine(proforma.reference) || "—",
         sellingLocation,
         storeLocation: sellingLocation,
         locationLabel: "Selling location",

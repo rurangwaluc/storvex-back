@@ -72,6 +72,183 @@ function paymentMethodTouchesCashDrawer(method) {
   return String(method || "").toUpperCase() === "CASH";
 }
 
+function hasModelField(model, fieldName) {
+  return typeof model?.fields?.[fieldName] !== "undefined";
+}
+
+function roundMoney(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n);
+}
+
+function normalizeTaxMode(value) {
+  const mode = String(value || "NONE").trim().toUpperCase();
+
+  if (
+    mode === "VAT_18" ||
+    mode === "TURNOVER_3_INTERNAL" ||
+    mode === "VAT_18_PLUS_TURNOVER_3" ||
+    mode === "CUSTOM"
+  ) {
+    return mode;
+  }
+
+  return "NONE";
+}
+
+function normalizeTaxDisplayMode(value) {
+  const mode = String(value || "HIDDEN").trim().toUpperCase();
+
+  if (mode === "CUSTOMER_FACING" || mode === "INTERNAL_ONLY") {
+    return mode;
+  }
+
+  return "HIDDEN";
+}
+
+function defaultTaxNameForMode(taxMode) {
+  if (taxMode === "VAT_18") return "VAT 18% included";
+  if (taxMode === "TURNOVER_3_INTERNAL") return "Turnover tax estimate included";
+  if (taxMode === "VAT_18_PLUS_TURNOVER_3") return "Tax included";
+  if (taxMode === "CUSTOM") return "Tax included";
+  return null;
+}
+
+function includedTaxName(value, taxMode) {
+  const base = normalizeText(value) || defaultTaxNameForMode(taxMode);
+  if (!base) return null;
+
+  if (String(base).toLowerCase().includes("included")) return base;
+
+  return `${base} included`;
+}
+
+function defaultTaxRateBpsForMode(taxMode) {
+  if (taxMode === "VAT_18") return 1800;
+  if (taxMode === "TURNOVER_3_INTERNAL") return 300;
+  if (taxMode === "VAT_18_PLUS_TURNOVER_3") return 2100;
+  return 0;
+}
+
+function clampTaxRateBps(value, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(10000, Math.round(n)));
+}
+
+function normalizeTenantTaxSettings(settings = {}) {
+  const taxMode = normalizeTaxMode(settings.taxMode);
+  const taxDisplayMode = normalizeTaxDisplayMode(settings.taxDisplayMode);
+  const defaultRate = defaultTaxRateBpsForMode(taxMode);
+  const taxRateBps = clampTaxRateBps(settings.taxRateBps, defaultRate);
+
+  // Retail rule: the product selling price is the final customer price.
+  // VAT/tax is extracted from that price, not added on top at checkout.
+  const pricesIncludeTax = taxMode !== "NONE" && taxRateBps > 0;
+
+  const taxName =
+    taxMode === "NONE"
+      ? null
+      : includedTaxName(settings.taxName, taxMode);
+
+  const customerFacing =
+    taxMode !== "NONE" &&
+    taxRateBps > 0 &&
+    taxDisplayMode === "CUSTOMER_FACING" &&
+    Boolean(settings.showTaxOnCustomerDocuments);
+
+  return {
+    taxMode,
+    taxDisplayMode,
+    taxName,
+    taxRateBps,
+    pricesIncludeTax,
+    showTaxOnCustomerDocuments: customerFacing,
+  };
+}
+
+function calculateSaleTaxSnapshot(subtotal, settings = {}) {
+  const safeSubtotal = roundMoney(subtotal);
+  const taxSettings = normalizeTenantTaxSettings(settings);
+  const hasTaxProfile = taxSettings.taxMode !== "NONE" && taxSettings.taxRateBps > 0;
+
+  let taxableAmount = safeSubtotal;
+  let taxAmount = 0;
+
+  if (hasTaxProfile) {
+    taxAmount = roundMoney(
+      (safeSubtotal * taxSettings.taxRateBps) /
+        (10000 + taxSettings.taxRateBps),
+    );
+    taxableAmount = Math.max(0, safeSubtotal - taxAmount);
+  }
+
+  const customerTaxIsCollected =
+    taxSettings.showTaxOnCustomerDocuments &&
+    taxSettings.taxDisplayMode === "CUSTOMER_FACING" &&
+    hasTaxProfile;
+
+  return {
+    // Product selling price is gross/customer price.
+    // For VAT-inclusive retail pricing, this remains equal to the final total.
+    subtotalAmount: safeSubtotal,
+    taxableAmount,
+    taxName: hasTaxProfile ? taxSettings.taxName : null,
+    taxMode: taxSettings.taxMode,
+    taxDisplayMode: taxSettings.taxDisplayMode,
+    taxRateBps: hasTaxProfile ? taxSettings.taxRateBps : 0,
+    taxAmount: hasTaxProfile ? taxAmount : 0,
+    pricesIncludeTax: hasTaxProfile,
+    showTaxOnCustomerDocuments: customerTaxIsCollected,
+    total: safeSubtotal,
+  };
+}
+
+function saleTaxSnapshotSelect(db) {
+  return {
+    ...(hasModelField(db.sale, "subtotalAmount") ? { subtotalAmount: true } : {}),
+    ...(hasModelField(db.sale, "taxableAmount") ? { taxableAmount: true } : {}),
+    ...(hasModelField(db.sale, "taxName") ? { taxName: true } : {}),
+    ...(hasModelField(db.sale, "taxMode") ? { taxMode: true } : {}),
+    ...(hasModelField(db.sale, "taxDisplayMode") ? { taxDisplayMode: true } : {}),
+    ...(hasModelField(db.sale, "taxRateBps") ? { taxRateBps: true } : {}),
+    ...(hasModelField(db.sale, "taxAmount") ? { taxAmount: true } : {}),
+    ...(hasModelField(db.sale, "pricesIncludeTax") ? { pricesIncludeTax: true } : {}),
+    ...(hasModelField(db.sale, "showTaxOnCustomerDocuments")
+      ? { showTaxOnCustomerDocuments: true }
+      : {}),
+  };
+}
+
+function saleTaxSnapshotData(db, taxSnapshot) {
+  return {
+    ...(hasModelField(db.sale, "subtotalAmount")
+      ? { subtotalAmount: taxSnapshot.subtotalAmount }
+      : {}),
+    ...(hasModelField(db.sale, "taxableAmount")
+      ? { taxableAmount: taxSnapshot.taxableAmount }
+      : {}),
+    ...(hasModelField(db.sale, "taxName") ? { taxName: taxSnapshot.taxName } : {}),
+    ...(hasModelField(db.sale, "taxMode") ? { taxMode: taxSnapshot.taxMode } : {}),
+    ...(hasModelField(db.sale, "taxDisplayMode")
+      ? { taxDisplayMode: taxSnapshot.taxDisplayMode }
+      : {}),
+    ...(hasModelField(db.sale, "taxRateBps")
+      ? { taxRateBps: taxSnapshot.taxRateBps }
+      : {}),
+    ...(hasModelField(db.sale, "taxAmount")
+      ? { taxAmount: taxSnapshot.taxAmount }
+      : {}),
+    ...(hasModelField(db.sale, "pricesIncludeTax")
+      ? { pricesIncludeTax: taxSnapshot.pricesIncludeTax }
+      : {}),
+    ...(hasModelField(db.sale, "showTaxOnCustomerDocuments")
+      ? { showTaxOnCustomerDocuments: taxSnapshot.showTaxOnCustomerDocuments }
+      : {}),
+  };
+}
+
 function computeSaleStatus({ saleType, total, amountPaid, dueDate }) {
   const t = Number(total) || 0;
   const paid = Number(amountPaid) || 0;
@@ -572,6 +749,57 @@ async function getTenantCashDrawerPolicy(db, tenantId) {
   return blockCashSales == null ? true : Boolean(blockCashSales);
 }
 
+async function getTenantDocumentTaxSettings(db, tenantId) {
+  if (!tenantId || !db.tenantDocumentSettings) {
+    return normalizeTenantTaxSettings({});
+  }
+
+  const settings = await db.tenantDocumentSettings.upsert({
+    where: { tenantId: String(tenantId) },
+    update: {},
+    create: {
+      tenantId: String(tenantId),
+      ...(hasModelField(db.tenantDocumentSettings, "documentHeaderDisplay")
+        ? { documentHeaderDisplay: "LOGO_AND_NAME" }
+        : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "documentSizeMode")
+        ? { documentSizeMode: "AUTO" }
+        : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "taxMode") ? { taxMode: "NONE" } : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "taxDisplayMode")
+        ? { taxDisplayMode: "HIDDEN" }
+        : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "taxRateBps")
+        ? { taxRateBps: 0 }
+        : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "pricesIncludeTax")
+        ? { pricesIncludeTax: false }
+        : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "showTaxOnCustomerDocuments")
+        ? { showTaxOnCustomerDocuments: false }
+        : {}),
+    },
+    select: {
+      ...(hasModelField(db.tenantDocumentSettings, "taxMode") ? { taxMode: true } : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "taxDisplayMode")
+        ? { taxDisplayMode: true }
+        : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "taxName") ? { taxName: true } : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "taxRateBps")
+        ? { taxRateBps: true }
+        : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "pricesIncludeTax")
+        ? { pricesIncludeTax: true }
+        : {}),
+      ...(hasModelField(db.tenantDocumentSettings, "showTaxOnCustomerDocuments")
+        ? { showTaxOnCustomerDocuments: true }
+        : {}),
+    },
+  });
+
+  return normalizeTenantTaxSettings(settings);
+}
+
 function toCashMovementDto(movement) {
   if (!movement) return null;
 
@@ -839,7 +1067,7 @@ async function createSale(req, res) {
           }
         }
 
-        let total = 0;
+        let subtotal = 0;
         const itemRows = [];
 
         for (const item of items) {
@@ -848,7 +1076,7 @@ async function createSale(req, res) {
           const p = byId.get(pid);
           const price = Number(p.sellPrice || 0);
 
-          total += price * qty;
+          subtotal += price * qty;
 
           itemRows.push({
             productId: pid,
@@ -856,6 +1084,10 @@ async function createSale(req, res) {
             price,
           });
         }
+
+        const tenantTaxSettings = await getTenantDocumentTaxSettings(tx, tenantId);
+        const taxSnapshot = calculateSaleTaxSnapshot(subtotal, tenantTaxSettings);
+        const total = taxSnapshot.total;
 
         const initialPaid = finalSaleType === "CASH" ? total : Math.min(paidRequested, total);
 
@@ -884,6 +1116,7 @@ async function createSale(req, res) {
             cashierId: userId,
             customerId: resolvedCustomerId,
             total,
+            ...saleTaxSnapshotData(tx, taxSnapshot),
             saleType: finalSaleType,
             amountPaid: initialPaid,
             balanceDue,
@@ -901,6 +1134,7 @@ async function createSale(req, res) {
             cashierId: true,
             customerId: true,
             total: true,
+            ...saleTaxSnapshotSelect(tx),
             saleType: true,
             status: true,
             amountPaid: true,
@@ -1040,6 +1274,15 @@ async function createSale(req, res) {
             branchId,
             saleType: finalSaleType,
             paymentMethod: selectedPaymentMethod,
+            subtotalAmount: taxSnapshot.subtotalAmount,
+            taxableAmount: taxSnapshot.taxableAmount,
+            taxName: taxSnapshot.taxName,
+            taxMode: taxSnapshot.taxMode,
+            taxDisplayMode: taxSnapshot.taxDisplayMode,
+            taxRateBps: taxSnapshot.taxRateBps,
+            taxAmount: taxSnapshot.taxAmount,
+            pricesIncludeTax: taxSnapshot.pricesIncludeTax,
+            showTaxOnCustomerDocuments: taxSnapshot.showTaxOnCustomerDocuments,
             total,
             amountPaid: initialPaid,
             balanceDue,
@@ -1416,6 +1659,7 @@ async function addSalePayment(req, res) {
             id: true,
             branchId: true,
             total: true,
+            ...saleTaxSnapshotSelect(tx),
             amountPaid: true,
             balanceDue: true,
             dueDate: true,
@@ -1481,6 +1725,7 @@ async function addSalePayment(req, res) {
             id: true,
             branchId: true,
             total: true,
+            ...saleTaxSnapshotSelect(tx),
             amountPaid: true,
             balanceDue: true,
             status: true,
@@ -1592,6 +1837,7 @@ async function listSales(req, res) {
         tenantId: true,
         branchId: true,
         total: true,
+        ...saleTaxSnapshotSelect(prisma),
         saleType: true,
         status: true,
         amountPaid: true,
@@ -1757,6 +2003,7 @@ async function getSaleReceipt(req, res) {
         customerId: true,
 
         total: true,
+        ...saleTaxSnapshotSelect(prisma),
         createdAt: true,
         amountPaid: true,
         balanceDue: true,
@@ -1949,6 +2196,7 @@ async function listOutstandingCredit(req, res) {
         id: true,
         branchId: true,
         total: true,
+        ...saleTaxSnapshotSelect(prisma),
         amountPaid: true,
         balanceDue: true,
         status: true,
@@ -2020,6 +2268,7 @@ async function listOverdueCredit(req, res) {
         id: true,
         branchId: true,
         total: true,
+        ...saleTaxSnapshotSelect(prisma),
         amountPaid: true,
         balanceDue: true,
         status: true,
@@ -2090,6 +2339,7 @@ async function cancelSale(req, res) {
             branchId: true,
             saleType: true,
             total: true,
+            ...saleTaxSnapshotSelect(tx),
             amountPaid: true,
             isCancelled: true,
             refundedTotal: true,
@@ -2166,6 +2416,7 @@ async function cancelSale(req, res) {
             branchId: true,
             saleType: true,
             total: true,
+            ...saleTaxSnapshotSelect(tx),
             isCancelled: true,
             cancelledAt: true,
             cancelledById: true,
@@ -2323,6 +2574,7 @@ async function createSaleRefund(req, res) {
             branchId: true,
             saleType: true,
             total: true,
+            ...saleTaxSnapshotSelect(tx),
             amountPaid: true,
             refundedTotal: true,
             isCancelled: true,
@@ -2463,6 +2715,7 @@ async function createSaleRefund(req, res) {
             id: true,
             branchId: true,
             total: true,
+            ...saleTaxSnapshotSelect(tx),
             amountPaid: true,
             refundedTotal: true,
             balanceDue: true,

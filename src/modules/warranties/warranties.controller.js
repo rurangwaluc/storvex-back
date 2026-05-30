@@ -4,6 +4,10 @@ const prisma = require("../../config/database");
 const { renderWarrantyHtml } = require("../documents/documentRender.service");
 const { buildTenantDocumentBranding } = require("../documents/documentBranding.service");
 const { reserveWarrantyDocumentNumberTx } = require("../documents/documentNumber.service");
+const {
+  parsePagination,
+  buildPaginationMeta,
+} = require("../../lib/pagination");
 
 function getTenantId(req) {
   return req.user?.tenantId || null;
@@ -23,6 +27,14 @@ function canViewAllBranches(req) {
 
 function cleanString(value) {
   const s = String(value ?? "").trim();
+  return s || null;
+}
+
+function oneLine(value) {
+  const s = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+
   return s || null;
 }
 
@@ -71,13 +83,33 @@ function deriveEndDate(startsAt, durationMonths, durationDays, explicitEndsAt) {
   return result;
 }
 
+function polishedProductName(value) {
+  const clean = oneLine(value) || "—";
+
+  if (clean === "—") return clean;
+
+  const hasUppercase = /[A-Z]/.test(clean);
+  const hasLowercase = /[a-z]/.test(clean);
+
+  if (hasLowercase && !hasUppercase) {
+    return clean
+      .split(" ")
+      .map((part) => {
+        if (!part) return part;
+        return `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
+      })
+      .join(" ");
+  }
+
+  return clean;
+}
+
 function getLocationName(location) {
   if (!location) return null;
 
-  const name = cleanString(location.name);
-  const code = cleanString(location.code);
+  const name = oneLine(location.name);
+  const code = oneLine(location.code);
 
-  if (name && code) return `${name} (${code})`;
   if (name) return name;
   if (code) return code;
 
@@ -87,12 +119,14 @@ function getLocationName(location) {
 function serializeSellingLocation(location) {
   if (!location) return null;
 
+  const name = getLocationName(location);
+
   return {
-    name: location.name || null,
-    code: location.code || null,
+    name,
+    code: oneLine(location.code),
     status: location.status || null,
     isMain: Boolean(location.isMain),
-    label: getLocationName(location),
+    label: name,
   };
 }
 
@@ -360,7 +394,6 @@ function mapWarrantyToListRow(warranty) {
     endsAt: warranty.endsAt || null,
     unitsCount: Array.isArray(warranty.units) ? warranty.units.length : 0,
     createdAt: warranty.createdAt,
-
     sellingLocation,
     storeLocation: sellingLocation,
   };
@@ -371,11 +404,11 @@ function mapWarrantyToDetail(warranty, tenant) {
     serializeSellingLocation(warranty.branch) ||
     (tenant?.sellingLocation
       ? {
-          name: tenant.sellingLocation,
+          name: oneLine(tenant.sellingLocation),
           code: null,
           status: null,
           isMain: false,
-          label: tenant.sellingLocation,
+          label: oneLine(tenant.sellingLocation),
         }
       : null);
 
@@ -391,7 +424,7 @@ function mapWarrantyToDetail(warranty, tenant) {
         startsAt: unit.startsAt || null,
         endsAt: unit.endsAt || null,
         createdAt: unit.createdAt,
-        productName: unit.saleItem?.product?.name || unit.unitLabel || null,
+        productName: polishedProductName(unit.saleItem?.product?.name || unit.unitLabel || null),
         sku: unit.saleItem?.product?.sku || null,
         barcode: unit.saleItem?.product?.barcode || null,
       }))
@@ -442,6 +475,8 @@ function mapWarrantyToDetail(warranty, tenant) {
             receiptFooter: tenant.receiptFooter || null,
             documentPrimaryColor: tenant.documentPrimaryColor || "#1F365C",
             documentAccentColor: tenant.documentAccentColor || "#D8D2C2",
+            documentHeaderDisplay: tenant.documentHeaderDisplay || "LOGO_AND_NAME",
+            documentSizeMode: tenant.documentSizeMode || "AUTO",
             invoiceTerms: tenant.invoiceTerms || null,
             warrantyTerms: tenant.warrantyTerms || null,
             proformaTerms: tenant.proformaTerms || null,
@@ -594,6 +629,10 @@ async function listWarranties(req, res) {
 
     const scope = resolveWarrantyBranchScope(req);
     const q = cleanString(req.query.q);
+    const pagination = parsePagination(req.query, {
+      defaultLimit: 30,
+      maxLimit: 100,
+    });
 
     const where = applyWarrantyBranchScope(
       {
@@ -603,7 +642,7 @@ async function listWarranties(req, res) {
           ...saleDraftWhereFalse(),
         },
       },
-      scope
+      scope,
     );
 
     if (q) {
@@ -619,16 +658,26 @@ async function listWarranties(req, res) {
       ];
     }
 
-    const warranties = await prisma.saleWarranty.findMany({
-      where,
-      orderBy: [{ createdAt: "desc" }],
-      take: 200,
-      select: warrantyListSelect(),
-    });
+    const [total, warranties] = await prisma.$transaction([
+      prisma.saleWarranty.count({ where }),
+      prisma.saleWarranty.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }],
+        skip: pagination.skip,
+        take: pagination.limit,
+        select: warrantyListSelect(),
+      }),
+    ]);
 
     return res.json({
       warranties: warranties.map(mapWarrantyToListRow),
       count: warranties.length,
+      pagination: buildPaginationMeta({
+        page: pagination.page,
+        limit: pagination.limit,
+        total,
+      }),
+      branchScope: scope,
     });
   } catch (error) {
     const handled = sendLocationError(res, error);
@@ -710,7 +759,7 @@ async function createWarranty(req, res) {
           productName: item.product?.name || null,
           serial: item.product?.serial || null,
         },
-      ])
+      ]),
     );
 
     const normalizedUnits = unitsInput
@@ -736,7 +785,7 @@ async function createWarranty(req, res) {
         (unit) =>
           unit.saleItemId &&
           unit.productId &&
-          (unit.unitLabel || unit.serial || unit.imei1 || unit.imei2)
+          (unit.unitLabel || unit.serial || unit.imei1 || unit.imei2),
       );
 
     if (!normalizedUnits.length) {
@@ -816,7 +865,7 @@ async function createWarranty(req, res) {
       {
         maxWait: 5000,
         timeout: 15000,
-      }
+      },
     );
 
     return res.status(201).json({
@@ -857,7 +906,7 @@ async function getWarranty(req, res) {
           },
           OR: [{ id }, { warrantyNumber: id }],
         },
-        scope
+        scope,
       ),
       select: warrantyDetailSelect(),
     });
@@ -869,7 +918,7 @@ async function getWarranty(req, res) {
     const tenant = await buildTenantDocumentBranding(
       prisma,
       tenantId,
-      warranty.branchId || null
+      warranty.branchId || null,
     );
 
     return res.json(mapWarrantyToDetail(warranty, tenant));
@@ -903,7 +952,7 @@ async function updateWarranty(req, res) {
           tenantId,
           OR: [{ id }, { warrantyNumber: id }],
         },
-        scope
+        scope,
       ),
       select: {
         id: true,
@@ -991,7 +1040,7 @@ async function updateWarranty(req, res) {
             (unit) =>
               unit.saleItemId &&
               unit.productId &&
-              (unit.unitLabel || unit.serial || unit.imei1 || unit.imei2)
+              (unit.unitLabel || unit.serial || unit.imei1 || unit.imei2),
           );
 
         await tx.saleWarrantyUnit.deleteMany({
@@ -1056,7 +1105,7 @@ async function deleteWarranty(req, res) {
           },
           OR: [{ id }, { warrantyNumber: id }],
         },
-        scope
+        scope,
       ),
       select: {
         id: true,
@@ -1113,7 +1162,7 @@ async function printWarrantyHtml(req, res) {
           },
           OR: [{ id }, { warrantyNumber: id }],
         },
-        scope
+        scope,
       ),
       select: warrantyDetailSelect(),
     });
@@ -1125,16 +1174,21 @@ async function printWarrantyHtml(req, res) {
     const tenant = await buildTenantDocumentBranding(
       prisma,
       tenantId,
-      warranty.branchId || null
+      warranty.branchId || null,
     );
 
-    const sellingLocation = getLocationName(warranty.branch) || tenant?.sellingLocation || null;
+    const sellingLocation =
+      getLocationName(warranty.branch) ||
+      oneLine(tenant?.sellingLocation) ||
+      oneLine(tenant?.storeLocation) ||
+      oneLine(tenant?.locationName) ||
+      null;
 
     const items = (warranty.units || []).map((unit) => ({
-      productName: unit.saleItem?.product?.name || unit.unitLabel || "—",
-      serial: unit.serial || unit.imei1 || unit.imei2 || null,
-      sku: unit.saleItem?.product?.sku || null,
-      barcode: unit.saleItem?.product?.barcode || null,
+      productName: polishedProductName(unit.saleItem?.product?.name || unit.unitLabel || "—"),
+      serial: oneLine(unit.serial || unit.imei1 || unit.imei2 || ""),
+      sku: oneLine(unit.saleItem?.product?.sku || ""),
+      barcode: oneLine(unit.saleItem?.product?.barcode || ""),
       quantity: 1,
       unitPrice: 0,
       price: 0,
@@ -1146,6 +1200,7 @@ async function printWarrantyHtml(req, res) {
         ...tenant,
         sellingLocation,
         storeLocation: sellingLocation,
+        locationName: sellingLocation,
       },
       document: {
         number: warranty.warrantyNumber || warranty.id,
@@ -1154,8 +1209,8 @@ async function printWarrantyHtml(req, res) {
       },
       customer: warranty.sale?.customer
         ? {
-            name: warranty.sale.customer.name,
-            phone: warranty.sale.customer.phone,
+            name: warranty.sale.customer.name || "Walk-in Customer",
+            phone: warranty.sale.customer.phone || null,
             email: warranty.sale.customer.email || null,
             address: warranty.sale.customer.address || null,
           }
@@ -1172,14 +1227,18 @@ async function printWarrantyHtml(req, res) {
         amountPaid: 0,
         balanceDue: 0,
         currency: "RWF",
+        _itemCount: items.length,
+        _itemCountLabel: "Items covered",
       },
       extra: {
-        issuedBy: warranty.sale?.cashier?.name || null,
+        issuedBy: oneLine(warranty.sale?.cashier?.name) || "Store staff",
         startDate: warranty.startsAt || null,
         endDate: warranty.endsAt || null,
         sellingLocation,
         storeLocation: sellingLocation,
         locationLabel: "Selling location",
+        itemCountLabel: "Items covered",
+        hideFooterSignature: true,
         warrantyTerms:
           warranty.policy ||
           tenant?.warrantyTerms ||

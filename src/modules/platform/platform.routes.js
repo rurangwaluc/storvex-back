@@ -1,57 +1,36 @@
 const express = require("express");
+
 const router = express.Router();
 
-const controller = require("./platform.controller");
+/**
+ * Platform root router.
+ *
+ * Keep this file intentionally small.
+ *
+ * Dedicated platform modules are mounted in app.js:
+ * - /api/platform/auth      -> platform.auth.routes.js
+ * - /api/platform/users     -> platform.users.routes.js
+ * - /api/platform/tenants   -> platform.tenants.routes.js
+ * - /api/platform/audit     -> platform.audit.routes.js
+ * - /api/platform/billing   -> platform.billing.routes.js
+ * - /api/platform/support   -> platform.support.routes.js
+ *
+ * Do NOT define /auth, /users, /tenants, /audit, /billing, or /support here.
+ * If this file defines those paths, it can shadow the dedicated route files.
+ */
 
-const authenticate = require("../../middlewares/authenticate");
-const requirePlatform = require("../../middlewares/requirePlatform");
-
-// Dashboard KPIs
-router.get(
-  "/dashboard",
-  authenticate,
-  requirePlatform,
-  controller.dashboard
-);
-
-// List all tenants
-router.get(
-  "/tenants",
-  authenticate,
-  requirePlatform,
-  controller.listTenants
-);
-// Tenants info
-router.get(
-  "/tenants/:tenantId",
-  authenticate,
-  requirePlatform,
-  controller.getTenantDetails
-);
-
-// Update tenant status (ACTIVE / SUSPENDED)
-router.patch(
-  "/tenants/:tenantId/status",
-  authenticate,
-  requirePlatform,
-  controller.updateTenantStatus
-);
-
-
-// List subscriptions
-router.get(
-  "/subscriptions",
-  authenticate,
-  requirePlatform,
-  controller.listSubscriptions
-);
-
-// List owner intents
-router.get(
-  "/intents",
-  authenticate,
-  requirePlatform,
-  controller.listOwnerIntents
-);
+router.get("/", (req, res) => {
+  return res.json({
+    message: "Storvex platform API",
+    modules: {
+      auth: "/api/platform/auth",
+      users: "/api/platform/users",
+      tenants: "/api/platform/tenants",
+      audit: "/api/platform/audit",
+      billing: "/api/platform/billing",
+      support: "/api/platform/support",
+    },
+  });
+});
 
 module.exports = router;

@@ -3,6 +3,10 @@
 const prisma = require("../../config/database");
 const { renderDeliveryNoteHtml } = require("../documents/documentRender.service");
 const { buildTenantDocumentBranding } = require("../documents/documentBranding.service");
+const {
+  parsePagination,
+  buildPaginationMeta,
+} = require("../../lib/pagination");
 
 function getTenantId(req) {
   return req.user?.tenantId || null;
@@ -25,18 +29,46 @@ function cleanString(value) {
   return s || null;
 }
 
+function oneLine(value) {
+  const s = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return s || null;
+}
+
 function toInt(value, fallback = NaN) {
   const n = Number(value);
   return Number.isFinite(n) ? Math.floor(n) : fallback;
 }
 
+function polishedProductName(value) {
+  const clean = oneLine(value) || "—";
+
+  if (clean === "—") return clean;
+
+  const hasUppercase = /[A-Z]/.test(clean);
+  const hasLowercase = /[a-z]/.test(clean);
+
+  if (hasLowercase && !hasUppercase) {
+    return clean
+      .split(" ")
+      .map((part) => {
+        if (!part) return part;
+        return `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
+      })
+      .join(" ");
+  }
+
+  return clean;
+}
+
 function getLocationName(branch) {
   if (!branch) return null;
 
-  const name = cleanString(branch.name);
-  const code = cleanString(branch.code);
+  const name = oneLine(branch.name);
+  const code = oneLine(branch.code);
 
-  if (name && code) return `${name} (${code})`;
   if (name) return name;
   if (code) return code;
 
@@ -47,8 +79,8 @@ function serializeSellingLocation(branch) {
   if (!branch) return null;
 
   return {
-    name: branch.name || null,
-    code: branch.code || null,
+    name: getLocationName(branch),
+    code: oneLine(branch.code),
     status: branch.status || null,
     isMain: Boolean(branch.isMain),
     label: getLocationName(branch),
@@ -59,8 +91,8 @@ function normalizeDeliveryItems(inputItems = []) {
   return (Array.isArray(inputItems) ? inputItems : [])
     .map((item) => ({
       productId: cleanString(item.productId),
-      productName: cleanString(item.productName),
-      serial: cleanString(item.serial),
+      productName: polishedProductName(item.productName),
+      serial: oneLine(item.serial),
       quantity: toInt(item.quantity, 1),
     }))
     .filter((item) => item.productName && item.quantity > 0);
@@ -205,7 +237,6 @@ function mapDeliveryNoteListRow(row) {
     status: "DELIVERED",
     itemsCount: Array.isArray(row.items) ? row.items.length : 0,
     createdAt: row.createdAt,
-
     sellingLocation,
     storeLocation: sellingLocation,
   };
@@ -244,6 +275,14 @@ function mapDeliveryNoteDetail(note) {
     ...note,
     sellingLocation,
     storeLocation: sellingLocation,
+    items: Array.isArray(note.items)
+      ? note.items.map((item) => ({
+          ...item,
+          productName: polishedProductName(item.productName),
+          serial: oneLine(item.serial),
+          quantity: Number(item.quantity || 0),
+        }))
+      : [],
   };
 }
 
@@ -291,6 +330,10 @@ async function listDeliveryNotes(req, res) {
 
     const scope = resolveDeliveryNoteBranchScope(req);
     const q = cleanString(req.query.q);
+    const pagination = parsePagination(req.query, {
+      defaultLimit: 30,
+      maxLimit: 100,
+    });
 
     let where = { tenantId };
     where = applyDeliveryBranchScope(where, scope);
@@ -307,44 +350,54 @@ async function listDeliveryNotes(req, res) {
       ];
     }
 
-    const rows = await prisma.deliveryNote.findMany({
-      where,
-      orderBy: [{ createdAt: "desc" }],
-      take: 200,
-      select: {
-        id: true,
-        ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
-          ? { branchId: true }
-          : {}),
-        ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
-          ? {
-              branch: {
-                select: {
-                  id: true,
-                  name: true,
-                  code: true,
-                  status: true,
-                  isMain: true,
+    const [total, rows] = await prisma.$transaction([
+      prisma.deliveryNote.count({ where }),
+      prisma.deliveryNote.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }],
+        skip: pagination.skip,
+        take: pagination.limit,
+        select: {
+          id: true,
+          ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
+            ? { branchId: true }
+            : {}),
+          ...(typeof prisma.deliveryNote.fields?.branchId !== "undefined"
+            ? {
+                branch: {
+                  select: {
+                    id: true,
+                    name: true,
+                    code: true,
+                    status: true,
+                    isMain: true,
+                  },
                 },
-              },
-            }
-          : {}),
-        number: true,
-        date: true,
-        customerName: true,
-        customerPhone: true,
-        deliveredBy: true,
-        receivedBy: true,
-        createdAt: true,
-        items: {
-          select: { id: true },
+              }
+            : {}),
+          number: true,
+          date: true,
+          customerName: true,
+          customerPhone: true,
+          deliveredBy: true,
+          receivedBy: true,
+          createdAt: true,
+          items: {
+            select: { id: true },
+          },
         },
-      },
-    });
+      }),
+    ]);
 
     return res.json({
       deliveryNotes: rows.map(mapDeliveryNoteListRow),
       count: rows.length,
+      pagination: buildPaginationMeta({
+        page: pagination.page,
+        limit: pagination.limit,
+        total,
+      }),
+      branchScope: scope,
     });
   } catch (error) {
     const handled = sendLocationError(res, error);
@@ -513,9 +566,7 @@ async function updateDeliveryNote(req, res) {
     const customerPhone =
       req.body.customerPhone !== undefined ? cleanString(req.body.customerPhone) : undefined;
     const customerAddress =
-      req.body.customerAddress !== undefined
-        ? cleanString(req.body.customerAddress)
-        : undefined;
+      req.body.customerAddress !== undefined ? cleanString(req.body.customerAddress) : undefined;
     const deliveredBy =
       req.body.deliveredBy !== undefined ? cleanString(req.body.deliveredBy) : undefined;
     const receivedBy =
@@ -690,16 +741,28 @@ async function printDeliveryNoteHtml(req, res) {
     const tenant = await buildTenantDocumentBranding(
       prisma,
       tenantId,
-      note.branchId || null
+      note.branchId || null,
     );
 
-    const sellingLocation = getLocationName(note.branch) || tenant?.sellingLocation || null;
+    const sellingLocation =
+      getLocationName(note.branch) ||
+      oneLine(tenant?.sellingLocation) ||
+      oneLine(tenant?.storeLocation) ||
+      oneLine(tenant?.locationName) ||
+      null;
+
+    const items = (note.items || []).map((item) => ({
+      productName: polishedProductName(item.productName),
+      serial: oneLine(item.serial),
+      quantity: Number(item.quantity || 0),
+    }));
 
     const html = renderDeliveryNoteHtml({
       tenant: {
         ...tenant,
         sellingLocation,
         storeLocation: sellingLocation,
+        locationName: sellingLocation,
       },
       document: {
         number: String(note.number),
@@ -711,19 +774,19 @@ async function printDeliveryNoteHtml(req, res) {
         phone: note.customerPhone,
         address: note.customerAddress,
       },
-      items: (note.items || []).map((item) => ({
-        productName: item.productName,
-        serial: item.serial,
-        quantity: item.quantity,
-      })),
+      items,
       totals: {
         currency: "RWF",
+        _itemCount: items.length,
       },
       extra: {
-        deliveredBy: note.deliveredBy,
-        receivedBy: note.receivedBy,
-        receivedByPhone: note.receivedByPhone,
-        notes: note.notes || tenant?.deliveryNoteTerms || null,
+        deliveredBy: oneLine(note.deliveredBy) || "Store staff",
+        receivedBy: oneLine(note.receivedBy) || "Receiver",
+        receivedByPhone: oneLine(note.receivedByPhone) || null,
+        notes:
+          note.notes ||
+          tenant?.deliveryNoteTerms ||
+          "Please confirm that all delivered items were received in good condition.",
         badgeText: "DELIVERY",
         sellingLocation,
         storeLocation: sellingLocation,

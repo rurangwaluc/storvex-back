@@ -1,4 +1,3 @@
-// src/modules/store/store.service.js
 const path = require("path");
 const prisma = require("../../config/database");
 const {
@@ -17,7 +16,6 @@ const ALLOWED_LOGO_CONTENT_TYPES = new Set([
   "image/webp",
 ]);
 
-// Storvex is for electronics retail only.
 const ALLOWED_SHOP_TYPES = new Set([
   "ELECTRONICS_RETAIL",
   "PHONE_SHOP",
@@ -42,6 +40,28 @@ const OPERATIONAL_ROLES = new Set([
   "SELLER",
   "CASHIER",
   "TECHNICIAN",
+]);
+
+const DOCUMENT_HEADER_DISPLAYS = new Set([
+  "LOGO_AND_NAME",
+  "LOGO_ONLY",
+  "NAME_ONLY",
+]);
+
+const DOCUMENT_SIZE_MODES = new Set(["AUTO", "COMPACT", "STANDARD"]);
+
+const TAX_MODES = new Set([
+  "NONE",
+  "VAT_18",
+  "TURNOVER_3_INTERNAL",
+  "VAT_18_PLUS_TURNOVER_3",
+  "CUSTOM",
+]);
+
+const TAX_DISPLAY_MODES = new Set([
+  "HIDDEN",
+  "CUSTOMER_FACING",
+  "INTERNAL_ONLY",
 ]);
 
 function cleanString(value) {
@@ -89,7 +109,6 @@ function normalizeShopType(value) {
   const raw = cleanUpperString(value, null, 80);
   if (!raw) return null;
 
-  // Backward-safe aliases
   if (raw === "ELECTRONICS") return "ELECTRONICS_RETAIL";
   if (raw === "PHONE") return "PHONE_SHOP";
   if (raw === "LAPTOP") return "LAPTOP_SHOP";
@@ -98,7 +117,7 @@ function normalizeShopType(value) {
 
   if (!ALLOWED_SHOP_TYPES.has(raw)) {
     const err = new Error(
-      "shopType must be one of ELECTRONICS_RETAIL, PHONE_SHOP, LAPTOP_SHOP, ACCESSORIES_SHOP, REPAIR_SHOP, MIXED_ELECTRONICS"
+      "shopType must be one of ELECTRONICS_RETAIL, PHONE_SHOP, LAPTOP_SHOP, ACCESSORIES_SHOP, REPAIR_SHOP, MIXED_ELECTRONICS",
     );
     err.status = 400;
     throw err;
@@ -121,15 +140,22 @@ function normalizeTimezone(value) {
 
 function toBool(value, fallback = false) {
   if (typeof value === "boolean") return value;
+
   if (typeof value === "string") {
     const v = value.trim().toLowerCase();
     if (v === "true") return true;
     if (v === "false") return false;
+    if (v === "1") return true;
+    if (v === "0") return false;
+    if (v === "yes") return true;
+    if (v === "no") return false;
   }
+
   if (typeof value === "number") {
     if (value === 1) return true;
     if (value === 0) return false;
   }
+
   return fallback;
 }
 
@@ -144,6 +170,78 @@ function daysBetweenCeil(futureDate, now = new Date()) {
   const ms = new Date(futureDate).getTime() - new Date(now).getTime();
   if (!Number.isFinite(ms)) return null;
   return Math.max(0, Math.ceil(ms / (1000 * 60 * 60 * 24)));
+}
+
+function normalizeEnum(value, allowed, fallback) {
+  const raw = cleanUpperString(value, fallback, 80) || fallback;
+  return allowed.has(raw) ? raw : fallback;
+}
+
+function normalizeDocumentHeaderDisplay(value) {
+  return normalizeEnum(value, DOCUMENT_HEADER_DISPLAYS, "LOGO_AND_NAME");
+}
+
+function normalizeDocumentSizeMode(value) {
+  return normalizeEnum(value, DOCUMENT_SIZE_MODES, "AUTO");
+}
+
+function normalizeTaxMode(value) {
+  return normalizeEnum(value, TAX_MODES, "NONE");
+}
+
+function normalizeTaxDisplayMode(value) {
+  return normalizeEnum(value, TAX_DISPLAY_MODES, "HIDDEN");
+}
+
+function defaultTaxNameForMode(taxMode) {
+  if (taxMode === "VAT_18") return "VAT 18%";
+  if (taxMode === "TURNOVER_3_INTERNAL") return "Turnover tax estimate 3%";
+  if (taxMode === "VAT_18_PLUS_TURNOVER_3") return "Tax 21%";
+  if (taxMode === "CUSTOM") return "Tax";
+  return null;
+}
+
+function defaultTaxRateBpsForMode(taxMode) {
+  if (taxMode === "VAT_18") return 1800;
+  if (taxMode === "TURNOVER_3_INTERNAL") return 300;
+  if (taxMode === "VAT_18_PLUS_TURNOVER_3") return 2100;
+  return 0;
+}
+
+function clampTaxRateBps(value, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(10000, Math.round(n)));
+}
+
+function normalizeTaxSettings(body = {}) {
+  const taxMode = normalizeTaxMode(body.taxMode);
+  const taxDisplayMode = normalizeTaxDisplayMode(body.taxDisplayMode);
+  const defaultRate = defaultTaxRateBpsForMode(taxMode);
+
+  const isCustom = taxMode === "CUSTOM";
+  const taxRateBps = isCustom
+    ? clampTaxRateBps(body.taxRateBps, defaultRate)
+    : defaultRate;
+
+  const taxName =
+    taxMode === "NONE"
+      ? null
+      : cleanNullableString(body.taxName, 80) || defaultTaxNameForMode(taxMode);
+
+  const customerFacing =
+    taxMode !== "NONE" &&
+    taxDisplayMode === "CUSTOMER_FACING" &&
+    toBool(body.showTaxOnCustomerDocuments, false) === true;
+
+  return {
+    taxMode,
+    taxDisplayMode,
+    taxName,
+    taxRateBps,
+    pricesIncludeTax: toBool(body.pricesIncludeTax, false),
+    showTaxOnCustomerDocuments: customerFacing,
+  };
 }
 
 function buildTrialBanner(subscription, now = new Date()) {
@@ -282,11 +380,111 @@ function serializeStoreProfileRow(tenant) {
   };
 }
 
+function serializeDocumentSettingsRow(settings, previews, tenantId) {
+  const taxMode = normalizeTaxMode(settings.taxMode);
+  const taxDisplayMode = normalizeTaxDisplayMode(settings.taxDisplayMode);
+
+  return {
+    tenantId,
+
+    receiptPrefix: settings.receiptPrefix || "RCT",
+    invoicePrefix: settings.invoicePrefix || "INV",
+    warrantyPrefix: settings.warrantyPrefix || "WAR",
+    proformaPrefix: settings.proformaPrefix || "PRF",
+
+    receiptPadding: Number(settings.receiptPadding || 6),
+    invoicePadding: Number(settings.invoicePadding || 6),
+    warrantyPadding: Number(settings.warrantyPadding || 6),
+    proformaPadding: Number(settings.proformaPadding || 6),
+
+    invoiceTerms: settings.invoiceTerms || null,
+    warrantyTerms: settings.warrantyTerms || null,
+    proformaTerms: settings.proformaTerms || null,
+    deliveryNoteTerms: settings.deliveryNoteTerms || null,
+
+    documentPrimaryColor: settings.documentPrimaryColor || "#0F4C81",
+    documentAccentColor: settings.documentAccentColor || "#E8EEF5",
+
+    documentHeaderDisplay: normalizeDocumentHeaderDisplay(
+      settings.documentHeaderDisplay,
+    ),
+    documentSizeMode: normalizeDocumentSizeMode(settings.documentSizeMode),
+
+    taxMode,
+    taxDisplayMode,
+    taxName: settings.taxName || defaultTaxNameForMode(taxMode),
+    taxRateBps: Number(
+      settings.taxRateBps || defaultTaxRateBpsForMode(taxMode),
+    ),
+    taxRatePercent:
+      Number(settings.taxRateBps || defaultTaxRateBpsForMode(taxMode)) / 100,
+    pricesIncludeTax: Boolean(settings.pricesIncludeTax),
+    showTaxOnCustomerDocuments: Boolean(settings.showTaxOnCustomerDocuments),
+
+    taxSummary: buildTaxSummary({
+      taxMode,
+      taxDisplayMode,
+      taxName: settings.taxName || defaultTaxNameForMode(taxMode),
+      taxRateBps: Number(
+        settings.taxRateBps || defaultTaxRateBpsForMode(taxMode),
+      ),
+      pricesIncludeTax: Boolean(settings.pricesIncludeTax),
+      showTaxOnCustomerDocuments: Boolean(settings.showTaxOnCustomerDocuments),
+    }),
+
+    ...previews,
+  };
+}
+
+function buildTaxSummary(settings) {
+  if (!settings || settings.taxMode === "NONE") {
+    return {
+      label: "No tax shown on customer documents",
+      customerFacing: false,
+      internalOnly: false,
+      warning: null,
+    };
+  }
+
+  if (settings.taxDisplayMode === "INTERNAL_ONLY") {
+    return {
+      label: `${settings.taxName || "Tax"} kept for internal reporting only`,
+      customerFacing: false,
+      internalOnly: true,
+      warning:
+        "This will not appear on receipts, invoices, proformas, delivery notes, or warranties.",
+    };
+  }
+
+  if (
+    settings.taxDisplayMode === "CUSTOMER_FACING" &&
+    settings.showTaxOnCustomerDocuments
+  ) {
+    return {
+      label: `${settings.taxName || "Tax"} shown on customer documents`,
+      customerFacing: true,
+      internalOnly: false,
+      warning:
+        "Only enable this when the business is legally allowed or required to show this tax.",
+    };
+  }
+
+  return {
+    label: "Tax configured but hidden from customer documents",
+    customerFacing: false,
+    internalOnly: false,
+    warning:
+      "Turn on customer document display only when this tax should legally appear to the customer.",
+  };
+}
+
 function sanitizePrefix(value, fallback) {
   const cleaned = String(value || "")
     .trim()
     .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "");
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 8);
+
   return cleaned || fallback;
 }
 
@@ -313,7 +511,7 @@ function sanitizeHexColor(value, fallback) {
 function clampPadding(value, fallback = 6) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
-  return Math.max(4, Math.min(10, Math.round(n)));
+  return Math.max(4, Math.min(12, Math.round(n)));
 }
 
 function sanitizeFilename(filename) {
@@ -445,7 +643,7 @@ async function getSetupChecklist(tenantId, subscription = null) {
   if (!tenant) return null;
 
   const roleCount = Object.fromEntries(
-    (userCounts || []).map((r) => [String(r.role || ""), Number(r._count?.role || 0)])
+    (userCounts || []).map((r) => [String(r.role || ""), Number(r._count?.role || 0)]),
   );
 
   const activeOwners = Number(roleCount.OWNER || 0);
@@ -572,6 +770,7 @@ async function updateStoreProfile(tenantId, payload) {
   if ("countryCode" in body) data.countryCode = normalizeCountryCode(body.countryCode);
   if ("currencyCode" in body) data.currencyCode = normalizeCurrencyCode(body.currencyCode);
   if ("timezone" in body) data.timezone = normalizeTimezone(body.timezone);
+
   if ("cashDrawerBlockCashSales" in body) {
     data.cash_drawer_block_cash_sales = toBool(body.cashDrawerBlockCashSales, true);
   }
@@ -689,39 +888,27 @@ async function getDocumentSettings(tenantId) {
     prisma.tenantDocumentSettings.upsert({
       where: { tenantId: id },
       update: {},
-      create: { tenantId: id },
+      create: {
+        tenantId: id,
+        documentHeaderDisplay: "LOGO_AND_NAME",
+        documentSizeMode: "AUTO",
+        taxMode: "NONE",
+        taxDisplayMode: "HIDDEN",
+        taxRateBps: 0,
+        pricesIncludeTax: false,
+        showTaxOnCustomerDocuments: false,
+      },
     }),
     previewDocumentNumbers(prisma, id),
   ]);
 
-  return {
-    tenantId: id,
-
-    receiptPrefix: settings.receiptPrefix,
-    invoicePrefix: settings.invoicePrefix,
-    warrantyPrefix: settings.warrantyPrefix,
-    proformaPrefix: settings.proformaPrefix,
-
-    receiptPadding: settings.receiptPadding,
-    invoicePadding: settings.invoicePadding,
-    warrantyPadding: settings.warrantyPadding,
-    proformaPadding: settings.proformaPadding,
-
-    invoiceTerms: settings.invoiceTerms,
-    warrantyTerms: settings.warrantyTerms,
-    proformaTerms: settings.proformaTerms,
-    deliveryNoteTerms: settings.deliveryNoteTerms,
-
-    documentPrimaryColor: settings.documentPrimaryColor || "#0F4C81",
-    documentAccentColor: settings.documentAccentColor || "#E8EEF5",
-
-    ...previews,
-  };
+  return serializeDocumentSettingsRow(settings, previews, id);
 }
 
 async function updateDocumentSettings(tenantId, payload) {
   const id = assertTenantId(tenantId);
   const body = payload || {};
+  const tax = normalizeTaxSettings(body);
 
   const updateData = {
     receiptPrefix: sanitizePrefix(body.receiptPrefix, "RCT"),
@@ -741,6 +928,16 @@ async function updateDocumentSettings(tenantId, payload) {
 
     documentPrimaryColor: sanitizeHexColor(body.documentPrimaryColor, "#0F4C81"),
     documentAccentColor: sanitizeHexColor(body.documentAccentColor, "#E8EEF5"),
+
+    documentHeaderDisplay: normalizeDocumentHeaderDisplay(body.documentHeaderDisplay),
+    documentSizeMode: normalizeDocumentSizeMode(body.documentSizeMode),
+
+    taxMode: tax.taxMode,
+    taxDisplayMode: tax.taxDisplayMode,
+    taxName: tax.taxName,
+    taxRateBps: tax.taxRateBps,
+    pricesIncludeTax: tax.pricesIncludeTax,
+    showTaxOnCustomerDocuments: tax.showTaxOnCustomerDocuments,
   };
 
   const updated = await prisma.tenantDocumentSettings.upsert({
@@ -754,35 +951,14 @@ async function updateDocumentSettings(tenantId, payload) {
 
   const previews = await previewDocumentNumbers(prisma, id);
 
-  return {
-    tenantId: id,
-
-    receiptPrefix: updated.receiptPrefix,
-    invoicePrefix: updated.invoicePrefix,
-    warrantyPrefix: updated.warrantyPrefix,
-    proformaPrefix: updated.proformaPrefix,
-
-    receiptPadding: updated.receiptPadding,
-    invoicePadding: updated.invoicePadding,
-    warrantyPadding: updated.warrantyPadding,
-    proformaPadding: updated.proformaPadding,
-
-    invoiceTerms: updated.invoiceTerms,
-    warrantyTerms: updated.warrantyTerms,
-    proformaTerms: updated.proformaTerms,
-    deliveryNoteTerms: updated.deliveryNoteTerms,
-
-    documentPrimaryColor: updated.documentPrimaryColor || "#0F4C81",
-    documentAccentColor: updated.documentAccentColor || "#E8EEF5",
-
-    ...previews,
-  };
+  return serializeDocumentSettingsRow(updated, previews, id);
 }
 
 async function createLogoUploadContract(tenantId, { filename, contentType, sizeBytes } = {}) {
   const id = assertTenantId(tenantId);
 
   const normalizedContentType = String(contentType || "").toLowerCase();
+
   if (!ALLOWED_LOGO_CONTENT_TYPES.has(normalizedContentType)) {
     const err = new Error("Only PNG, JPEG, and WEBP logos are allowed");
     err.status = 400;
@@ -790,6 +966,7 @@ async function createLogoUploadContract(tenantId, { filename, contentType, sizeB
   }
 
   const safeFilename = cleanString(filename);
+
   if (!safeFilename) {
     const err = new Error("filename is required");
     err.status = 400;
@@ -797,6 +974,7 @@ async function createLogoUploadContract(tenantId, { filename, contentType, sizeB
   }
 
   const size = Number(sizeBytes || 0);
+
   if (!Number.isFinite(size) || size <= 0 || size > 3 * 1024 * 1024) {
     const err = new Error("Logo must be 3MB or smaller");
     err.status = 400;

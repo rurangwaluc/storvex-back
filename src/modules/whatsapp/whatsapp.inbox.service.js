@@ -751,8 +751,8 @@ async function getOpenCashSessionId(tx, tenantId, branchId = null) {
     const rows = await tx.$queryRaw`
       select id
       from public.cash_sessions
-      where tenant_id = ${String(tenantId)}::uuid
-        and branch_id = ${String(branchId)}::uuid
+      where tenant_id::text = ${String(tenantId)}
+        and branch_id::text = ${String(branchId)}
         and closed_at is null
       order by opened_at desc
       limit 1
@@ -764,7 +764,7 @@ async function getOpenCashSessionId(tx, tenantId, branchId = null) {
   const rows = await tx.$queryRaw`
     select id
     from public.cash_sessions
-    where tenant_id = ${String(tenantId)}::uuid
+    where tenant_id::text = ${String(tenantId)}
       and closed_at is null
     order by opened_at desc
     limit 1
@@ -788,14 +788,14 @@ async function insertCashMovementIfPossible(
         (tenant_id, branch_id, session_id, type, reason, amount, note, created_by)
       values
         (
-          ${String(tenantId)}::uuid,
-          ${String(branchId)}::uuid,
-          ${String(sessionId)}::uuid,
+          ${String(tenantId)},
+          ${String(branchId)},
+          ${String(sessionId)},
           ${String(type)}::cash_movement_type,
           ${String(reason)}::cash_movement_reason,
           ${amountBigInt},
           ${note},
-          ${userId ? String(userId) : null}::uuid
+          ${userId ? String(userId) : null}
         )
       returning id, type, reason, amount, note, created_at, created_by
     `;
@@ -808,13 +808,13 @@ async function insertCashMovementIfPossible(
       (tenant_id, session_id, type, reason, amount, note, created_by)
     values
       (
-        ${String(tenantId)}::uuid,
-        ${String(sessionId)}::uuid,
+        ${String(tenantId)},
+        ${String(sessionId)},
         ${String(type)}::cash_movement_type,
         ${String(reason)}::cash_movement_reason,
         ${amountBigInt},
         ${note},
-        ${userId ? String(userId) : null}::uuid
+        ${userId ? String(userId) : null}
       )
     returning id, type, reason, amount, note, created_at, created_by
   `;
@@ -1220,14 +1220,41 @@ async function resolveOrCreateCustomerTx(tx, tenantId, { customerId, customer, c
 async function getSaleDraftTx(tx, tenantId, saleId) {
   const saleFields = getModelFields(tx.sale);
 
+  const where = {
+    id: saleId,
+    tenantId,
+    isCancelled: false,
+  };
+
+  if (
+    typeof saleFields.isDraft !== "undefined" &&
+    typeof saleFields.draftSource !== "undefined" &&
+    typeof saleFields.conversationId !== "undefined"
+  ) {
+    where.OR = [
+      {
+        isDraft: true,
+        draftSource: "WHATSAPP",
+      },
+      {
+        isDraft: false,
+        conversationId: {
+          not: null,
+        },
+      },
+    ];
+  } else if (
+    typeof saleFields.isDraft !== "undefined" &&
+    typeof saleFields.draftSource !== "undefined"
+  ) {
+    where.isDraft = true;
+    where.draftSource = "WHATSAPP";
+  } else if (typeof saleFields.isDraft !== "undefined") {
+    where.isDraft = true;
+  }
+
   const draft = await tx.sale.findFirst({
-    where: {
-      id: saleId,
-      tenantId,
-      ...(typeof saleFields.isDraft !== "undefined" ? { isDraft: true } : {}),
-      ...(typeof saleFields.draftSource !== "undefined" ? { draftSource: "WHATSAPP" } : {}),
-      isCancelled: false,
-    },
+    where,
     select: buildDraftSaleSelectShape(tx.sale),
   });
 
@@ -1372,7 +1399,8 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
     sale: null,
   });
 
-  return prisma.$transaction(async (tx) => {
+    return prisma.$transaction(
+    async (tx) => {
     const resolvedCustomerId = await resolveOrCreateCustomerTx(tx, tenantId, {
       customerId: body?.customerId || convo.customerId || null,
       customer: body?.customer || null,
@@ -1486,11 +1514,15 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
 
     const draft = await getSaleDraftTx(tx, tenantId, sale.id);
 
-    return {
+        return {
       created: true,
       draft,
       branch,
     };
+  },
+  {
+    maxWait: 10000,
+    timeout: 20000,
   });
 }
 
@@ -1533,123 +1565,131 @@ async function updateSaleDraft({ tenantId, saleId, userId, body }) {
     sale: draft,
   });
 
-  return prisma.$transaction(async (tx) => {
-    let resolvedCustomerId = draft.customerId || null;
+  return prisma.$transaction(
+    async (tx) => {
+      let resolvedCustomerId = draft.customerId || null;
 
-    if (body?.customerId || body?.customer) {
-      resolvedCustomerId = await resolveOrCreateCustomerTx(tx, tenantId, {
-        customerId: body?.customerId || null,
-        customer: body?.customer || null,
-        conversation: null,
-      });
-    }
-
-    const patch = {
-      ...(typeof getModelFields(tx.sale).branchId !== "undefined" ? { branchId: branch.id } : {}),
-    };
-
-    if (body?.saleType !== undefined) {
-      patch.saleType = normalizeSaleType(body.saleType);
-    }
-
-    if (body?.dueDate !== undefined) {
-      if (!body.dueDate) {
-        patch.dueDate = null;
-      } else {
-        const parsedDueDate = safeDate(body.dueDate);
-        if (!parsedDueDate) throw appError("INVALID_DUE_DATE");
-        patch.dueDate = parsedDueDate;
-      }
-    }
-
-    if (resolvedCustomerId !== draft.customerId) {
-      patch.customerId = resolvedCustomerId || null;
-    }
-
-    await attachConversationBranchIfPossible(tx, {
-      tenantId,
-      conversationId: draft.conversationId,
-      branchId: branch.id,
-    });
-
-    if (Object.keys(patch).length > 0) {
-      await tx.sale.update({
-        where: { id: draft.id },
-        data: patch,
-      });
-    }
-
-    if (body?.items !== undefined) {
-      const items = Array.isArray(body.items) ? body.items : [];
-      if (items.length === 0) throw appError("NO_ITEMS");
-
-      for (const item of items) {
-        if (!item?.productId) throw appError("PRODUCT_ID_REQUIRED");
-
-        const qty = toInt(item.quantity, NaN);
-        if (!Number.isInteger(qty) || qty <= 0) throw appError("INVALID_QUANTITY");
-      }
-
-      const normalizedItems = items.map((item) => ({
-        productId: String(item.productId),
-        quantity: toInt(item.quantity),
-        unitPrice: toNumber(item.unitPrice, NaN),
-      }));
-
-      const { productById } = await assertBranchStockAvailableTx(tx, {
-        tenantId,
-        branchId: branch.id,
-        items: normalizedItems,
-      });
-
-      await tx.saleItem.deleteMany({
-        where: { saleId: draft.id },
-      });
-
-      for (const item of normalizedItems) {
-        const product = productById.get(item.productId);
-
-        const unitPrice =
-          Number.isFinite(item.unitPrice) && item.unitPrice > 0
-            ? item.unitPrice
-            : Number(product.sellPrice || 0);
-
-        await tx.saleItem.create({
-          data: {
-            saleId: draft.id,
-            productId: item.productId,
-            quantity: item.quantity,
-            price: unitPrice,
-          },
+      if (body?.customerId || body?.customer) {
+        resolvedCustomerId = await resolveOrCreateCustomerTx(tx, tenantId, {
+          customerId: body?.customerId || null,
+          customer: body?.customer || null,
+          conversation: null,
         });
       }
-    }
 
-    const recomputed = await recomputeDraftTotalsTx(tx, tenantId, draft.id);
+      const saleTxFields = getModelFields(tx.sale);
 
-    await createAuditLogTx(tx, {
-      tenantId,
-      userId,
-      entity: "SALE",
-      entityId: draft.id,
-      action: "WHATSAPP_SALE_DRAFT_UPDATED",
-      metadata: {
-        source: "WHATSAPP",
+      const patch = {
+        ...(typeof saleTxFields.branchId !== "undefined" ? { branchId: branch.id } : {}),
+      };
+
+      if (body?.saleType !== undefined) {
+        patch.saleType = normalizeSaleType(body.saleType);
+      }
+
+      if (body?.dueDate !== undefined) {
+        if (!body.dueDate) {
+          patch.dueDate = null;
+        } else {
+          const parsedDueDate = safeDate(body.dueDate);
+          if (!parsedDueDate) throw appError("INVALID_DUE_DATE");
+          patch.dueDate = parsedDueDate;
+        }
+      }
+
+      if (resolvedCustomerId !== draft.customerId) {
+        patch.customerId = resolvedCustomerId || null;
+      }
+
+      await attachConversationBranchIfPossible(tx, {
+        tenantId,
+        conversationId: draft.conversationId,
         branchId: branch.id,
-        branchName: branch.name,
-        hasItemsPatch: body?.items !== undefined,
-        hasCustomerPatch: Boolean(body?.customerId || body?.customer),
-        hasSaleTypePatch: body?.saleType !== undefined,
-        hasDueDatePatch: body?.dueDate !== undefined,
-      },
-    });
+      });
 
-    return {
-      updated: true,
-      draft: recomputed,
-      branch,
-    };
-  });
+      if (Object.keys(patch).length > 0) {
+        await tx.sale.update({
+          where: { id: draft.id },
+          data: patch,
+        });
+      }
+
+      if (body?.items !== undefined) {
+        const items = Array.isArray(body.items) ? body.items : [];
+        if (items.length === 0) throw appError("NO_ITEMS");
+
+        for (const item of items) {
+          if (!item?.productId) throw appError("PRODUCT_ID_REQUIRED");
+
+          const qty = toInt(item.quantity, NaN);
+          if (!Number.isInteger(qty) || qty <= 0) throw appError("INVALID_QUANTITY");
+        }
+
+        const normalizedItems = items.map((item) => ({
+          productId: String(item.productId),
+          quantity: toInt(item.quantity),
+          unitPrice: toNumber(item.unitPrice, NaN),
+        }));
+
+        const { productById } = await assertBranchStockAvailableTx(tx, {
+          tenantId,
+          branchId: branch.id,
+          items: normalizedItems,
+        });
+
+        await tx.saleItem.deleteMany({
+          where: { saleId: draft.id },
+        });
+
+        for (const item of normalizedItems) {
+          const product = productById.get(item.productId);
+
+          const unitPrice =
+            Number.isFinite(item.unitPrice) && item.unitPrice > 0
+              ? item.unitPrice
+              : Number(product.sellPrice || 0);
+
+          await tx.saleItem.create({
+            data: {
+              saleId: draft.id,
+              productId: item.productId,
+              quantity: item.quantity,
+              price: unitPrice,
+            },
+          });
+        }
+      }
+
+      const recomputed = await recomputeDraftTotalsTx(tx, tenantId, draft.id);
+
+      await createAuditLogTx(tx, {
+        tenantId,
+        userId,
+        entity: "SALE",
+        entityId: draft.id,
+        action: "WHATSAPP_SALE_DRAFT_UPDATED",
+        metadata: {
+          source: "WHATSAPP",
+          branchId: branch.id,
+          branchName: branch.name,
+          hasItemsPatch: body?.items !== undefined,
+          hasCustomerPatch: Boolean(body?.customerId || body?.customer),
+          hasSaleTypePatch: body?.saleType !== undefined,
+          hasDueDatePatch: body?.dueDate !== undefined,
+        },
+      });
+
+      return {
+        updated: true,
+        draft: recomputed,
+        branch,
+      };
+    },
+    {
+      maxWait: 10000,
+      timeout: 20000,
+    }
+  );
 }
 
 async function deleteSaleDraft({ tenantId, saleId, userId = null }) {
