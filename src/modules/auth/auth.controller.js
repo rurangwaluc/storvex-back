@@ -699,7 +699,7 @@ async function login(req, res) {
       },
     });
 
-    await recordLoginEventSafe(req, {
+    recordLoginEventSafe(req, {
       tenantId: user.tenantId,
       userId: user.id,
       email: user.email,
@@ -707,10 +707,9 @@ async function login(req, res) {
       status: "SUCCESS",
       method: "PASSWORD",
       reason: `${deviceLabel} signed in successfully.`,
-    });
+    }).catch(() => null);
 
     const token = signAuthToken({ user, tokenId });
-    const workspace = await getWorkspaceContextForUser(user.id, user.tenantId);
 
     return res.json({
       token,
@@ -722,10 +721,9 @@ async function login(req, res) {
         email: user.email,
         phone: user.phone,
       },
-      tenant: workspace.tenant,
-      activeBranch: workspace.activeBranch,
-      allowedBranches: workspace.allowedBranches,
+      workspaceShouldRefresh: true,
     });
+
   } catch (err) {
     console.error("login error:", err);
     return res.status(500).json({ message: "Server error" });

@@ -266,17 +266,16 @@ async function resolveSubscriptionAccess(tenantId) {
   }
 
   const updatedSubscription = await updateSubscriptionAccessModeIfNeeded(subscription);
-  const activeUsers = await countActiveBillableUsers(tenantId);
 
-  return {
-    ok: true,
-    code:
-      String(updatedSubscription.status || "").toUpperCase() === "EXPIRED"
-        ? "SUBSCRIPTION_BLOCKED"
-        : updatedSubscription.accessMode || "ACTIVE",
-    subscription: updatedSubscription,
-    activeUsers,
-  };
+return {
+  ok: true,
+  code:
+    String(updatedSubscription.status || "").toUpperCase() === "EXPIRED"
+      ? "SUBSCRIPTION_BLOCKED"
+      : updatedSubscription.accessMode || "ACTIVE",
+  subscription: updatedSubscription,
+  activeUsers: null,
+};
 }
 
 /**
@@ -305,18 +304,17 @@ async function requireActiveSubscription(req, res, next) {
 
     req.subscription = result.subscription;
     req.subscriptionAccess = result.subscription.accessMode;
-    req.subscriptionUsage = {
-      activeStaff: result.activeUsers,
-      staffLimit:
-        Number.isFinite(Number(result.subscription.staffLimit))
-          ? Number(result.subscription.staffLimit)
-          : null,
-      overLimit:
-        Number.isFinite(Number(result.subscription.staffLimit)) &&
-        Number(result.activeUsers) > Number(result.subscription.staffLimit),
-    };
+    const staffLimit = Number.isFinite(Number(result.subscription.staffLimit))
+        ? Number(result.subscription.staffLimit)
+        : null;
 
-    req.subscriptionMeta = serializeSubscription(result.subscription, result.activeUsers);
+      req.subscriptionUsage = {
+        activeStaff: null,
+        staffLimit,
+        overLimit: false,
+      };
+
+      req.subscriptionMeta = serializeSubscription(result.subscription, null);
 
     if (String(result.subscription.status || "").toUpperCase() === "EXPIRED") {
       return res.status(403).json({

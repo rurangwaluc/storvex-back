@@ -13,6 +13,74 @@ function normalizeText(value) {
   return s || null;
 }
 
+function isConnectionClosedError(error) {
+  return (
+    error?.code === "P1017" ||
+    String(error?.message || "").toLowerCase().includes("server has closed the connection")
+  );
+}
+
+async function withPrismaRetry(operation, attempts = 2) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+
+      if (!isConnectionClosedError(error) || attempt >= attempts) {
+        throw error;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
+  throw lastError;
+}
+
+function friendlySendFailure(error) {
+  const status = Number(error?.status || error?.response?.status || 0);
+  const providerCode = Number(error?.data?.error?.code || error?.response?.data?.error?.code || 0);
+  const providerMessage = String(
+    error?.data?.error?.message ||
+      error?.response?.data?.error?.message ||
+      error?.message ||
+      "",
+  ).toLowerCase();
+
+  if (providerCode === 132001 || providerMessage.includes("template name does not exist")) {
+    return "The WhatsApp message format is not approved for this sending language.";
+  }
+
+  if (providerCode === 131030 || providerMessage.includes("not in allowed list")) {
+    return "This customer phone number is not allowed for the current WhatsApp sending setup.";
+  }
+
+  if (status === 400) {
+    return "WhatsApp rejected this customer message. Check the customer phone number and approved message format.";
+  }
+
+  if (status === 401 || status === 403) {
+    return "The WhatsApp sending account needs attention before messages can be sent.";
+  }
+
+  if (status === 404) {
+    return "The WhatsApp message format could not be found for this sending setup.";
+  }
+
+  if (status === 429) {
+    return "WhatsApp is limiting customer messages right now. Try again later.";
+  }
+
+  if (status >= 500) {
+    return "WhatsApp could not process this customer message right now. Try again later.";
+  }
+
+  return "This customer message could not be sent.";
+}
+
 function normalizeLanguageCode(value) {
   const s = String(value || "").trim();
   return s || "en_US";
@@ -64,11 +132,6 @@ function getModelFields(delegate) {
   }
 }
 
-function modelHasField(delegate, fieldName) {
-  const fields = getModelFields(delegate);
-  return typeof fields[fieldName] !== "undefined";
-}
-
 function buildCustomerWhereBase(tenantId) {
   const customerFields = getModelFields(prisma.customer);
 
@@ -76,7 +139,6 @@ function buildCustomerWhereBase(tenantId) {
     tenantId,
     ...(typeof customerFields.isActive !== "undefined" ? { isActive: true } : {}),
     ...(typeof customerFields.whatsappOptIn !== "undefined" ? { whatsappOptIn: true } : {}),
-    phone: { not: null },
   };
 }
 
@@ -151,8 +213,8 @@ function buildPublicBroadcast(broadcast) {
     strategy: {
       mode: "ONE_STORE_NUMBER",
       customerFacingLabel: "One WhatsApp number for the store",
-      internalTargeting:
-        "Broadcasts are sent from the store number. Branch targeting is internal and only controls which customers receive the message.",
+      customerSelectionNote:
+        "Broadcasts are sent from the store WhatsApp number. The selected audience controls which customers receive the message.",
     },
 
     account: broadcast.account
@@ -193,10 +255,12 @@ async function ensureTenantExists(tenantId) {
     throw appError("TENANT_REQUIRED");
   }
 
-  const tenant = await prisma.tenant.findUnique({
-    where: { id: tenantId },
-    select: { id: true, name: true },
-  });
+  const tenant = await withPrismaRetry(() =>
+    prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { id: true, name: true },
+    }),
+  );
 
   if (!tenant) {
     throw appError("TENANT_NOT_FOUND");
@@ -208,20 +272,22 @@ async function ensureTenantExists(tenantId) {
 async function assertBranchBelongsToTenant(tenantId, branchId) {
   if (!branchId) throw appError("BRANCH_REQUIRED");
 
-  const branch = await prisma.branch.findFirst({
-    where: {
-      id: String(branchId),
-      tenantId,
-      status: "ACTIVE",
-    },
-    select: {
-      id: true,
-      name: true,
-      code: true,
-      isMain: true,
-      status: true,
-    },
-  });
+  const branch = await withPrismaRetry(() =>
+    prisma.branch.findFirst({
+      where: {
+        id: String(branchId),
+        tenantId,
+        status: "ACTIVE",
+      },
+      select: {
+        id: true,
+        name: true,
+        code: true,
+        isMain: true,
+        status: true,
+      },
+    }),
+  );
 
   if (!branch) throw appError("BRANCH_NOT_FOUND");
 
@@ -235,19 +301,21 @@ async function getActiveAccountOrThrow(tenantId, accountId) {
     ...(accountId ? { id: String(accountId) } : {}),
   };
 
-  const account = await prisma.whatsAppAccount.findFirst({
-    where,
-    select: {
-      id: true,
-      tenantId: true,
-      phoneNumber: true,
-      phoneNumberId: true,
-      businessName: true,
-      accessToken: true,
-      isActive: true,
-    },
-    orderBy: accountId ? undefined : [{ createdAt: "desc" }],
-  });
+  const account = await withPrismaRetry(() =>
+    prisma.whatsAppAccount.findFirst({
+      where,
+      select: {
+        id: true,
+        tenantId: true,
+        phoneNumber: true,
+        phoneNumberId: true,
+        businessName: true,
+        accessToken: true,
+        isActive: true,
+      },
+      orderBy: accountId ? undefined : [{ createdAt: "desc" }],
+    }),
+  );
 
   if (!account) {
     throw appError("WHATSAPP_ACCOUNT_NOT_FOUND");
@@ -265,20 +333,22 @@ async function getActiveAccountOrThrow(tenantId, accountId) {
 }
 
 async function getPromotionOrThrow(tenantId, promotionId) {
-  const promotion = await prisma.promotion.findFirst({
-    where: {
-      id: String(promotionId),
-      tenantId,
-    },
-    select: {
-      id: true,
-      title: true,
-      message: true,
-      productId: true,
-      sentAt: true,
-      createdAt: true,
-    },
-  });
+  const promotion = await withPrismaRetry(() =>
+    prisma.promotion.findFirst({
+      where: {
+        id: String(promotionId),
+        tenantId,
+      },
+      select: {
+        id: true,
+        title: true,
+        message: true,
+        productId: true,
+        sentAt: true,
+        createdAt: true,
+      },
+    }),
+  );
 
   if (!promotion) {
     throw appError("PROMOTION_NOT_FOUND");
@@ -288,13 +358,15 @@ async function getPromotionOrThrow(tenantId, promotionId) {
 }
 
 async function getBroadcastOrThrow(tenantId, broadcastId) {
-  const broadcast = await prisma.whatsAppBroadcast.findFirst({
-    where: {
-      id: String(broadcastId),
-      tenantId,
-    },
-    include: broadcastIncludeShape(),
-  });
+  const broadcast = await withPrismaRetry(() =>
+    prisma.whatsAppBroadcast.findFirst({
+      where: {
+        id: String(broadcastId),
+        tenantId,
+      },
+      include: broadcastIncludeShape(),
+    }),
+  );
 
   if (!broadcast) {
     throw appError("BROADCAST_NOT_FOUND");
@@ -331,34 +403,36 @@ async function listBroadcasts({ tenantId, status, accountId, q, limit = 50 }) {
   const cleanQuery = normalizeText(q);
   const take = clampLimit(limit, 50, 100);
 
-  const broadcasts = await prisma.whatsAppBroadcast.findMany({
-    where: {
-      tenantId,
-      ...(cleanStatus ? { status: cleanStatus } : {}),
-      ...(cleanAccountId ? { accountId: cleanAccountId } : {}),
-      ...(cleanQuery
-        ? {
-            OR: [
-              { templateName: { contains: cleanQuery, mode: "insensitive" } },
-              { languageCode: { contains: cleanQuery, mode: "insensitive" } },
-              {
-                promotion: {
-                  is: {
-                    OR: [
-                      { title: { contains: cleanQuery, mode: "insensitive" } },
-                      { message: { contains: cleanQuery, mode: "insensitive" } },
-                    ],
+  const broadcasts = await withPrismaRetry(() =>
+    prisma.whatsAppBroadcast.findMany({
+      where: {
+        tenantId,
+        ...(cleanStatus ? { status: cleanStatus } : {}),
+        ...(cleanAccountId ? { accountId: cleanAccountId } : {}),
+        ...(cleanQuery
+          ? {
+              OR: [
+                { templateName: { contains: cleanQuery, mode: "insensitive" } },
+                { languageCode: { contains: cleanQuery, mode: "insensitive" } },
+                {
+                  promotion: {
+                    is: {
+                      OR: [
+                        { title: { contains: cleanQuery, mode: "insensitive" } },
+                        { message: { contains: cleanQuery, mode: "insensitive" } },
+                      ],
+                    },
                   },
                 },
-              },
-            ],
-          }
-        : {}),
-    },
-    include: broadcastIncludeShape(),
-    orderBy: [{ createdAt: "desc" }],
-    take,
-  });
+              ],
+            }
+          : {}),
+      },
+      include: broadcastIncludeShape(),
+      orderBy: [{ createdAt: "desc" }],
+      take,
+    }),
+  );
 
   return broadcasts.map(buildPublicBroadcast);
 }
@@ -400,18 +474,20 @@ async function createBroadcast({ tenantId, userId, body }) {
     throw appError("CUSTOMER_IDS_REQUIRED_FOR_TARGET");
   }
 
-  const created = await prisma.whatsAppBroadcast.create({
-    data: {
-      tenantId,
-      accountId: account.id,
-      promotionId: promotion ? promotion.id : null,
-      templateName,
-      languageCode,
-      status: "DRAFT",
-      createdById: userId,
-    },
-    include: broadcastIncludeShape(),
-  });
+  const created = await withPrismaRetry(() =>
+    prisma.whatsAppBroadcast.create({
+      data: {
+        tenantId,
+        accountId: account.id,
+        promotionId: promotion ? promotion.id : null,
+        templateName,
+        languageCode,
+        status: "DRAFT",
+        createdById: userId,
+      },
+      include: broadcastIncludeShape(),
+    }),
+  );
 
   return {
     ...buildPublicBroadcast(created),
@@ -422,7 +498,7 @@ async function createBroadcast({ tenantId, userId, body }) {
       manualCustomerCount: targeting.manualCustomerIds.length,
       persisted: false,
       note:
-        "Targeting is currently applied when sending. Add targeting columns later if you want saved broadcast segments.",
+        "Audience selection is applied when sending. Saved audience segments can be added later if needed.",
     },
   };
 }
@@ -471,16 +547,18 @@ async function updateBroadcast({ tenantId, broadcastId, body }) {
     await assertBranchBelongsToTenant(tenantId, targeting.branchId);
   }
 
-  const updated = await prisma.whatsAppBroadcast.update({
-    where: { id: existing.id },
-    data: {
-      accountId: nextAccountId,
-      promotionId: nextPromotionId,
-      templateName: nextTemplateName,
-      languageCode: nextLanguageCode,
-    },
-    include: broadcastIncludeShape(),
-  });
+  const updated = await withPrismaRetry(() =>
+    prisma.whatsAppBroadcast.update({
+      where: { id: existing.id },
+      data: {
+        accountId: nextAccountId,
+        promotionId: nextPromotionId,
+        templateName: nextTemplateName,
+        languageCode: nextLanguageCode,
+      },
+      include: broadcastIncludeShape(),
+    }),
+  );
 
   return {
     ...buildPublicBroadcast(updated),
@@ -503,14 +581,16 @@ async function queueBroadcast({ tenantId, broadcastId }) {
     throw appError("ONLY_DRAFT_CAN_BE_QUEUED");
   }
 
-  const updated = await prisma.whatsAppBroadcast.update({
-    where: { id: existing.id },
-    data: {
-      status: "QUEUED",
-      queuedAt: new Date(),
-    },
-    include: broadcastIncludeShape(),
-  });
+  const updated = await withPrismaRetry(() =>
+    prisma.whatsAppBroadcast.update({
+      where: { id: existing.id },
+      data: {
+        status: "QUEUED",
+        queuedAt: new Date(),
+      },
+      include: broadcastIncludeShape(),
+    }),
+  );
 
   return buildPublicBroadcast(updated);
 }
@@ -524,21 +604,23 @@ async function getBranchCustomerIds({ tenantId, branchId, limit }) {
     throw appError("SALE_BRANCH_NOT_AVAILABLE");
   }
 
-  const rows = await prisma.sale.findMany({
-    where: {
-      tenantId,
-      branchId,
-      customerId: { not: null },
-      isDraft: false,
-      isCancelled: false,
-    },
-    select: {
-      customerId: true,
-      createdAt: true,
-    },
-    orderBy: [{ createdAt: "desc" }],
-    take: Math.min(1000, Math.max(limit * 4, limit)),
-  });
+  const rows = await withPrismaRetry(() =>
+    prisma.sale.findMany({
+      where: {
+        tenantId,
+        branchId,
+        customerId: { not: null },
+        isDraft: false,
+        isCancelled: false,
+      },
+      select: {
+        customerId: true,
+        createdAt: true,
+      },
+      orderBy: [{ createdAt: "desc" }],
+      take: Math.min(1000, Math.max(limit * 4, limit)),
+    }),
+  );
 
   return [...new Set(rows.map((row) => row.customerId).filter(Boolean))].slice(0, limit);
 }
@@ -546,25 +628,27 @@ async function getBranchCustomerIds({ tenantId, branchId, limit }) {
 async function getCreditCustomerIds({ tenantId, overdueOnly = false, limit }) {
   const now = new Date();
 
-  const rows = await prisma.sale.findMany({
-    where: {
-      tenantId,
-      customerId: { not: null },
-      isDraft: false,
-      isCancelled: false,
-      saleType: "CREDIT",
-      balanceDue: { gt: 0 },
-      ...(overdueOnly ? { dueDate: { lt: now } } : {}),
-    },
-    select: {
-      customerId: true,
-      balanceDue: true,
-      dueDate: true,
-      createdAt: true,
-    },
-    orderBy: [{ createdAt: "desc" }],
-    take: Math.min(1000, Math.max(limit * 4, limit)),
-  });
+  const rows = await withPrismaRetry(() =>
+    prisma.sale.findMany({
+      where: {
+        tenantId,
+        customerId: { not: null },
+        isDraft: false,
+        isCancelled: false,
+        saleType: "CREDIT",
+        balanceDue: { gt: 0 },
+        ...(overdueOnly ? { dueDate: { lt: now } } : {}),
+      },
+      select: {
+        customerId: true,
+        balanceDue: true,
+        dueDate: true,
+        createdAt: true,
+      },
+      orderBy: [{ createdAt: "desc" }],
+      take: Math.min(1000, Math.max(limit * 4, limit)),
+    }),
+  );
 
   return [...new Set(rows.map((row) => row.customerId).filter(Boolean))].slice(0, limit);
 }
@@ -572,39 +656,43 @@ async function getCreditCustomerIds({ tenantId, overdueOnly = false, limit }) {
 async function getProductBuyerCustomerIds({ tenantId, productId, limit }) {
   if (!productId) throw appError("PRODUCT_ID_REQUIRED_FOR_TARGET");
 
-  const product = await prisma.product.findFirst({
-    where: {
-      id: String(productId),
-      tenantId,
-    },
-    select: {
-      id: true,
-    },
-  });
+  const product = await withPrismaRetry(() =>
+    prisma.product.findFirst({
+      where: {
+        id: String(productId),
+        tenantId,
+      },
+      select: {
+        id: true,
+      },
+    }),
+  );
 
   if (!product) throw appError("PRODUCT_NOT_FOUND");
 
-  const rows = await prisma.saleItem.findMany({
-    where: {
-      productId: product.id,
-      sale: {
-        tenantId,
-        customerId: { not: null },
-        isDraft: false,
-        isCancelled: false,
-      },
-    },
-    select: {
-      sale: {
-        select: {
-          customerId: true,
-          createdAt: true,
+  const rows = await withPrismaRetry(() =>
+    prisma.saleItem.findMany({
+      where: {
+        productId: product.id,
+        sale: {
+          tenantId,
+          customerId: { not: null },
+          isDraft: false,
+          isCancelled: false,
         },
       },
-    },
-    orderBy: [{ id: "desc" }],
-    take: Math.min(1000, Math.max(limit * 4, limit)),
-  });
+      select: {
+        sale: {
+          select: {
+            customerId: true,
+            createdAt: true,
+          },
+        },
+      },
+      orderBy: [{ id: "desc" }],
+      take: Math.min(1000, Math.max(limit * 4, limit)),
+    }),
+  );
 
   return [...new Set(rows.map((row) => row.sale?.customerId).filter(Boolean))].slice(0, limit);
 }
@@ -660,15 +748,17 @@ async function getRecipients({ tenantId, targeting, promotion, limit }) {
           id: { in: customerIds },
         };
 
-  const recipients = await prisma.customer.findMany({
-    where,
-    select: customerSelectShape(),
-    orderBy:
-      typeof customerFields.createdAt !== "undefined"
-        ? [{ createdAt: "desc" }]
-        : [{ name: "asc" }],
-    take,
-  });
+  const recipients = await withPrismaRetry(() =>
+    prisma.customer.findMany({
+      where,
+      select: customerSelectShape(),
+      orderBy:
+        typeof customerFields.createdAt !== "undefined"
+          ? [{ createdAt: "desc" }]
+          : [{ name: "asc" }],
+      take,
+    }),
+  );
 
   const seenPhones = new Set();
   const cleanRecipients = [];
@@ -690,44 +780,50 @@ async function getRecipients({ tenantId, targeting, promotion, limit }) {
 }
 
 async function findOrCreateConversation({ tenantId, account, recipient }) {
-  let conversation = await prisma.whatsAppConversation.findFirst({
-    where: {
-      tenantId,
-      accountId: account.id,
-      phone: recipient.phone,
-    },
-    select: {
-      id: true,
-      customerId: true,
-    },
-    orderBy: [{ updatedAt: "desc" }],
-  });
-
-  if (!conversation) {
-    const conversationFields = getModelFields(prisma.whatsAppConversation);
-
-    conversation = await prisma.whatsAppConversation.create({
-      data: {
+  let conversation = await withPrismaRetry(() =>
+    prisma.whatsAppConversation.findFirst({
+      where: {
         tenantId,
         accountId: account.id,
-        customerId: recipient.id,
         phone: recipient.phone,
-        status: "OPEN",
-        ...(typeof conversationFields.branchId !== "undefined" ? { branchId: null } : {}),
       },
       select: {
         id: true,
         customerId: true,
       },
-    });
+      orderBy: [{ updatedAt: "desc" }],
+    }),
+  );
+
+  if (!conversation) {
+    const conversationFields = getModelFields(prisma.whatsAppConversation);
+
+    conversation = await withPrismaRetry(() =>
+      prisma.whatsAppConversation.create({
+        data: {
+          tenantId,
+          accountId: account.id,
+          customerId: recipient.id,
+          phone: recipient.phone,
+          status: "OPEN",
+          ...(typeof conversationFields.branchId !== "undefined" ? { branchId: null } : {}),
+        },
+        select: {
+          id: true,
+          customerId: true,
+        },
+      }),
+    );
   } else if (!conversation.customerId) {
-    await prisma.whatsAppConversation.update({
-      where: { id: conversation.id },
-      data: {
-        customerId: recipient.id,
-        updatedAt: new Date(),
-      },
-    });
+    await withPrismaRetry(() =>
+      prisma.whatsAppConversation.update({
+        where: { id: conversation.id },
+        data: {
+          customerId: recipient.id,
+          updatedAt: new Date(),
+        },
+      }),
+    );
   }
 
   return conversation;
@@ -736,35 +832,37 @@ async function findOrCreateConversation({ tenantId, account, recipient }) {
 async function sendBroadcastNow({ tenantId, broadcastId, limit = 50, targeting: targetingInput = null }) {
   await ensureTenantExists(tenantId);
 
-  const broadcast = await prisma.whatsAppBroadcast.findFirst({
-    where: {
-      id: String(broadcastId),
-      tenantId,
-    },
-    include: {
-      account: true,
-      promotion: true,
-      createdBy: {
-        select: {
-          id: true,
-          name: true,
-          role: true,
+  const broadcast = await withPrismaRetry(() =>
+    prisma.whatsAppBroadcast.findFirst({
+      where: {
+        id: String(broadcastId),
+        tenantId,
+      },
+      include: {
+        account: true,
+        promotion: true,
+        createdBy: {
+          select: {
+            id: true,
+            name: true,
+            role: true,
+          },
+        },
+        messages: {
+          select: {
+            id: true,
+            conversationId: true,
+          },
         },
       },
-      messages: {
-        select: {
-          id: true,
-          conversationId: true,
-        },
-      },
-    },
-  });
+    }),
+  );
 
   if (!broadcast) {
     throw appError("BROADCAST_NOT_FOUND");
   }
 
-  if (broadcast.status !== "DRAFT" && broadcast.status !== "QUEUED") {
+  if (broadcast.status !== "DRAFT" && broadcast.status !== "QUEUED" && broadcast.status !== "FAILED") {
     throw appError("ONLY_DRAFT_OR_QUEUED_CAN_BE_SENT");
   }
 
@@ -789,7 +887,7 @@ async function sendBroadcastNow({ tenantId, broadcastId, limit = 50, targeting: 
   const sentConversationIds = new Set(
     Array.isArray(broadcast.messages)
       ? broadcast.messages.map((m) => String(m.conversationId || "")).filter(Boolean)
-      : []
+      : [],
   );
 
   let attempted = 0;
@@ -828,26 +926,30 @@ async function sendBroadcastNow({ tenantId, broadcastId, limit = 50, targeting: 
 
       const providerMessageId = resp?.messages?.[0]?.id || null;
 
-      await prisma.whatsAppMessage.create({
-        data: {
-          conversationId: conversation.id,
-          tenantId,
-          accountId: account.id,
-          broadcastId: broadcast.id,
-          direction: "OUTBOUND",
-          type: "TEXT",
-          textContent: broadcast.promotion.message || "",
-          messageId: providerMessageId,
-        },
-      });
+      await withPrismaRetry(() =>
+        prisma.whatsAppMessage.create({
+          data: {
+            conversationId: conversation.id,
+            tenantId,
+            accountId: account.id,
+            broadcastId: broadcast.id,
+            direction: "OUTBOUND",
+            type: "TEXT",
+            textContent: broadcast.promotion.message || "",
+            messageId: providerMessageId,
+          },
+        }),
+      );
 
-      await prisma.whatsAppConversation.update({
-        where: { id: conversation.id },
-        data: {
-          updatedAt: new Date(),
-          customerId: recipient.id,
-        },
-      });
+      await withPrismaRetry(() =>
+        prisma.whatsAppConversation.update({
+          where: { id: conversation.id },
+          data: {
+            updatedAt: new Date(),
+            customerId: recipient.id,
+          },
+        }),
+      );
 
       delivered += 1;
       sentConversationIds.add(conversation.id);
@@ -858,7 +960,7 @@ async function sendBroadcastNow({ tenantId, broadcastId, limit = 50, targeting: 
       failures.push({
         customerId: recipient.id,
         phone: recipient.phone,
-        message: err?.message || "Send failed",
+        message: friendlySendFailure(err),
       });
     }
   }
@@ -866,21 +968,25 @@ async function sendBroadcastNow({ tenantId, broadcastId, limit = 50, targeting: 
   const nextStatus = delivered > 0 ? "SENT" : "FAILED";
   const sentAt = delivered > 0 ? new Date() : null;
 
-  const updated = await prisma.whatsAppBroadcast.update({
-    where: { id: broadcast.id },
-    data: {
-      status: nextStatus,
-      ...(sentAt ? { sentAt } : {}),
-      queuedAt: broadcast.queuedAt || new Date(),
-    },
-    include: broadcastIncludeShape(),
-  });
+  const updated = await withPrismaRetry(() =>
+    prisma.whatsAppBroadcast.update({
+      where: { id: broadcast.id },
+      data: {
+        status: nextStatus,
+        ...(sentAt ? { sentAt } : {}),
+        queuedAt: broadcast.queuedAt || new Date(),
+      },
+      include: broadcastIncludeShape(),
+    }),
+  );
 
   if (delivered > 0 && broadcast.promotion && !broadcast.promotion.sentAt) {
-    await prisma.promotion.update({
-      where: { id: broadcast.promotion.id },
-      data: { sentAt: new Date() },
-    });
+    await withPrismaRetry(() =>
+      prisma.promotion.update({
+        where: { id: broadcast.promotion.id },
+        data: { sentAt: new Date() },
+      }),
+    );
   }
 
   return {

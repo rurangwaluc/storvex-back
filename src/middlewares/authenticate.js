@@ -56,15 +56,27 @@ function branchPublicShape(branch) {
   };
 }
 
-async function touchSession(sessionId) {
+async function touchSession(sessionId, previousLastSeenAt = null) {
   if (!sessionId) return;
 
-  await prisma.userSession.update({
-    where: { id: sessionId },
-    data: {
-      lastSeenAt: new Date(),
-    },
-  });
+  const previous = previousLastSeenAt ? new Date(previousLastSeenAt) : null;
+  const now = new Date();
+
+  if (previous && !Number.isNaN(previous.getTime())) {
+    const ageMs = now.getTime() - previous.getTime();
+
+    // Do not write on every request. One update every 5 minutes is enough.
+    if (ageMs < 5 * 60 * 1000) return;
+  }
+
+  await prisma.userSession
+    .update({
+      where: { id: sessionId },
+      data: {
+        lastSeenAt: now,
+      },
+    })
+    .catch(() => null);
 }
 
 module.exports = async function authenticate(req, res, next) {
@@ -144,6 +156,7 @@ module.exports = async function authenticate(req, res, next) {
           id: true,
           isRevoked: true,
           expiresAt: true,
+          lastSeenAt: true,
         },
       });
 
@@ -169,7 +182,7 @@ module.exports = async function authenticate(req, res, next) {
       }
 
       sessionId = session.id;
-      await touchSession(session.id);
+      await touchSession(session.id, session.lastSeenAt);
     }
 
     const role = normalizeRole(user.role);

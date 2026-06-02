@@ -788,14 +788,14 @@ async function insertCashMovementIfPossible(
         (tenant_id, branch_id, session_id, type, reason, amount, note, created_by)
       values
         (
-          ${String(tenantId)},
-          ${String(branchId)},
-          ${String(sessionId)},
+          ${String(tenantId)}::uuid,
+          ${String(branchId)}::uuid,
+          ${String(sessionId)}::uuid,
           ${String(type)}::cash_movement_type,
           ${String(reason)}::cash_movement_reason,
           ${amountBigInt},
           ${note},
-          ${userId ? String(userId) : null}
+          ${userId ? String(userId) : null}::uuid
         )
       returning id, type, reason, amount, note, created_at, created_by
     `;
@@ -808,13 +808,13 @@ async function insertCashMovementIfPossible(
       (tenant_id, session_id, type, reason, amount, note, created_by)
     values
       (
-        ${String(tenantId)},
-        ${String(sessionId)},
+        ${String(tenantId)}::uuid,
+        ${String(sessionId)}::uuid,
         ${String(type)}::cash_movement_type,
         ${String(reason)}::cash_movement_reason,
         ${amountBigInt},
         ${note},
-        ${userId ? String(userId) : null}
+        ${userId ? String(userId) : null}::uuid
       )
     returning id, type, reason, amount, note, created_at, created_by
   `;
@@ -1399,131 +1399,147 @@ async function createSaleDraft({ tenantId, conversationId, userId, body }) {
     sale: null,
   });
 
-    return prisma.$transaction(
+  const normalizedRequestItems = items.map((item) => ({
+    productId: String(item.productId),
+    quantity: toInt(item.quantity),
+    unitPrice: toNumber(item.unitPrice, NaN),
+  }));
+
+  const result = await prisma.$transaction(
     async (tx) => {
-    const resolvedCustomerId = await resolveOrCreateCustomerTx(tx, tenantId, {
-      customerId: body?.customerId || convo.customerId || null,
-      customer: body?.customer || null,
-      conversation: convo,
-    });
-
-    if (resolvedCustomerId && !convo.customerId) {
-      await tx.whatsAppConversation.update({
-        where: { id: convo.id },
-        data: { customerId: resolvedCustomerId },
+      const resolvedCustomerId = await resolveOrCreateCustomerTx(tx, tenantId, {
+        customerId: body?.customerId || convo.customerId || null,
+        customer: body?.customer || null,
+        conversation: convo,
       });
-    }
 
-    await attachConversationBranchIfPossible(tx, {
-      tenantId,
-      conversationId: convo.id,
-      branchId: branch.id,
-    });
+      if (resolvedCustomerId && !convo.customerId) {
+        await tx.whatsAppConversation.update({
+          where: { id: convo.id },
+          data: { customerId: resolvedCustomerId },
+        });
+      }
 
-    const normalizedRequestItems = items.map((item) => ({
-      productId: String(item.productId),
-      quantity: toInt(item.quantity),
-      unitPrice: toNumber(item.unitPrice, NaN),
-    }));
-
-    const { productById } = await assertBranchStockAvailableTx(tx, {
-      tenantId,
-      branchId: branch.id,
-      items: normalizedRequestItems,
-    });
-
-    let total = 0;
-    const normalizedItems = [];
-
-    for (const item of normalizedRequestItems) {
-      const product = productById.get(item.productId);
-
-      const unitPrice =
-        Number.isFinite(item.unitPrice) && item.unitPrice > 0
-          ? item.unitPrice
-          : Number(product.sellPrice || 0);
-
-      total += unitPrice * item.quantity;
-
-      normalizedItems.push({
-        productId: item.productId,
-        quantity: item.quantity,
-        unitPrice,
-      });
-    }
-
-    const { status, balanceDue } = computeSaleStatus({
-      saleType: requestedSaleType,
-      total,
-      amountPaid: 0,
-      dueDate: requestedSaleType === "CREDIT" ? parsedDueDate : null,
-    });
-
-    const saleFields = getModelFields(tx.sale);
-    const draftCashierId = convo.assignedToId || userId;
-
-    const sale = await tx.sale.create({
-      data: {
+      await attachConversationBranchIfPossible(tx, {
         tenantId,
-        cashierId: draftCashierId,
-        customerId: resolvedCustomerId || null,
-        ...(typeof saleFields.branchId !== "undefined" ? { branchId: branch.id } : {}),
-        total,
-        saleType: requestedSaleType,
-        amountPaid: 0,
-        balanceDue,
-        status,
-        dueDate: requestedSaleType === "CREDIT" ? parsedDueDate : null,
-        conversationId: convo.id,
-        ...(typeof saleFields.isDraft !== "undefined" ? { isDraft: true } : {}),
-        ...(typeof saleFields.draftSource !== "undefined" ? { draftSource: "WHATSAPP" } : {}),
-      },
-      select: {
-        id: true,
-      },
-    });
-
-    for (const row of normalizedItems) {
-      await tx.saleItem.create({
-        data: {
-          saleId: sale.id,
-          productId: row.productId,
-          quantity: row.quantity,
-          price: row.unitPrice,
-        },
-      });
-    }
-
-    await createAuditLogTx(tx, {
-      tenantId,
-      userId,
-      entity: "SALE",
-      entityId: sale.id,
-      action: "WHATSAPP_SALE_DRAFT_CREATED",
-      metadata: {
-        source: "WHATSAPP",
         conversationId: convo.id,
         branchId: branch.id,
-        branchName: branch.name,
-        itemCount: normalizedItems.length,
+      });
+
+      const { productById } = await assertBranchStockAvailableTx(tx, {
+        tenantId,
+        branchId: branch.id,
+        items: normalizedRequestItems,
+      });
+
+      let total = 0;
+      const normalizedItems = [];
+
+      for (const item of normalizedRequestItems) {
+        const product = productById.get(item.productId);
+
+        const unitPrice =
+          Number.isFinite(item.unitPrice) && item.unitPrice > 0
+            ? item.unitPrice
+            : Number(product.sellPrice || 0);
+
+        total += unitPrice * item.quantity;
+
+        normalizedItems.push({
+          productId: item.productId,
+          quantity: item.quantity,
+          unitPrice,
+        });
+      }
+
+      const { status, balanceDue } = computeSaleStatus({
         saleType: requestedSaleType,
         total,
-        customerId: resolvedCustomerId,
-      },
-    });
+        amountPaid: 0,
+        dueDate: requestedSaleType === "CREDIT" ? parsedDueDate : null,
+      });
 
-    const draft = await getSaleDraftTx(tx, tenantId, sale.id);
+      const saleFields = getModelFields(tx.sale);
+      const draftCashierId = convo.assignedToId || userId;
 
-        return {
-      created: true,
-      draft,
-      branch,
-    };
-  },
-  {
-    maxWait: 10000,
-    timeout: 20000,
+      const sale = await tx.sale.create({
+        data: {
+          tenantId,
+          cashierId: draftCashierId,
+          customerId: resolvedCustomerId || null,
+          ...(typeof saleFields.branchId !== "undefined" ? { branchId: branch.id } : {}),
+          total,
+          saleType: requestedSaleType,
+          amountPaid: 0,
+          balanceDue,
+          status,
+          dueDate: requestedSaleType === "CREDIT" ? parsedDueDate : null,
+          conversationId: convo.id,
+          ...(typeof saleFields.isDraft !== "undefined" ? { isDraft: true } : {}),
+          ...(typeof saleFields.draftSource !== "undefined" ? { draftSource: "WHATSAPP" } : {}),
+        },
+        select: {
+          id: true,
+          total: true,
+          customerId: true,
+        },
+      });
+
+      for (const row of normalizedItems) {
+        await tx.saleItem.create({
+          data: {
+            saleId: sale.id,
+            productId: row.productId,
+            quantity: row.quantity,
+            price: row.unitPrice,
+          },
+        });
+      }
+
+      return {
+        created: true,
+        draft: {
+          id: sale.id,
+          total: sale.total,
+          customerId: sale.customerId || null,
+        },
+        branch,
+        audit: {
+          source: "WHATSAPP",
+          conversationId: convo.id,
+          branchId: branch.id,
+          branchName: branch.name,
+          itemCount: normalizedItems.length,
+          saleType: requestedSaleType,
+          total,
+          customerId: resolvedCustomerId || null,
+        },
+      };
+    },
+    {
+      maxWait: 15000,
+      timeout: 45000,
+    }
+  );
+
+  createAuditLogTx(prisma, {
+    tenantId,
+    userId,
+    entity: "SALE",
+    entityId: result.draft.id,
+    action: "WHATSAPP_SALE_DRAFT_CREATED",
+    metadata: result.audit,
+  }).catch((err) => {
+    console.error("WhatsApp draft audit log failed:", err?.message || err);
   });
+
+  return {
+    created: true,
+    draft: {
+      id: result.draft.id,
+    },
+    branch: result.branch,
+  };
 }
 
 async function updateSaleDraft({ tenantId, saleId, userId, body }) {
@@ -1811,25 +1827,40 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
   }
 
   const requestedPaid = Math.max(0, toNumber(body?.amountPaid, 0));
+  const saleTotal = Number(draft.total || 0);
 
   const initialPaid =
     finalSaleType === "CASH"
-      ? Number(draft.total)
-      : Math.min(requestedPaid, Number(draft.total));
+      ? saleTotal
+      : Math.min(requestedPaid, saleTotal);
 
-  if (finalSaleType === "CREDIT" && initialPaid > Number(draft.total) + 0.000001) {
+  if (requestedPaid > saleTotal + 0.000001) {
     throw appError("PAYMENT_EXCEEDS_TOTAL");
   }
 
-  if (finalSaleType === "CASH" || method === "CASH") {
+  let precheckedOpenCashSessionId = null;
+
+  const paymentTouchesCashDrawer = method === "CASH" && initialPaid > 0;
+
+  if (paymentTouchesCashDrawer) {
     const blockCashSales = await tenantBlocksCashSales(prisma, tenantId);
 
     if (blockCashSales) {
-      const openSessionId = await getOpenCashSessionId(prisma, tenantId, branch.id);
+      precheckedOpenCashSessionId = await getOpenCashSessionId(
+        prisma,
+        tenantId,
+        branch.id
+      );
 
-      if (!openSessionId) {
+      if (!precheckedOpenCashSessionId) {
         throw appError("CASH_DRAWER_CLOSED", { code: "CASH_DRAWER_CLOSED" });
       }
+    } else {
+      precheckedOpenCashSessionId = await getOpenCashSessionId(
+        prisma,
+        tenantId,
+        branch.id
+      );
     }
   }
 
@@ -1882,11 +1913,13 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
         dueDate: finalSaleType === "CREDIT" ? parsedDueDate : null,
       });
 
+      const saleTxFields = getModelFields(tx.sale);
+
       const updatedSale = await tx.sale.update({
         where: { id: draft.id },
         data: {
           customerId: resolvedCustomerId || null,
-          ...(typeof getModelFields(tx.sale).branchId !== "undefined" ? { branchId: branch.id } : {}),
+          ...(typeof saleTxFields.branchId !== "undefined" ? { branchId: branch.id } : {}),
           saleType: finalSaleType,
           amountPaid: initialPaid,
           balanceDue,
@@ -1894,17 +1927,13 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
           dueDate: finalSaleType === "CREDIT" ? parsedDueDate : null,
           receiptNumber: doc.receiptNumber,
           invoiceNumber: doc.invoiceNumber,
-          ...(typeof getModelFields(tx.sale).isDraft !== "undefined" ? { isDraft: false } : {}),
-          ...(typeof getModelFields(tx.sale).draftSource !== "undefined"
-            ? { draftSource: null }
-            : {}),
-          ...(typeof getModelFields(tx.sale).finalizedAt !== "undefined"
-            ? { finalizedAt }
-            : {}),
+          ...(typeof saleTxFields.isDraft !== "undefined" ? { isDraft: false } : {}),
+          ...(typeof saleTxFields.draftSource !== "undefined" ? { draftSource: null } : {}),
+          ...(typeof saleTxFields.finalizedAt !== "undefined" ? { finalizedAt } : {}),
         },
         select: {
           id: true,
-          ...(typeof getModelFields(tx.sale).branchId !== "undefined" ? { branchId: true } : {}),
+          ...(typeof saleTxFields.branchId !== "undefined" ? { branchId: true } : {}),
           saleType: true,
           total: true,
           amountPaid: true,
@@ -1916,13 +1945,9 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
           customerId: true,
           createdAt: true,
           conversationId: true,
-          ...(typeof getModelFields(tx.sale).isDraft !== "undefined" ? { isDraft: true } : {}),
-          ...(typeof getModelFields(tx.sale).draftSource !== "undefined"
-            ? { draftSource: true }
-            : {}),
-          ...(typeof getModelFields(tx.sale).finalizedAt !== "undefined"
-            ? { finalizedAt: true }
-            : {}),
+          ...(typeof saleTxFields.isDraft !== "undefined" ? { isDraft: true } : {}),
+          ...(typeof saleTxFields.draftSource !== "undefined" ? { draftSource: true } : {}),
+          ...(typeof saleTxFields.finalizedAt !== "undefined" ? { finalizedAt: true } : {}),
         },
       });
 
@@ -1933,8 +1958,8 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
         const noteBase = normalizeText(body?.note);
 
         const safeNote = noteBase
-          ? `${noteBase} • ${draft.id} • ${Date.now()}`
-          : `WhatsApp payment • ${draft.id} • ${Date.now()}`;
+          ? `${noteBase} - ${draft.id} - ${Date.now()}`
+          : `WhatsApp payment - ${draft.id} - ${Date.now()}`;
 
         const paymentFields = getModelFields(tx.salePayment);
 
@@ -1958,14 +1983,12 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
           },
         });
 
-        if (method === "CASH") {
-          const openSessionId = await getOpenCashSessionId(tx, tenantId, branch.id);
-
+        if (paymentTouchesCashDrawer) {
           movement = await insertCashMovementIfPossible(tx, {
             tenantId,
             branchId: branch.id,
             userId,
-            sessionId: openSessionId,
+            sessionId: precheckedOpenCashSessionId,
             type: "IN",
             reason: finalSaleType === "CASH" ? "OTHER" : "DEPOSIT",
             amount: initialPaid,
@@ -1976,27 +1999,6 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
           });
         }
       }
-
-      await createAuditLogTx(tx, {
-        tenantId,
-        userId,
-        entity: "SALE",
-        entityId: draft.id,
-        action: "WHATSAPP_SALE_DRAFT_FINALIZED",
-        metadata: {
-          source: "WHATSAPP",
-          conversationId: draft.conversationId || null,
-          branchId: branch.id,
-          branchName: branch.name,
-          saleType: finalSaleType,
-          total: draft.total,
-          amountPaid: initialPaid,
-          paymentMethod: initialPaid > 0 ? method : null,
-          receiptNumber: updatedSale.receiptNumber || null,
-          invoiceNumber: updatedSale.invoiceNumber || null,
-          customerId: resolvedCustomerId || null,
-        },
-      });
 
       return {
         finalized: true,
@@ -2014,15 +2016,45 @@ async function finalizeSaleDraft({ tenantId, saleId, userId, body }) {
               createdBy: movement.created_by,
             }
           : null,
+        audit: {
+          source: "WHATSAPP",
+          conversationId: draft.conversationId || null,
+          branchId: branch.id,
+          branchName: branch.name,
+          saleType: finalSaleType,
+          total: draft.total,
+          amountPaid: initialPaid,
+          paymentMethod: initialPaid > 0 ? method : null,
+          receiptNumber: updatedSale.receiptNumber || null,
+          invoiceNumber: updatedSale.invoiceNumber || null,
+          customerId: resolvedCustomerId || null,
+        },
       };
     },
     {
-      maxWait: 10000,
-      timeout: 20000,
+      maxWait: 15000,
+      timeout: 45000,
     }
   );
 
-  return result;
+  createAuditLogTx(prisma, {
+    tenantId,
+    userId,
+    entity: "SALE",
+    entityId: draft.id,
+    action: "WHATSAPP_SALE_DRAFT_FINALIZED",
+    metadata: result.audit,
+  }).catch((err) => {
+    console.error("WhatsApp finalize audit log failed:", err?.message || err);
+  });
+
+  return {
+    finalized: result.finalized,
+    sale: result.sale,
+    branch: result.branch,
+    payment: result.payment,
+    cashMovement: result.cashMovement,
+  };
 }
 
 function normalizeConversationPublic(conversation) {
