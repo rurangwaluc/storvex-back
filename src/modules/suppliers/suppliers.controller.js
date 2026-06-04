@@ -847,28 +847,63 @@ async function createSupply(req, res) {
 
         createdItems.push(createdItem);
 
-        if (!alsoUpdateStock || !productId) continue;
+        if (!alsoUpdateStock) continue;
 
-        const product = await tx.product.findFirst({
-          where: { id: productId, tenantId },
-          select: { id: true, stockQty: true },
-        });
+        let product = null;
+        let beforeQtyGlobal = 0;
+        let afterQtyGlobal = quantity;
 
-        if (!product) continue;
+        if (productId) {
+          product = await tx.product.findFirst({
+            where: { id: productId, tenantId },
+            select: { id: true, stockQty: true },
+          });
 
-        const beforeQtyGlobal = Number(product.stockQty || 0);
-        const afterQtyGlobal = beforeQtyGlobal + quantity;
+          if (!product) continue;
 
-        await tx.product.update({
-          where: { id: product.id },
-          data: {
-            stockQty: afterQtyGlobal,
-            costPrice: buyPrice,
-            sellPrice,
-            supplierId,
-            supplierName: supplier.name,
-          },
-        });
+          beforeQtyGlobal = Number(product.stockQty || 0);
+          afterQtyGlobal = beforeQtyGlobal + quantity;
+
+          await tx.product.update({
+            where: { id: product.id },
+            data: {
+              stockQty: afterQtyGlobal,
+              costPrice: buyPrice,
+              sellPrice,
+              supplierId,
+              supplierName: supplier.name,
+              isActive: true,
+            },
+          });
+        } else {
+          product = await tx.product.create({
+            data: {
+              tenantId,
+              name: productName,
+              category: cleanString(item.category),
+              subcategory: cleanString(item.subcategory),
+              subcategoryOther: cleanString(item.subcategoryOther),
+              brand: cleanString(item.brand),
+              serial: cleanString(item.serial),
+              costPrice: buyPrice,
+              sellPrice,
+              stockQty: quantity,
+              supplierId,
+              supplierName: supplier.name,
+              isActive: true,
+            },
+            select: { id: true, stockQty: true },
+          });
+
+          beforeQtyGlobal = 0;
+          afterQtyGlobal = Number(product.stockQty || quantity);
+
+          await tx.supplierSupplyItem.update({
+            where: { id: createdItem.id },
+            data: { productId: product.id },
+            select: { id: true },
+          });
+        }
 
         await incrementBranchInventoryIfPossible(tx, {
           tenantId,
@@ -884,7 +919,7 @@ async function createSupply(req, res) {
           delta: quantity,
           beforeQty: beforeQtyGlobal,
           afterQty: afterQtyGlobal,
-          note: `Supplier supply (${supplier.name}) • Branch ${activeBranch.code || activeBranch.name || activeBranch.id}`,
+          note: `Supplier supply from ${supplier.name} at ${activeBranch.code || activeBranch.name || "current selling location"}`,
           createdById: userId,
         };
 
